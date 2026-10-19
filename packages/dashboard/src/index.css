@@ -1,0 +1,187 @@
+/* Variable axis, woff2-only, latin + latin-ext subsets only (cyrillic/greek/vietnamese trimmed). Source: @fontsource-variable */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('../node_modules/@fontsource-variable/inter/files/inter-latin-standard-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('../node_modules/@fontsource-variable/inter/files/inter-latin-ext-standard-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url('../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* surface                                       hex ref      */
+    --background: 0 0% 98%;          /* canvas-soft  #fafafa     */
+    --foreground: 0 0% 9%;           /* ink          #171717     */
+    --card: 0 0% 100%;               /* canvas       #ffffff     */
+    --card-foreground: 0 0% 9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 9%;
+
+    /* brand CTA — ink black                                      */
+    --primary: 0 0% 9%;              /* ink          #171717     */
+    --primary-foreground: 0 0% 100%;
+
+    /* secondary / muted                                          */
+    --secondary: 0 0% 96%;           /* canvas-soft-2 #f5f5f5    */
+    --secondary-foreground: 0 0% 9%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 53%;    /* mute         #888888     */
+    --accent: 0 0% 96%;
+    --accent-foreground: 0 0% 9%;
+
+    /* semantic                                                   */
+    --destructive: 0 100% 47%;       /* error        #ee0000     */
+    --destructive-foreground: 0 0% 100%;
+
+    /* border / input                                             */
+    --border: 0 0% 92%;              /* hairline     #ebebeb     */
+    --input: 0 0% 92%;
+    --ring: 0 0% 9%;
+    --radius: 0.5rem;                /* 8px — marketing card     */
+
+    /* avatar palette — 6 hue slots (light: vibrant pastel)       */
+    --avatar-1-bg: 353 90% 82%;  --avatar-1-fg: 353 80% 28%;
+    --avatar-2-bg: 25 100% 76%;  --avatar-2-fg: 25 90% 25%;
+    --avatar-3-bg: 48 100% 72%;  --avatar-3-fg: 31 85% 25%;
+    --avatar-4-bg: 151 70% 70%;  --avatar-4-fg: 151 80% 18%;
+    --avatar-5-bg: 216 90% 78%;  --avatar-5-fg: 216 85% 25%;
+    --avatar-6-bg: 278 75% 84%;  --avatar-6-fg: 278 75% 28%;
+
+    /* sidebar                                                    */
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 0 0% 30%;  /* body text    #4d4d4d     */
+    --sidebar-primary: 0 0% 9%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 0 0% 96%;
+    --sidebar-accent-foreground: 0 0% 9%;
+    --sidebar-border: 0 0% 92%;
+    --sidebar-ring: 211 100% 48%;    /* link blue    #0070f3     */
+
+    --chart-1: 216 85% 55%;
+    --chart-2: 262 65% 58%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 151 65% 45%;
+    --chart-5: 340 75% 55%;
+  }
+
+  .dark {
+    --background: 0 0% 9%;
+    --foreground: 0 0% 98%;
+    --card: 0 0% 11%;
+    --card-foreground: 0 0% 98%;
+    --popover: 0 0% 11%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 0 0% 9%;
+    --secondary: 0 0% 15%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 0 0% 15%;
+    --muted-foreground: 0 0% 65%;
+    --accent: 0 0% 15%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 70% 62%;        /* shadcn dark — oklch(0.704) 기준 */
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 18%;
+    --input: 0 0% 18%;
+    --ring: 0 0% 98%;
+    /* avatar palette — 6 hue slots (dark: muted, low-lightness)  */
+    --avatar-1-bg: 353 40% 32%;  --avatar-1-fg: 353 60% 78%;
+    --avatar-2-bg: 25 42% 32%;   --avatar-2-fg: 25 65% 78%;
+    --avatar-3-bg: 48 42% 32%;   --avatar-3-fg: 48 65% 78%;
+    --avatar-4-bg: 151 36% 28%;  --avatar-4-fg: 151 50% 72%;
+    --avatar-5-bg: 216 42% 32%;  --avatar-5-fg: 216 60% 78%;
+    --avatar-6-bg: 278 38% 32%;  --avatar-6-fg: 278 55% 78%;
+    --sidebar-background: 0 0% 7%;
+    --sidebar-foreground: 0 0% 80%;
+    --sidebar-primary: 0 0% 98%;
+    --sidebar-primary-foreground: 0 0% 9%;
+    --sidebar-accent: 0 0% 13%;
+    --sidebar-accent-foreground: 0 0% 98%;
+    --sidebar-border: 0 0% 18%;
+    --sidebar-ring: 211 100% 48%;
+
+    --chart-1: 216 80% 65%;
+    --chart-2: 262 60% 68%;
+    --chart-3: 30 75% 65%;
+    --chart-4: 151 60% 55%;
+    --chart-5: 340 70% 65%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+    font-feature-settings: 'ss01', 'ss02';
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+@layer base {
+  button:not([aria-haspopup]):not(:disabled),
+  [role="button"]:not([aria-haspopup]):not(:disabled) {
+    transition-property: color, background-color, border-color, transform;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 120ms;
+  }
+  button:active:not([aria-haspopup]):not(:disabled),
+  [role="button"]:active:not([aria-haspopup]):not(:disabled) {
+    transform: translateY(1px);
+  }
+}
+
+/* Overlays (dialogs, menus, selects, tooltips, sheets) open and close with tailwindcss-animate. Someone who asked
+   the OS for less motion gets them instantly. `none` rather than a zero duration: Radix keeps an exiting overlay
+   mounted until its animation ends, and with no animation name it unmounts at once. A substring match because the
+   components write `data-[state=open]:animate-in`, a different class from the bare `animate-in` only Tooltip uses. */
+@media (prefers-reduced-motion: reduce) {
+  [class*="animate-in"],
+  [class*="animate-out"] {
+    animation: none !important;
+  }
+}
+
+
+/* A tap or swipe the agent made, drawn on the watch page's device (A2): it grows and fades, then is gone. The
+   translate is repeated here because Tailwind 3's translate utilities are a `transform` this would replace. */
+@keyframes tap-mark {
+  from { opacity: 1; transform: translate(-50%, -50%) scale(0.6); }
+  to { opacity: 0; transform: translate(-50%, -50%) scale(1.5); }
+}
+@keyframes swipe-mark {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}

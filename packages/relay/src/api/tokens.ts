@@ -1,0 +1,92 @@
+import http from 'http'
+import crypto from 'crypto'
+import { getDb } from '../db.js'
+import { currentRole, requireAuth, hashPat } from '../middleware/auth.js'
+import { json, readJson } from '../router.js'
+import { AGENT_SCOPE, type AuthChange } from '../lib/connectionAuth.js'
+
+const ALLOWED_SCOPES = new Set(['view', 'builds:write', AGENT_SCOPE])
+const DEFAULT_SCOPE = 'view,builds:write'
+
+export function handleListTokens(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const auth = requireAuth(req, res)
+  if (!auth) return
+
+  const db = getDb()
+  const tokens = db.prepare(
+    'SELECT id, name, scope, last_used_at, expires_at, created_at FROM personal_access_tokens WHERE user_id = ? ORDER BY created_at DESC'
+  ).all(auth.userId)
+  json(res, 200, tokens)
+}
+
+export async function handleCreateToken(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  if (!requireAuth(req, res)) return
+
+  const body = await readJson<{ name?: string; expires_in_days?: number; scope?: string }>(req)
+  // Checked again once the body is in: a request can hold its body back for as long as it likes, and a
+  // password reset that commits meanwhile revokes every token of the account and ends its sessions. A
+  // token minted from the check made before the wait would outlive that reset. From here to the INSERT
+  // nothing awaits, so no reset can land between this check and the write.
+  const auth = requireAuth(req, res)
+  if (!auth) return
+  if (!body.name?.trim()) return json(res, 400, { error: 'name required' })
+
+  const scopes = (body.scope?.trim() || DEFAULT_SCOPE).split(',').map((s) => s.trim())
+  if (scopes.some((s) => !ALLOWED_SCOPES.has(s))) {
+    return json(res, 400, { error: `Invalid scope. Allowed: ${[...ALLOWED_SCOPES].join(', ')}` })
+  }
+  // agent 스코프 토큰은 화면을 공급하는 에이전트의 자격이므로 발급을 Admin으로 제한한다 (#271).
+  // The DB role, not the JWT's: a demoted Admin keeps a valid cookie for up to 7 days.
+  if (scopes.includes(AGENT_SCOPE)) {
+    const role = currentRole(res, auth.userId)
+    if (role === null) return
+    if (role !== 'Admin') {
+      return json(res, 403, { error: `'${AGENT_SCOPE}' scope requires the Admin role` })
+    }
+  }
+
+  // Omitted or 0 means no expiry. A negative count used to mint a token that was already expired, and one too
+  // large for a Date threw on toISOString(). No upper cap: 365 is the dialog's limit, and API callers may rely on more.
+  // Only a number or a numeric string counts: `Number()` alone turns "" / " " / [] into 0, so a CI template whose
+  // variable came out empty would get a token that never expires — the most permissive result, silently.
+  const raw: unknown = body.expires_in_days
+  const days = raw == null ? 0
+    : typeof raw === 'number' ? raw
+    : typeof raw === 'string' && raw.trim() !== '' ? Number(raw)
+    : NaN
+  const expiresDate = days ? new Date(Date.now() + days * 24 * 3600 * 1000) : null
+  if (!Number.isFinite(days) || days < 0 || (expiresDate && isNaN(expiresDate.getTime()))) {
+    return json(res, 400, { error: 'expires_in_days must be a number of days, 0 or more and small enough to be a date (omit it or send 0 for no expiry)' })
+  }
+
+  const rawToken = `tflw_pat_${crypto.randomBytes(32).toString('hex')}`
+  const tokenHash = hashPat(rawToken)
+  const expiresAt = expiresDate ? expiresDate.toISOString() : null
+
+  const db = getDb()
+  db.prepare(
+    'INSERT INTO personal_access_tokens (user_id, name, token_hash, scope, expires_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(auth.userId, body.name.trim(), tokenHash, scopes.join(','), expiresAt)
+
+  json(res, 201, { token: rawToken })
+}
+
+export function handleRevokeToken(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: Record<string, string>,
+  onAuthChanged: (affected?: AuthChange) => void = () => {},
+): void {
+  const auth = requireAuth(req, res)
+  if (!auth) return
+
+  const db = getDb()
+  const result = db.prepare(
+    'DELETE FROM personal_access_tokens WHERE id = ? AND user_id = ?'
+  ).run(params.id, auth.userId)
+
+  if (result.changes === 0) return json(res, 404, { error: 'Token not found' })
+  // Closes the sockets that were opened with it.
+  onAuthChanged({ userId: auth.userId, scope: 'token', patId: Number(params.id) })
+  json(res, 204, null)
+}

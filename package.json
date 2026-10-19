@@ -1,0 +1,61 @@
+{
+  "name": "tapflow",
+  "version": "0.1.0",
+  "description": "Self-hosted iOS/Android simulator streaming and remote control for the whole team.",
+  "license": "MIT",
+  "private": true,
+  "packageManager": "pnpm@9.15.1",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @tapflowio/protocol build && pnpm --filter @tapflowio/agent-core build && pnpm --filter @tapflowio/dashboard build && pnpm --filter @tapflowio/flow-runner build && pnpm --filter @tapflowio/relay build && pnpm --filter @tapflowio/ios-agent build && pnpm --filter @tapflowio/android-agent build && pnpm --filter tapflow build && pnpm --filter @tapflowio/mcp-server build",
+    "test": "pnpm test:scripts && pnpm -r test --if-present",
+    "test:scripts": "vitest run --config scripts/vitest.config.mjs",
+    "lint": "eslint scripts && pnpm -r --if-present lint",
+    "typecheck": "tsc -b && pnpm -r --if-present typecheck",
+    "prepare": "lefthook install || true",
+    "dev": "node scripts/dev-preflight.mjs relay dashboard && concurrently -k -n relay,dashboard,ios,android -c cyan,magenta,green,yellow \"pnpm dev:relay\" \"pnpm --filter @tapflowio/dashboard dev\" \"pnpm dev:ios\" \"pnpm dev:android\"",
+    "dev:lean": "node scripts/dev-lean.mjs",
+    "dev:pool": "node scripts/dev-preflight.mjs relay && concurrently -k -n relay,ios,mocks -c cyan,green,yellow \"pnpm dev:relay\" \"pnpm dev:ios\" \"pnpm --filter @tapflowio/playground mock-agents\"",
+    "dev:relay": "pnpm --filter @tapflowio/playground relay",
+    "dev:ios": "pnpm --filter @tapflowio/playground ios-agent",
+    "dev:android": "pnpm --filter @tapflowio/playground android-agent",
+    "dev:down": "node scripts/dev-down.mjs",
+    "seed": "pnpm --filter @tapflowio/playground seed",
+    "seed:demo": "pnpm --filter @tapflowio/playground demo-seed",
+    "doctor": "pnpm --filter @tapflowio/playground doctor",
+    "reset": "pnpm --filter @tapflowio/playground reset",
+    "mcp": "pnpm --filter @tapflowio/playground mcp",
+    "pre-release": "pnpm --filter @tapflowio/playground pre-release",
+    "docs:dev": "pnpm --filter @tapflowio/docs dev",
+    "docs:build": "pnpm --filter @tapflowio/docs build",
+    "docs:preview": "pnpm --filter @tapflowio/docs preview",
+    "changeset": "changeset",
+    "changeset:check": "node scripts/check-changeset.mjs",
+    "changeset:audit": "node scripts/check-changeset.mjs --audit",
+    "e2e:plan": "node scripts/e2e-plan.mjs",
+    "overrides:audit": "node scripts/audit-overrides.mjs",
+    "version": "changeset version",
+    "release": "pnpm build && changeset publish"
+  },
+  "devDependencies": {
+    "@a11y-lens/cli": "^0.6.1",
+    "@changesets/cli": "^2.31.1",
+    "@manypkg/get-packages": "1.1.3",
+    "@vitest/coverage-v8": "^4.1.12",
+    "concurrently": "^9.2.5",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
+    "lefthook": "^2.2.2",
+    "typescript": "^5.0.0",
+    "typescript-eslint": "^8.71.2",
+    "vitest": "^4.1.12"
+  },
+  "pnpm": {
+    "overrides": {},
+    "patchedDependencies": {
+      "next-themes@0.4.6": "patches/next-themes@0.4.6.patch"
+    }
+  }
+}

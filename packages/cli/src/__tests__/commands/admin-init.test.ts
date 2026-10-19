@@ -1,0 +1,153 @@
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest'
+
+vi.mock('@clack/prompts', () => ({
+  text: vi.fn(),
+  password: vi.fn(),
+  isCancel: vi.fn().mockReturnValue(false),
+  cancel: vi.fn(),
+}))
+
+import * as clack from '@clack/prompts'
+import { cmdAdminInit } from '../../commands/admin-init.js'
+
+const mockText = vi.mocked(clack.text)
+const mockPassword = vi.mocked(clack.password)
+
+/** Both ends, because the command now refuses a run that could not answer its two questions. */
+function setTTY(value: boolean | undefined) {
+  Object.defineProperty(process.stdout, 'isTTY', { value, configurable: true })
+  Object.defineProperty(process.stdin, 'isTTY', { value, configurable: true })
+}
+
+function mockInputs(email: string, pw: string) {
+  mockText.mockResolvedValue(email)
+  mockPassword.mockResolvedValue(pw)
+}
+
+function mockFetch(status: number, body: unknown) {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => 'application/json' },
+    json: vi.fn().mockResolvedValue(body),
+  }))
+}
+
+describe('cmdAdminInit', () => {
+  let output: string[]
+  let exitSpy: MockInstance
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    vi.mocked(clack.isCancel).mockReturnValue(false)
+    output = []
+    vi.spyOn(console, 'log').mockImplementation((...args) => output.push(args.join(' ')))
+    vi.spyOn(console, 'error').mockImplementation((...args) => output.push(args.join(' ')))
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('process.exit') })
+    setTTY(true)
+  })
+
+  afterEach(() => {
+    setTTY(undefined)
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('성공 시 "Admin account created" 출력', async () => {
+    mockInputs('admin@test.com', 'password123')
+    mockFetch(201, { ok: true })
+
+    await cmdAdminInit({})
+    expect(output.join('\n')).toContain('Admin account created')
+  })
+
+  it('성공 시 입력한 email 표시', async () => {
+    mockInputs('admin@test.com', 'password123')
+    mockFetch(201, { ok: true })
+
+    await cmdAdminInit({})
+    expect(output.join('\n')).toContain('admin@test.com')
+  })
+
+  it('relay 연결 실패 시 exit(1)', async () => {
+    mockInputs('admin@test.com', 'password123')
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')))
+
+    await expect(cmdAdminInit({})).rejects.toThrow('process.exit')
+    expect(exitSpy).toHaveBeenCalledWith(1)
+  })
+
+  it('이미 초기화된 경우(403) exit(1) + 안내 메시지', async () => {
+    mockInputs('admin@test.com', 'password123')
+    mockFetch(403, { error: 'Already initialized' })
+
+    await expect(cmdAdminInit({})).rejects.toThrow('process.exit')
+    expect(exitSpy).toHaveBeenCalledWith(1)
+    expect(output.join('\n')).toContain('Already initialized')
+  })
+
+  it('비밀번호 8자 미만 시 clack validate에서 에러 반환', async () => {
+    mockInputs('admin@test.com', 'password123')
+    mockFetch(201, { ok: true })
+
+    await cmdAdminInit({})
+
+    const validateFn = mockPassword.mock.calls[0]?.[0]?.validate as ((v: string) => string | undefined) | undefined
+    expect(validateFn).toBeDefined()
+    expect(validateFn!('short')).toMatch(/8 characters/)
+    expect(validateFn!('password123')).toBeUndefined()
+  })
+
+  it('--relay 옵션 URL로 요청', async () => {
+    mockInputs('admin@test.com', 'password123')
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: vi.fn().mockResolvedValue({ ok: true }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await cmdAdminInit({ relay: 'http://remote:4000' })
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('http://remote:4000'),
+      expect.anything(),
+    )
+  })
+
+  it.each([
+    ['터미널 아님', false],
+    // The shape self-hosting reaches: a provisioning script or `docker exec` without `-it`. The
+    // prompt used to draw, never settle, and the process exited 0 with no account and no spinner.
+    ['stdout만 터미널, stdin은 EOF', undefined],
+  ])('답할 수 없는 세션(%s)에서는 묻지 않고 1로 종료한다', async (_shape, stdinValue) => {
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true })
+    Object.defineProperty(process.stdin, 'isTTY', { value: stdinValue, configurable: true })
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(cmdAdminInit({})).rejects.toThrow('process.exit')
+    expect(mockText).not.toHaveBeenCalled()
+    expect(mockPassword).not.toHaveBeenCalled()
+    // Nothing was created, and the exit code says so rather than reading as success.
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(exitSpy).toHaveBeenCalledWith(1)
+    expect(output.join('\n')).toContain('terminal is required')
+  })
+
+  it('ws:// relay URL을 http://로 변환', async () => {
+    mockInputs('admin@test.com', 'password123')
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: vi.fn().mockResolvedValue({ ok: true }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await cmdAdminInit({ relay: 'ws://remote:4000' })
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('http://remote:4000'),
+      expect.anything(),
+    )
+  })
+})

@@ -1,0 +1,76 @@
+{
+  "name": "@tapflowio/relay",
+  "version": "0.28.0",
+  "description": "WebSocket relay server for tapflow — NAT traversal, session routing, JWT auth, bundled dashboard",
+  "keywords": [
+    "tapflow",
+    "relay",
+    "websocket",
+    "self-hosted",
+    "ios",
+    "android",
+    "simulator"
+  ],
+  "homepage": "https://github.com/jo-duchan/tapflow",
+  "bugs": "https://github.com/jo-duchan/tapflow/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jo-duchan/tapflow.git",
+    "directory": "packages/relay"
+  },
+  "license": "MIT",
+  "author": "tapflow contributors",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "tsx": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "public",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -b && rm -rf dist/migrations && cp -r src/migrations dist/migrations",
+    "typecheck": "tsc -b && tsc -p src/__tests__/tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@tapflowio/agent-core": "workspace:*",
+    "@tapflowio/protocol": "workspace:*",
+    "acme-client": "^5.4.0",
+    "better-sqlite3": "^12.11.1",
+    "busboy": "^1.6.0",
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^10.1.2",
+    "ws": "^8.22.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@tapflowio/test-utils": "workspace:*",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/busboy": "^1.5.5",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.20.5",
+    "@types/nodemailer": "^8.0.2",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.12"
+  }
+}

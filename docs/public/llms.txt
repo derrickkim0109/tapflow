@@ -1,0 +1,96 @@
+# tapflow
+
+> tapflow is an open-source, self-hosted tool that lets your entire team — PO, PM, designers, backend engineers, and QA — run iOS simulators and Android emulators directly in the browser. No IDE, no device setup, no data leaving your network.
+>
+> It is a self-hosted, open-source alternative to cloud testing services like Appetize and BrowserStack App Live. Unlike those services, tapflow runs on Macs your team already owns, so your app binaries and test data never leave your network.
+>
+> Architecture: a Mac Agent connects outbound to a Relay server; team members open the dashboard in any browser and interact with the simulator in real time. The Relay also exposes a REST API and an MCP server for LLM-based automation.
+>
+> Two testing paths:
+> - Manual review (primary): CI uploads a build → team tests in the browser
+> - AI Agent via MCP (experimental): an LLM agent controls the simulator using @tapflowio/mcp-server
+>
+> Every page below is also served as its source markdown at the same URL with a `.md` suffix, and all of them concatenated are at https://www.tapflow.dev/llms-full.txt. Korean translations of every page live under `/ko/` with the same paths and the same content.
+>
+> Read the page you need rather than the concatenation. A tool that truncates or summarises a large fetch loses the end of `llms-full.txt`, which is where the reference pages are — the CLI, the REST API and every configuration key.
+
+## Get started
+
+- [Introduction](https://www.tapflow.dev/get-started/introduction): What tapflow is, who does what (an operator sets up a Mac; teammates only open a browser), the key concepts (relay, agent, dashboard, App Center, build, QA Session, roles), architecture diagrams, and the manual-first vs experimental MCP paths.
+- [Quick Start](https://www.tapflow.dev/get-started/quick-start): Operator tutorial from install to the first tap: prerequisites, tapflow setup, optional tapflow init, tapflow start and its banner, the admin account, uploading your build, Start QA, picking a Mac and device, Launch app, and inviting a teammate with the dashboard's LAN address.
+- [For teammates](https://www.tapflow.dev/get-started/teammates): For a teammate who received an invite link: accept it, save the dashboard address, pick a build in App Center, start a QA Session, leave comments, what each role (Viewer / QA / Developer / Admin) may do, and profile settings.
+
+## Test apps
+
+- [Test apps](https://www.tapflow.dev/testing): How teammates test builds in the browser: pick a build in App Center, drive a simulator or emulator in a QA Session, and leave what you found.
+- [App Center](https://www.tapflow.dev/testing/app-center): The dashboard's build list, grouped by app and version: uploading builds (.app.zip / .tar.gz for iOS simulators, .apk), search and status filter, what each review status means, scheduled deletion, and the Start QA button (disabled for Done).
+
+### QA Session
+
+- [QA Session](https://www.tapflow.dev/testing/qa-session): Pick a Mac and a device to start a session and drive the device screen from your browser. Every feature a session offers, the info card, keyboard shortcuts, and why a session ends.
+- [Device controls](https://www.tapflow.dev/testing/device-controls): Touch, swipe and Option-drag pinch, typing after clicking the screen, Launch app, device buttons, the iOS software keyboard, rotate, fold/unfold, restart, and the clipboard bridge (device → you needs HTTPS).
+- [Deep links](https://www.tapflow.dev/testing/deep-links): Open a specific screen of the app from a URL with the toolbar's Open a deeplink button or ⌘K, on iOS and Android.
+- [Network Control](https://www.tapflow.dev/testing/network-control): Take a simulator or emulator offline from the toolbar and bring it back. Exactly which connections are cut and which are not, why localhost is exempt, and why iOS needs the bundled network extension.
+- [Audio](https://www.tapflow.dev/testing/audio): Device audio in the browser — on by default on both platforms, the one-time permission, per-agent opt-out with TAPFLOW_AUDIO=off, volume, and why the agent Mac itself stays silent.
+- [Screenshots & recordings](https://www.tapflow.dev/testing/screenshots-and-recordings): ⌘S downloads a PNG locally and never uploads it; ⌘⇧Y records an mp4/webm that is saved to the relay, listed in the build's Recordings tab, and kept for 72 hours.
+- [Comments](https://www.tapflow.dev/testing/comments): A flat, per-build list of notes with png/jpg/webp images up to 5 MB, links to a single comment (need HTTPS to copy), and posting from CI.
+
+## Operate
+
+### Set up a Mac
+
+- [Requirements](https://www.tapflow.dev/operate/requirements): Node.js ≥ 22 for relay and agent; Xcode for iOS; Android SDK + AVD for Android; any modern browser for the dashboard. Names the verified macOS and Xcode versions.
+- [Environment Setup](https://www.tapflow.dev/operate/environment-setup): `tapflow doctor` to diagnose what a Mac is missing, and `tapflow setup` to install and configure it — per platform, including the Xcode license and first-launch steps that need sudo.
+- [Configuring tapflow](https://www.tapflow.dev/operate/configure): `tapflow init` and the `tapflow.config.json` it writes — tunnel choice, streaming profile on a LAN, certificate method, and the `.env` that holds secrets. Skippable if port 4000 over HTTP with no tunnel is fine.
+- [Agent Setup](https://www.tapflow.dev/operate/agents): Start the Mac agent and connect it to the relay. listing and creating devices for iOS and Android, and authenticating a remote agent with a PAT.
+- [iOS Network Extension](https://www.tapflow.dev/operate/network-extension): Install and approve the network extension that iOS network control needs on the agent Mac, and recover when replacing it cuts the Mac off or a device comes back online by itself.
+
+### Deploy the relay
+
+- [Deployment Options](https://www.tapflow.dev/operate/deployment): Choose where the relay runs: on the same Mac as the agent, on a separate always-on Mac, or in Docker, and how teammates on the same network reach it.
+- [Deploy with Docker](https://www.tapflow.dev/operate/docker): Run the relay from the official Docker image on an always-on LAN box: the Compose file, the required volume, the relay URL for invite links, and creating the first account.
+- [External Access](https://www.tapflow.dev/operate/external-access): Reach the relay from outside the office through an outbound tunnel — Tailscale for tailnet members, or rathole through a VPS you own for a public URL — with optional HTTPS for the Smooth profile.
+- [HTTPS](https://www.tapflow.dev/operate/https): Serve the relay over HTTPS so teammates get the Smooth stream with native resolution and hardware decoding: a certificate from your DNS account, a certificate you already have, or HTTPS through Tailscale or a VPS.
+- [Streaming Quality](https://www.tapflow.dev/operate/streaming-quality): The three streaming profiles (Standard / Smooth / Remote), which one a viewer gets from how it connects, the decoder and resolution behind each, and how to tune the resolution.
+- [Backups & Uptime](https://www.tapflow.dev/operate/relay-operations): Back up the relay's data directory (Litestream for SQLite), and keep the relay running with PM2 on a Mac or systemd on Linux.
+
+### Run the team
+
+- [Team, Roles & Tokens](https://www.tapflow.dev/operate/team-and-roles): The dashboard's Settings pages: workspace, apps and flow run video storage, the member list with roles, invitations and password resets (Admin), and personal access tokens for CI and remote agents (Admin, Developer, QA).
+- [Scaling Mac Resources](https://www.tapflow.dev/operate/scaling): Add more Mac hosts to the same relay for a larger device pool. Agent naming, per-Mac device limits, and monitoring via Mac Resources tab.
+
+### Deliver builds
+
+- [Build Distribution](https://www.tapflow.dev/operate/ci-distribution): Connect your CI pipeline to upload builds automatically. Includes Personal Access Token setup, curl examples, GitHub Actions full example with branch/commit metadata, and build status reference.
+- [Webhooks](https://www.tapflow.dev/operate/webhooks): Register a URL that tapflow POSTs to when someone moves a build to Done or Rejected — the review verdict, not a build completion. Payload shape, signature verification, and when it fires.
+
+### AI automation (MCP and flows — experimental)
+
+- [MCP Server](https://www.tapflow.dev/automation/mcp-server): Install and configure @tapflowio/mcp-server. Supports Claude Code, Codex, Cursor, and any MCP-compatible client. Available tools: list_builds, list_devices, connect_device, disconnect_device, boot_device, shutdown_device, screenshot, query_ui_tree, tap, swipe, type_text, press_key, press_button, install_app, launch_app, run_flow, list_runs, get_run. connect_device returns a dashboard link for watching the device live.
+- [Flow Reference](https://www.tapflow.dev/automation/flows): The YAML flow format replayed deterministically by `tapflow flow run` with no LLM calls — file structure, every step type, selectors, running in CI, the link for watching a run, and how it relates to the `run_flow` MCP tool.
+- [Flow Runs](https://www.tapflow.dev/automation/runs): The dashboard page for `tapflow flow run`'s records — CI and local runs apart, each flow's result, steps, the screen it failed on or ended on and a video of the whole flow, product vs environment failures, and a link to watch a run in progress.
+- [MCP in CI/CD](https://www.tapflow.dev/automation/mcp-ci): Run automated smoke tests on every build using claude CLI + MCP. Includes GitHub Actions example, multi-device matrix, example test prompts, and tips for reliable agentic test scripts.
+
+## Reference
+
+- [CLI Reference](https://www.tapflow.dev/reference/cli): Every command with a section on that page — doctor, setup, init, admin init, start, relay start, agent start, devices, boot, reset, status, logs, migrate, migrate data-dir, migrate net-filter. `tapflow flow run` is documented under Flow Reference instead.
+- [Configuration](https://www.tapflow.dev/reference/configuration): tapflow.config.json schema and environment variable overrides (JWT_SECRET, TAPFLOW_PORT, TAPFLOW_DATA_DIR, SMTP_*, etc.).
+- [REST API](https://www.tapflow.dev/reference/api): Full REST API reference — Auth, Invitations, Password reset, Apps, Builds, Comments, Team, Tokens, Profile, Settings, Recordings, Agents, Logs. Base path: /api/v1/.
+- [Keyboard shortcuts](https://www.tapflow.dev/reference/keyboard-shortcuts): Every dashboard shortcut: QA Session actions (deep link, screenshot, recording, rotate, Home, software keyboard, pinch, clipboard), typing on the device, the sidebar, and the Mac Resources charts.
+- [Security & Privacy](https://www.tapflow.dev/reference/security): How tapflow keeps data on-prem — build files, device streams, and session recordings never leave your network. LAN-first architecture, PAT-based authentication with scopes, and TLS via reverse proxy.
+- [Performance & Latency](https://www.tapflow.dev/reference/performance): What tapflow streaming actually measures — bandwidth, decode latency on the WASM (tinyh264) path over a real LAN, the glass-to-glass estimate against the ~100 ms direct-manipulation budget, known limitations, and how to reproduce the numbers.
+- [Sustainability](https://www.tapflow.dev/reference/sustainability): Why reusing Macs a team already owns lowers the hardware footprint of mobile QA — embodied carbon, the SCI standard, what we measured, and the limits of the claim.
+
+## Troubleshooting
+
+- [Troubleshooting](https://www.tapflow.dev/troubleshooting): Fixes for tapflow problems, grouped by area — install and agents, iOS simulator, Android emulator, builds, streaming, and sign-in — and how to read the relay's logs.
+- [Install & Agents](https://www.tapflow.dev/troubleshooting/install-and-agents): An agent that will not start or connect, `tapflow doctor` failures, and a relay that uses a configuration you did not expect.
+- [iOS Simulator](https://www.tapflow.dev/troubleshooting/ios-simulator): `spawn unknown error`, the CoreSimulator service version mismatch, a simulator that cannot be located on disk, and Korean input on iOS 17 and earlier.
+- [Android Emulator](https://www.tapflow.dev/troubleshooting/android-emulator): An emulator stream that does not start, colors that look less saturated than the emulator window, and an emulator that slows down when the Mac is unattended.
+- [Builds & Uploads](https://www.tapflow.dev/troubleshooting/builds): iOS upload errors (.ipa vs .app.zip), INSTALL_FAILED_NO_MATCHING_ABIS on Apple Silicon, and an APK that shows as Unversioned or merges into the wrong app.
+- [Stream & Sessions](https://www.tapflow.dev/troubleshooting/streaming): A stream that lags or stutters — Wi-Fi (AWDL), host load, display sleep, low resolution on a LAN — and a session that ends by itself.
+- [Sign-in & Accounts](https://www.tapflow.dev/troubleshooting/accounts): `tapflow admin init` reporting Already initialized, and an invitation or password reset link that has expired.
+
+## Contributing
+
+- [Contributing Guide](https://www.tapflow.dev/contributing): The monorepo's package layout, where each platform's agent lives, and how to report a bug. The full contributing guide is CONTRIBUTING.md in the repository.

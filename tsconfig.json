@@ -1,0 +1,29 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/protocol"
+    },
+    {
+      "path": "packages/agent-core"
+    },
+    {
+      "path": "packages/audiotap-helper"
+    },
+    {
+      "path": "packages/flow-runner"
+    },
+    {
+      "path": "packages/relay"
+    },
+    {
+      "path": "packages/ios-agent"
+    },
+    {
+      "path": "packages/android-agent"
+    },
+    {
+      "path": "packages/cli"
+    }
+  ]
+}

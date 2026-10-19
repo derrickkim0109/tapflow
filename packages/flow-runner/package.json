@@ -1,0 +1,63 @@
+{
+  "name": "@tapflowio/flow-runner",
+  "version": "0.28.0",
+  "description": "Deterministic YAML flow runner for tapflow — replay UI test flows against simulators/emulators with zero LLM calls",
+  "keywords": [
+    "tapflow",
+    "flow",
+    "ui-testing",
+    "ios",
+    "android",
+    "simulator",
+    "ci"
+  ],
+  "homepage": "https://github.com/jo-duchan/tapflow",
+  "bugs": "https://github.com/jo-duchan/tapflow/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jo-duchan/tapflow.git",
+    "directory": "packages/flow-runner"
+  },
+  "license": "MIT",
+  "author": "tapflow contributors",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./schema/tapflow-flow.schema.json": "./schema/tapflow-flow.schema.json"
+  },
+  "files": [
+    "dist",
+    "schema"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit && tsc -p src/__tests__/tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@tapflowio/agent-core": "workspace:*",
+    "@tapflowio/protocol": "workspace:*",
+    "ws": "^8.22.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.12"
+  }
+}

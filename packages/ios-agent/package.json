@@ -1,0 +1,80 @@
+{
+  "name": "@tapflowio/ios-agent",
+  "version": "0.28.0",
+  "description": "iOS simulator agent for tapflow — xcrun simctl control and screen streaming",
+  "keywords": [
+    "tapflow",
+    "ios",
+    "simulator",
+    "xcrun",
+    "simctl",
+    "streaming",
+    "qa"
+  ],
+  "homepage": "https://github.com/jo-duchan/tapflow",
+  "bugs": "https://github.com/jo-duchan/tapflow/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jo-duchan/tapflow.git",
+    "directory": "packages/ios-agent"
+  },
+  "license": "MIT",
+  "author": "tapflow contributors",
+  "os": [
+    "darwin"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "tsx": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "xctest-runner/project.yml",
+    "xctest-runner/TreeHost",
+    "xctest-runner/TreeRunner",
+    "xctest-runner/TapflowTreeRunner.xcodeproj",
+    "README.md",
+    "LICENSE",
+    "LICENSE-APACHE-2.0",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "postinstall": "node -e \"if (process.platform === 'darwin') { require('fs').readdirSync('bin').forEach(f => require('fs').chmodSync('bin/' + f, 0o755)) }\"",
+    "build": "tsc -b",
+    "typecheck": "tsc -b && tsc -p src/__tests__/tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src",
+    "build:nethook": "./build-nethook.sh",
+    "test:netfilter": "./ios-netfilter/run-tests.sh"
+  },
+  "dependencies": {
+    "@tapflowio/agent-core": "workspace:*",
+    "@tapflowio/protocol": "workspace:*",
+    "@tapflowio/audiotap-helper": "workspace:*",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@tapflowio/relay": "workspace:*",
+    "@tapflowio/test-utils": "workspace:*",
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.12"
+  }
+}

@@ -1,0 +1,1562 @@
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
+import crypto from 'crypto'
+import fs from 'fs'
+import net from 'net'
+import os from 'os'
+import path from 'path'
+import { WebSocket } from 'ws'
+import { RelayServer } from '../RelayServer'
+import { initDb, closeDb, getDb } from '../db'
+import { hashPat } from '../middleware/auth'
+import { writeEnvelopeHeader, HEADER_SIZE, CODEC_AUDIO } from '@tapflowio/agent-core/utils'
+import { barrier, waitForMessage, waitForOpen, waitForType, waitForTypeOrNull } from '@tapflowio/test-utils'
+import type { AgentRegistered, AgentsListed, DeviceReady, DeviceShutdown, InputTouchStart, OpenUrl, OpenUrlError, SessionJoined, SessionTerminated, StreamRequestIdr } from '@tapflowio/protocol'
+
+// Sends a raw HTTP request, bypassing client-side URL normalization.
+const rawHttpGet = (targetPort: number, rawPath: string): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const socket = net.createConnection(targetPort, '127.0.0.1')
+    socket.once('connect', () => {
+      socket.write(`GET ${rawPath} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`)
+    })
+    socket.once('data', (data) => {
+      const match = /HTTP\/1\.\d (\d{3})/.exec(data.toString())
+      resolve(match ? parseInt(match[1]) : 0)
+      socket.destroy()
+    })
+    socket.on('error', reject)
+  })
+
+
+
+describe('RelayServer', () => {
+  let server: RelayServer
+  let port: number
+  let tmpDir: string
+
+  beforeAll(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-relay-test-'))
+    initDb(path.join(tmpDir, 'test.db'))
+  })
+
+  afterAll(() => {
+    closeDb()
+    fs.rmSync(tmpDir, { recursive: true })
+  })
+
+  beforeEach(async () => {
+    server = new RelayServer({ port: 0 })
+    await server.start()
+    port = (server.address() as { port: number }).port
+  })
+
+  afterEach(async () => {
+    await server.stop()
+  })
+
+  it('accepts WebSocket connections', async () => {
+    const ws = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(ws)
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+    ws.close()
+  })
+
+  it('registers an agent with devices and returns registeredSessions', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const ws = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(ws)
+    ws.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-1', devices }))
+    const msg = await waitForMessage<AgentRegistered>(ws)
+    expect(msg.type).toBe('agent:registered')
+    expect(msg.registeredSessions).toHaveLength(1)
+    expect(msg.registeredSessions[0]!.deviceId).toBe('devA')
+    expect(typeof msg.registeredSessions[0]!.sessionId).toBe('string')
+    ws.close()
+  })
+
+  it('registers an agent with multiple devices — one sessionId per device', async () => {
+    const devices = [
+      { id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' },
+      { id: 'devB', name: 'iPhone B', platform: 'ios', status: 'shutdown' },
+    ]
+    const ws = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(ws)
+    ws.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-1', devices }))
+    const msg = await waitForMessage<AgentRegistered>(ws)
+    expect(msg.registeredSessions).toHaveLength(2)
+    const ids = msg.registeredSessions.map((s) => s.sessionId)
+    expect(ids[0]).not.toBe(ids[1])
+    ws.close()
+  })
+
+  it('re-register from the same agent (hostname+platform) evicts the stale socket — one card, not a duplicate', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+
+    const agent1 = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent1)
+    agent1.send(JSON.stringify({ type: 'agent:register', agentId: 'uuid-1', agentName: 'MyMac', platform: 'ios', devices }))
+    await waitForType<AgentRegistered>(agent1, 'agent:registered')
+    const agent1Closed = new Promise<void>((resolve) => agent1.on('close', () => resolve()))
+
+    // Unclean reconnect: a fresh socket from the same Mac before the old socket's close fires.
+    const agent2 = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent2)
+    agent2.send(JSON.stringify({ type: 'agent:register', agentId: 'uuid-1', agentName: 'MyMac', platform: 'ios', devices }))
+    await waitForType<AgentRegistered>(agent2, 'agent:registered')
+
+    // The relay terminates the stale socket.
+    await agent1Closed
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'agents:list' }))
+    const listed = await waitForType<AgentsListed>(browser, 'agents:listed')
+    expect(listed.sessions.filter((s) => s.agentName === 'MyMac')).toHaveLength(1)
+
+    agent2.close()
+    browser.close()
+  })
+
+  it('keeps iOS and Android agents on the same Mac as separate cards', async () => {
+    const iosAgent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(iosAgent)
+    iosAgent.send(JSON.stringify({ type: 'agent:register', agentId: 'uuid-mac', agentName: 'MyMac', platform: 'ios', devices: [{ id: 'i1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+    await waitForType<AgentRegistered>(iosAgent, 'agent:registered')
+
+    const androidAgent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(androidAgent)
+    androidAgent.send(JSON.stringify({ type: 'agent:register', agentId: 'uuid-mac', agentName: 'MyMac', platform: 'android', devices: [{ id: 'a1', name: 'Pixel', platform: 'android', status: 'shutdown' }] }))
+    await waitForType<AgentRegistered>(androidAgent, 'agent:registered')
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'agents:list' }))
+    const listed = await waitForType<AgentsListed>(browser, 'agents:listed')
+    expect(listed.sessions.filter((s) => s.agentName === 'MyMac')).toHaveLength(2)
+
+    iosAgent.close()
+    androidAgent.close()
+    browser.close()
+  })
+
+  it('does not evict a different Mac that shares a hostname (distinct machine ids → two cards)', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+
+    const macA = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(macA)
+    macA.send(JSON.stringify({ type: 'agent:register', agentId: 'uuid-A', agentName: 'DupName', platform: 'ios', devices }))
+    await waitForType<AgentRegistered>(macA, 'agent:registered')
+
+    const macB = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(macB)
+    macB.send(JSON.stringify({ type: 'agent:register', agentId: 'uuid-B', agentName: 'DupName', platform: 'ios', devices }))
+    await waitForType<AgentRegistered>(macB, 'agent:registered')
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'agents:list' }))
+    const listed = await waitForType<AgentsListed>(browser, 'agents:listed')
+    expect(listed.sessions.filter((s) => s.agentName === 'DupName')).toHaveLength(2)
+
+    macA.close()
+    macB.close()
+    browser.close()
+  })
+
+  it('allows a browser to join a device session', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-2', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    const msg = await waitForMessage(browser)
+    expect(msg.type).toBe('session:joined')
+    // **The address on the success half, and nothing held it.** L5d added four assertions that each
+    // *refusal* names the right session and none that the reply does — and the reply is the one both
+    // clients already matched strictly (`sessionId === mine`), so it had the largest blast radius and the
+    // least coverage. Measured: pointing it at `session.deviceId` instead passed relay 620, ios 382,
+    // android 263 and the static suite, while **no client could join at all** — viewer spinning forever,
+    // `connect_device` and `joinSession` burning their deadlines. The agent suites miss it because they
+    // wait on the type alone; `waitForMessage` here returns the frame, so the id is readable.
+    expect(msg.sessionId).toBe(sessionId)
+
+    agent.close()
+    browser.close()
+  })
+
+  it('addresses the refusal from the unanticipated join failure too', async () => {
+    // The fourth `error` exit, and the only one no other test reaches: `join()` throws for not-found and busy
+    // as well, and both are answered above it, so getting here means a condition the handler did not foresee.
+    // Its own comment says so, and that is why it exists — an earlier version was a bare `catch {}` that
+    // swallowed the cause entirely.
+    //
+    // Forced with a spy rather than left unpinned. A mutation confirmed the gap: replacing this exit's address
+    // with a literal passed all 619 relay tests, and an address no test can hold is one that will drift.
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-3', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const sessions = (server as unknown as { sessions: { join(id: string, ws: WebSocket): void } }).sessions
+    const join = vi.spyOn(sessions, 'join').mockImplementation(() => { throw new Error('unforeseen') })
+    try {
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      const msg = await waitForMessage(browser)
+
+      expect(msg.type).toBe('error')
+      expect(msg.sessionId).toBe(sessionId)
+      // `session-not-found` rather than `session-busy`, because busy was already answered above — putting a
+      // specific claim on an unknown cause is what `reason` exists to stop.
+      expect(msg.reason).toBe('session-not-found')
+      browser.close()
+    } finally { join.mockRestore() }
+
+    agent.close()
+  })
+
+  it('returns error when joining a non-existent session', async () => {
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId: 'bad-id' }))
+    const msg = await waitForMessage(browser)
+    expect(msg.type).toBe('error')
+    expect(msg.message).toBe('Session not found')
+    // The refusal names the id it could not find — the session does not exist, but the *request* does, and it
+    // is the request the caller's waiter is keyed on.
+    expect(msg.sessionId).toBe('bad-id')
+    expect(msg.reason).toBe('session-not-found')
+    browser.close()
+  })
+
+  it('returns error when a second browser tries to join a busy session', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-4', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser1 = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser1)
+    browser1.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser1) // session:joined
+
+    const browser2 = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser2)
+    browser2.send(JSON.stringify({ type: 'session:start', sessionId }))
+    const msg = await waitForMessage(browser2)
+    expect(msg.type).toBe('error')
+    expect(msg.message).toBe('Session busy')
+    // L5d. Every refusal names the join it refuses, and each of the four exits needs its own assertion:
+    // asserting one leaves the other three free to carry a literal, and the two `'Session not found'` exits
+    // are especially easy to mistake for one. Before this, `error` carried no address at all and the clients'
+    // join waiters had a `sessionId === undefined` escape that let any refusal resolve any pending join —
+    // #512's first finding.
+    expect(msg.sessionId).toBe(sessionId)
+    expect(msg.reason).toBe('session-busy')
+
+    agent.close()
+    browser1.close()
+    browser2.close()
+  })
+
+  it('two browsers can use different device sessions concurrently', async () => {
+    const devices = [
+      { id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' },
+      { id: 'devB', name: 'iPhone B', platform: 'ios', status: 'shutdown' },
+    ]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-5', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionA = registeredSessions.find((s) => s.deviceId === 'devA')!.sessionId
+    const sessionB = registeredSessions.find((s) => s.deviceId === 'devB')!.sessionId
+
+    const browserA = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browserA)
+    browserA.send(JSON.stringify({ type: 'session:start', sessionId: sessionA }))
+    const msgA = await waitForMessage(browserA)
+    expect(msgA.type).toBe('session:joined')
+
+    const browserB = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browserB)
+    browserB.send(JSON.stringify({ type: 'session:start', sessionId: sessionB }))
+    const msgB = await waitForMessage(browserB)
+    expect(msgB.type).toBe('session:joined')
+
+    agent.close()
+    browserA.close()
+    browserB.close()
+  })
+
+  it('tells an attached viewer its session ended when the agent disconnects (#426)', async () => {
+    // Its own server with a near-zero hold: the session now outlives its agent's socket while the
+    // relay waits for that agent to come back, and the default window is far longer than any test
+    // should sit through. The notice itself is unchanged — only when it arrives.
+    const shortServer = new RelayServer({ port: 0, agentGraceMs: 20 })
+    try {
+      await shortServer.start()
+      const shortPort = (shortServer.address() as { port: number }).port
+      const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+      const agent = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-6', devices }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      const browser = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      await waitForType<SessionJoined>(browser, 'session:joined')
+
+      // Without the notice the browser keeps a live socket addressed to a sessionId the relay has
+      // dropped: everything it sends is ignored and nothing streams back, with no way to tell.
+      const endedPromise = waitForType<SessionTerminated>(browser, 'session:terminated')
+      agent.close()
+      const ended = await endedPromise
+
+      expect(ended.sessionId).toBe(sessionId)
+      expect(ended.reason).toBe('agent-disconnected')
+
+      browser.close()
+    } finally {
+      await shortServer.stop()
+    }
+  })
+
+  it('handles an agent disconnect with no viewer attached', async () => {
+    const devices = [{ id: 'devSolo', name: 'iPhone Solo', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-7', devices }))
+    await waitForMessage(agent)
+
+    // Arm the close listener before closing: `agent.close()` returns immediately and the relay's
+    // eviction runs on its own close handler, so querying straight away can observe the session
+    // still present and prove nothing.
+    const agentClosed = new Promise<void>((resolve) => agent.on('close', () => resolve()))
+    agent.close()
+    await agentClosed
+
+    // The session had no browserSocket, so there is nobody to notify. The relay must skip it
+    // rather than throw — proven by it still answering, and by the device no longer being offered.
+    // Not the same as the session being gone: it is held for a returning agent (#426) and merely
+    // left out of the list, since nobody can pick it while its agent is away.
+    const probe = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(probe)
+    probe.send(JSON.stringify({ type: 'agents:list' }))
+    const listed = await waitForType<AgentsListed>(probe, 'agents:listed')
+    // Not `listed.sessions ?? []` — that would also pass if the field went missing entirely, which
+    // is a different bug wearing the same green tick.
+    expect(listed.sessions).toBeDefined()
+    expect(listed.sessions.filter((s) => s.devices.some((d) => d.id === 'devSolo'))).toHaveLength(0)
+    probe.close()
+  })
+
+  it('routes input:touch:start from browser to agent', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-8', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    const touchPromise = waitForMessage(agent)
+    browser.send(JSON.stringify({ type: 'input:touch:start', sessionId, payload: { x: 0.5, y: 0.5 } }))
+    const touch = await touchPromise
+    expect(touch.type).toBe('input:touch:start')
+    expect(touch.payload).toEqual({ x: 0.5, y: 0.5 })
+
+    agent.close()
+    browser.close()
+  })
+
+  // #910. The relay forwards the parsed message rather than the raw one, so the target reaches the
+  // agent only because the schema declares it — and a relay that rebuilt the message would drop it
+  // with every other test here still green.
+  //
+  // Mutation: forward `{ type, sessionId }` for input:rotate.
+  it('routes input:rotate to the agent with its target', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-910', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    const rotatePromise = waitForMessage(agent)
+    browser.send(JSON.stringify({ type: 'input:rotate', sessionId, payload: { orientation: 'landscape' } }))
+    const rotate = await rotatePromise
+    expect(rotate.type).toBe('input:rotate')
+    expect(rotate.payload).toEqual({ orientation: 'landscape' })
+
+    agent.close()
+    browser.close()
+  })
+
+  it('input from browserA does not reach browserB session agent', async () => {
+    const devices = [
+      { id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' },
+      { id: 'devB', name: 'iPhone B', platform: 'ios', status: 'shutdown' },
+    ]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-9', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionA = registeredSessions.find((s) => s.deviceId === 'devA')!.sessionId
+    const sessionB = registeredSessions.find((s) => s.deviceId === 'devB')!.sessionId
+
+    const browserA = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browserA)
+    browserA.send(JSON.stringify({ type: 'session:start', sessionId: sessionA }))
+    await waitForMessage(browserA)
+
+    // Agent receives browserA's touch for sessionA
+    const touchPromise = waitForType<InputTouchStart>(agent, 'input:touch:start')
+    browserA.send(JSON.stringify({ type: 'input:touch:start', sessionId: sessionA, payload: { x: 0.1, y: 0.2 } }))
+    const touch = await touchPromise
+    expect(touch.sessionId).toBe(sessionA)  // carries sessionA, not sessionB
+
+    // A touch for sessionB should also route correctly when browser B joins
+    const browserB = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browserB)
+    browserB.send(JSON.stringify({ type: 'session:start', sessionId: sessionB }))
+    await waitForMessage(browserB)
+
+    const touch2Promise = waitForType<InputTouchStart>(agent, 'input:touch:start')
+    browserB.send(JSON.stringify({ type: 'input:touch:start', sessionId: sessionB, payload: { x: 0.9, y: 0.8 } }))
+    const touch2 = await touch2Promise
+    expect(touch2.sessionId).toBe(sessionB)
+
+    agent.close()
+    browserA.close()
+    browserB.close()
+  })
+
+  it('routes device:boot from browser to agent', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-10', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    const bootPromise = waitForMessage(agent)
+    browser.send(JSON.stringify({ type: 'device:boot', sessionId, requestId: 'rq-route', payload: { deviceId: 'devA' } }))
+    const boot = await bootPromise
+    expect(boot.type).toBe('device:boot')
+    expect((boot.payload as { deviceId: string }).deviceId).toBe('devA')
+
+    agent.close()
+    browser.close()
+  })
+
+  it('routes device:booting and device:ready from agent to browser', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-11', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    const bootingPromise = waitForMessage(browser)
+    agent.send(JSON.stringify({ type: 'device:booting', sessionId }))
+    const booting = await bootingPromise
+    expect(booting.type).toBe('device:booting')
+
+    const readyPromise = waitForMessage(browser)
+    agent.send(JSON.stringify({ type: 'device:ready', sessionId, payload: { deviceId: 'devA' } }))
+    const ready = await readyPromise
+    expect(ready.type).toBe('device:ready')
+    expect((ready.payload as { deviceId: string }).deviceId).toBe('devA')
+
+    agent.close()
+    browser.close()
+  })
+
+  it('registers a stream socket and forwards binary frames to browser', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-12', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    browser.binaryType = 'nodebuffer'
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser) // session:joined
+
+    // Stream WS connects and registers
+    const streamWs = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(streamWs)
+    streamWs.send(JSON.stringify({ type: 'stream:register', sessionId }))
+    const ack = await waitForMessage(streamWs)
+    expect(ack.type).toBe('stream:registered')
+
+    // Binary frames sent via stream WS are forwarded to browser
+    const framePromise = new Promise<Buffer>((r) =>
+      browser.once('message', (d, isBinary) => { if (isBinary) r(d as Buffer) })
+    )
+    const frame = Buffer.from([0xff, 0xd8, 0xff]) // fake JPEG header
+    streamWs.send(frame)
+    const received = await framePromise
+    expect(received).toEqual(frame)
+
+    agent.close()
+    browser.close()
+    streamWs.close()
+  })
+
+  it('relay patches relayedAt in TFFE envelope frames and forwards to browser', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-13', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    browser.binaryType = 'nodebuffer'
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser) // session:joined
+
+    const streamWs = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(streamWs)
+    streamWs.send(JSON.stringify({ type: 'stream:register', sessionId }))
+    await waitForMessage(streamWs) // stream:registered
+
+    const capturedAt = Date.now() - 10
+    const envelopedFrame = writeEnvelopeHeader(Buffer.from([0xFF, 0xD8]), capturedAt)
+
+    const framePromise = new Promise<Buffer>((r) =>
+      browser.once('message', (d, isBinary) => { if (isBinary) r(d as Buffer) })
+    )
+    const beforeSend = Date.now()
+    streamWs.send(envelopedFrame)
+    const received = await framePromise
+    const afterSend = Date.now()
+
+    expect(received.length).toBe(envelopedFrame.length)
+    const relayedAt = Number(received.readBigUInt64BE(14))
+    expect(relayedAt).toBeGreaterThanOrEqual(beforeSend)
+    expect(relayedAt).toBeLessThanOrEqual(afterSend + 50)
+    // payload bytes preserved
+    expect(received.subarray(HEADER_SIZE)).toEqual(Buffer.from([0xFF, 0xD8]))
+
+    agent.close()
+    browser.close()
+    streamWs.close()
+  })
+
+  it('relay forwards CODEC_AUDIO frames to browser (audio routing, relayedAt patched)', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-14', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    browser.binaryType = 'nodebuffer'
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser) // session:joined
+
+    const streamWs = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(streamWs)
+    streamWs.send(JSON.stringify({ type: 'stream:register', sessionId }))
+    await waitForMessage(streamWs) // stream:registered
+
+    const pcm = Buffer.from([0x11, 0x22, 0x33, 0x44])
+    const audioFrame = writeEnvelopeHeader(pcm, Date.now() - 5, { codec: CODEC_AUDIO })
+
+    const framePromise = new Promise<Buffer>((r) =>
+      browser.once('message', (d, isBinary) => { if (isBinary) r(d as Buffer) })
+    )
+    const beforeSend = Date.now()
+    streamWs.send(audioFrame)
+    const received = await framePromise
+    const afterReceive = Date.now()
+
+    // On a near-empty socket the yielding audio sender forwards: payload intact + relayedAt patched
+    // within the send→receive window (bounded both sides so a stray future timestamp can't pass).
+    expect(received.subarray(HEADER_SIZE)).toEqual(pcm)
+    const relayedAt = Number(received.readBigUInt64BE(14))
+    expect(relayedAt).toBeGreaterThanOrEqual(beforeSend)
+    expect(relayedAt).toBeLessThanOrEqual(afterReceive)
+
+    agent.close()
+    browser.close()
+    streamWs.close()
+  })
+
+  it('relay forwards plain (non-envelope) binary frames unchanged', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-15', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    browser.binaryType = 'nodebuffer'
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser) // session:joined
+
+    const streamWs = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(streamWs)
+    streamWs.send(JSON.stringify({ type: 'stream:register', sessionId }))
+    await waitForMessage(streamWs) // stream:registered
+
+    const framePromise = new Promise<Buffer>((r) =>
+      browser.once('message', (d, isBinary) => { if (isBinary) r(d as Buffer) })
+    )
+    const plain = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0])
+    streamWs.send(plain)
+    const received = await framePromise
+    expect(received).toEqual(plain)
+
+    agent.close()
+    browser.close()
+    streamWs.close()
+  })
+
+  it('stream from devA does not reach browser of devB', async () => {
+    const devices = [
+      { id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' },
+      { id: 'devB', name: 'iPhone B', platform: 'ios', status: 'shutdown' },
+    ]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-16', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionA = registeredSessions.find((s) => s.deviceId === 'devA')!.sessionId
+    const sessionB = registeredSessions.find((s) => s.deviceId === 'devB')!.sessionId
+
+    const browserA = new WebSocket(`ws://localhost:${port}`)
+    browserA.binaryType = 'nodebuffer'
+    await waitForOpen(browserA)
+    browserA.send(JSON.stringify({ type: 'session:start', sessionId: sessionA }))
+    await waitForMessage(browserA)
+
+    const browserB = new WebSocket(`ws://localhost:${port}`)
+    browserB.binaryType = 'nodebuffer'
+    await waitForOpen(browserB)
+    browserB.send(JSON.stringify({ type: 'session:start', sessionId: sessionB }))
+    await waitForMessage(browserB)
+
+    // Stream WS for devA
+    const streamA = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(streamA)
+    streamA.send(JSON.stringify({ type: 'stream:register', sessionId: sessionA }))
+    await waitForMessage(streamA) // stream:registered
+
+    // browserB should NOT receive frames from streamA
+    let browserBGotBinary = false
+    browserB.on('message', (_d, isBinary) => { if (isBinary) browserBGotBinary = true })
+
+    const framePromise = new Promise<Buffer>((r) =>
+      browserA.once('message', (d, isBinary) => { if (isBinary) r(d as Buffer) })
+    )
+    streamA.send(Buffer.from([0xaa, 0xbb]))
+    const received = await framePromise
+    expect(received).toEqual(Buffer.from([0xaa, 0xbb]))
+    // The relay never sends this frame to browserB's session — so the flag stays false.
+    // framePromise resolved means the relay has already processed the frame and forwarded
+    // it exclusively to browserA. No further waiting needed.
+    expect(browserBGotBinary).toBe(false)
+
+    agent.close()
+    browserA.close()
+    browserB.close()
+    streamA.close()
+  })
+
+  it('wsBackpressureBytes: 0 → binary frames are never forwarded to browser', async () => {
+    // Use a fresh server with threshold=0 so bufferedAmount(0) >= threshold(0) is always true
+    const strictServer = new RelayServer({ port: 0, wsBackpressureBytes: 0 })
+    await strictServer.start()
+    const strictPort = (strictServer.address() as { port: number }).port
+
+    try {
+      const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+      const agent = new WebSocket(`ws://localhost:${strictPort}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-17', devices }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      const browser = new WebSocket(`ws://localhost:${strictPort}`)
+      browser.binaryType = 'nodebuffer'
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      await waitForMessage(browser) // session:joined
+
+      const streamWs = new WebSocket(`ws://localhost:${strictPort}`)
+      await waitForOpen(streamWs)
+      streamWs.send(JSON.stringify({ type: 'stream:register', sessionId }))
+      await waitForMessage(streamWs) // stream:registered
+
+      // Register before send — if drop is broken the frame may arrive before setImmediate fires
+      const dropCheck = new Promise<void>((resolve, reject) => {
+        setImmediate(resolve)
+        browser.once('message', (_d, isBinary) => {
+          if (isBinary) reject(new Error('frame should have been dropped by backpressure'))
+        })
+      })
+      streamWs.send(Buffer.from([0xff, 0xd8, 0xff]))
+      await dropCheck
+
+      agent.close()
+      browser.close()
+      streamWs.close()
+    } finally {
+      await strictServer.stop()
+    }
+  })
+
+  it('agents:listed groups devices by agent and includes sessionId per device', async () => {
+    const devices = [
+      { id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' },
+      { id: 'devB', name: 'iPhone B', platform: 'ios', status: 'shutdown' },
+    ]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'MyMac', devices }))
+    await waitForMessage(agent)
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'agents:list' }))
+    const msg = await waitForMessage<AgentsListed>(browser)
+
+    expect(msg.type).toBe('agents:listed')
+    expect(msg.sessions).toHaveLength(1)
+    expect(msg.sessions[0]!.agentName).toBe('MyMac')
+    expect(msg.sessions[0]!.devices).toHaveLength(2)
+    expect(msg.sessions[0]!.devices[0]!.sessionId).toBeTruthy()
+    expect(msg.sessions[0]!.devices[1]!.sessionId).toBeTruthy()
+    expect(msg.sessions[0]!.devices[0]!.busy).toBe(false)
+
+    agent.close()
+    browser.close()
+  })
+
+  it('agents:listed shows busy=true after browser joins a device session', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-18', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser) // session:joined
+
+    const observer = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(observer)
+    observer.send(JSON.stringify({ type: 'agents:list' }))
+    const listed = await waitForMessage<AgentsListed>(observer)
+    expect(listed.sessions[0]!.devices[0]!.busy).toBe(true)
+
+    agent.close()
+    browser.close()
+    observer.close()
+  })
+
+  it('removes all device sessions when agent disconnects', async () => {
+    const devices = [
+      { id: 'devA', name: 'A', platform: 'ios', status: 'shutdown' },
+      { id: 'devB', name: 'B', platform: 'ios', status: 'shutdown' },
+    ]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-19', devices }))
+    await waitForMessage(agent)
+    agent.close()
+
+    const observer = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(observer)
+    await vi.waitFor(async () => {
+      observer.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForMessage<AgentsListed>(observer)
+      expect(listed.sessions).toHaveLength(0)
+    }, { timeout: 2000 })
+    observer.close()
+  })
+
+  it('agent:resources is reflected in agents:listed', async () => {
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'Mac1', devices: [{ id: 'd1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+    await waitForMessage(agent)
+
+    agent.send(JSON.stringify({
+      type: 'agent:resources',
+      resources: { cpuPercent: 25, memUsedMB: 4096, memTotalMB: 16384, slotsAvailable: 2, slotsTotal: 3, reportedAt: 1000 },
+    }))
+
+    const observer = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(observer)
+    await vi.waitFor(async () => {
+      observer.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForMessage<AgentsListed>(observer)
+      expect(listed.sessions[0]!.resources?.cpuPercent).toBe(25)
+      expect(listed.sessions[0]!.resources?.slotsTotal).toBe(3)
+    }, { timeout: 500 })
+
+    agent.close()
+    observer.close()
+  })
+
+  it('agent resources are cleared after agent disconnects', async () => {
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'Mac1', devices: [{ id: 'd1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+    await waitForMessage(agent)
+    agent.send(JSON.stringify({
+      type: 'agent:resources',
+      resources: { cpuPercent: 50, memUsedMB: 8000, memTotalMB: 16000, slotsAvailable: 3, slotsTotal: 3, reportedAt: 1000 },
+    }))
+    agent.close()
+
+    const observer = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(observer)
+    await vi.waitFor(async () => {
+      observer.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForMessage<AgentsListed>(observer)
+      expect(listed.sessions).toHaveLength(0)
+    }, { timeout: 2000 })
+
+    observer.close()
+  })
+
+  describe('mock-agent — 다중 agent 등록·자원 보고', () => {
+    it('두 mock agent가 독립적으로 등록되어 agents:listed에 각각 표시됨', async () => {
+      const agentA = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agentA)
+      agentA.send(JSON.stringify({
+        type: 'agent:register', platform: 'ios',
+        agentName: 'Mac-A',
+        devices: [
+          { id: 'a1', name: 'iPhone A1', platform: 'ios', status: 'shutdown' },
+          { id: 'a2', name: 'iPhone A2', platform: 'ios', status: 'shutdown' },
+        ],
+      }))
+      await waitForMessage(agentA)
+
+      const agentB = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agentB)
+      agentB.send(JSON.stringify({
+        type: 'agent:register', platform: 'ios',
+        agentName: 'Mac-B',
+        devices: [{ id: 'b1', name: 'iPhone B1', platform: 'ios', status: 'shutdown' }],
+      }))
+      await waitForMessage(agentB)
+
+      const observer = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(observer)
+      observer.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForMessage<AgentsListed>(observer)
+
+      const sessions = listed.sessions!
+      expect(sessions).toHaveLength(2)
+      const macA = sessions.find((s) => s.agentName === 'Mac-A')
+      const macB = sessions.find((s) => s.agentName === 'Mac-B')
+      expect(macA?.devices).toHaveLength(2)
+      expect(macB?.devices).toHaveLength(1)
+
+      agentA.close()
+      agentB.close()
+      observer.close()
+    })
+
+    it('각 agent의 resources가 agents:listed에 독립적으로 반영됨', async () => {
+      const agentA = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agentA)
+      agentA.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'Mac-A', devices: [{ id: 'a1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+      await waitForMessage(agentA)
+      agentA.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 30, memUsedMB: 4000, memTotalMB: 16000, slotsAvailable: 1, slotsTotal: 1, reportedAt: 1000 } }))
+
+      const agentB = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agentB)
+      agentB.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'Mac-B', devices: [{ id: 'b1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+      await waitForMessage(agentB)
+      agentB.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 70, memUsedMB: 12000, memTotalMB: 16000, slotsAvailable: 1, slotsTotal: 1, reportedAt: 1000 } }))
+
+      const observer = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(observer)
+      await vi.waitFor(async () => {
+        observer.send(JSON.stringify({ type: 'agents:list' }))
+        const listed = await waitForMessage<AgentsListed>(observer)
+        const sessions = listed.sessions!
+        const macA = sessions.find((s) => s.agentName === 'Mac-A')
+        const macB = sessions.find((s) => s.agentName === 'Mac-B')
+        expect(macA?.resources?.cpuPercent).toBe(30)
+        expect(macB?.resources?.cpuPercent).toBe(70)
+      }, { timeout: 500 })
+
+      agentA.close()
+      agentB.close()
+      observer.close()
+    })
+
+    it('한 agent 종료 시 해당 agent 세션만 제거됨', async () => {
+      const agentA = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agentA)
+      agentA.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'Mac-A', devices: [{ id: 'a1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+      await waitForMessage(agentA)
+
+      const agentB = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agentB)
+      agentB.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'Mac-B', devices: [{ id: 'b1', name: 'iPhone', platform: 'ios', status: 'shutdown' }] }))
+      await waitForMessage(agentB)
+
+      agentA.close()
+
+      const observer = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(observer)
+      await vi.waitFor(async () => {
+        observer.send(JSON.stringify({ type: 'agents:list' }))
+        const listed = await waitForMessage<AgentsListed>(observer)
+        const sessions = listed.sessions!
+        expect(sessions).toHaveLength(1)
+        expect(sessions[0].agentName).toBe('Mac-B')
+      }, { timeout: 2000 })
+
+      agentB.close()
+      observer.close()
+    })
+  })
+
+  it('browser disconnect starts idle timer — agent receives device:shutdown after timeout', async () => {
+    const shortServer = new RelayServer({ port: 0, idleTimeoutMs: 20 })
+    try {
+      await shortServer.start()
+      const shortPort = (shortServer.address() as { port: number }).port
+
+      const agent = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-20', devices: [{ id: 'devA', name: 'A', platform: 'ios', status: 'shutdown' }] }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      const browser = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      await waitForMessage(browser) // session:joined
+
+      const shutdownPromise = waitForType<DeviceShutdown>(agent, 'device:shutdown')
+      browser.close()
+
+      const shutdown = await shutdownPromise
+      expect(shutdown.type).toBe('device:shutdown')
+      expect(shutdown.sessionId).toBe(sessionId)
+
+      agent.close()
+    } finally {
+      await shortServer.stop()
+    }
+  })
+
+  it('browser reconnect before timeout cancels shutdown', async () => {
+    const shortServer = new RelayServer({ port: 0, idleTimeoutMs: 200 })
+    try {
+      await shortServer.start()
+      const shortPort = (shortServer.address() as { port: number }).port
+
+      const agent = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-21', devices: [{ id: 'devA', name: 'A', platform: 'ios', status: 'shutdown' }] }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      const browser = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      await waitForMessage(browser)
+
+      browser.close()
+      // yield to event loop so relay receives close event and sets idle timer
+      await new Promise<void>((r) => setImmediate(r))
+
+      const browser2 = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(browser2)
+      browser2.send(JSON.stringify({ type: 'session:start', sessionId }))
+      await waitForMessage(browser2) // session:joined — relay cancels idle timer
+
+      // If shutdown arrives at any point during the wait, fail immediately
+      await new Promise<void>((resolve, reject) => {
+        const listener = (d: Buffer) => {
+          if (JSON.parse(d.toString()).type === 'device:shutdown') {
+            agent.off('message', listener)
+            reject(new Error('unexpected device:shutdown — idle timer was not cancelled'))
+          }
+        }
+        agent.on('message', listener)
+        setTimeout(() => { agent.off('message', listener); resolve() }, 600)
+      })
+
+      agent.close()
+      browser2.close()
+    } finally {
+      await shortServer.stop()
+    }
+  })
+
+  it('idle timeout after agent already disconnected — no error thrown', async () => {
+    const shortServer = new RelayServer({ port: 0, idleTimeoutMs: 20 })
+    try {
+      await shortServer.start()
+      const shortPort = (shortServer.address() as { port: number }).port
+
+      const agent = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-22', devices: [{ id: 'devA', name: 'A', platform: 'ios', status: 'shutdown' }] }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      const browser = new WebSocket(`ws://localhost:${shortPort}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      await waitForMessage(browser)
+
+      // Agent closes first → all sessions removed. Browser closes → idle timer set on now-removed session.
+      agent.close()
+      browser.close()
+      // Wait past idleTimeoutMs — timer callback must not throw even when session is gone
+      await new Promise<void>((r) => setTimeout(r, 100))
+    } finally {
+      await shortServer.stop()
+    }
+  })
+
+  it('replays device:ready on reconnect when device is already booted', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-23', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser) // session:joined
+
+    // Agent reports device is ready
+    agent.send(JSON.stringify({ type: 'device:ready', sessionId, payload: { deviceId: 'devA' } }))
+    await waitForType<DeviceReady>(browser, 'device:ready')
+
+    browser.close()
+    // Poll until relay has cleared browser from session (busy=false)
+    // so the replay logic correctly re-sends device:ready to browser2
+    const tmpObs = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(tmpObs)
+    await vi.waitFor(async () => {
+      tmpObs.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForMessage<AgentsListed>(tmpObs)
+      expect(listed.sessions[0]!.devices[0]!.busy).toBe(false)
+    }, { timeout: 2000 })
+    tmpObs.close()
+
+    // Browser reconnects — set up both listeners before sending to avoid race
+    const browser2 = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser2)
+    const joinedPromise = waitForType<SessionJoined>(browser2, 'session:joined')
+    const readyPromise = waitForType<DeviceReady>(browser2, 'device:ready')
+    browser2.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await joinedPromise
+    await readyPromise
+
+    agent.close()
+    browser2.close()
+  })
+
+  it('routes open-url from browser to agent', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-24', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    // session:start on a booted device now also sends the agent a join-IDR (stream:request-idr),
+    // so wait specifically for open-url rather than the next message.
+    const msgPromise = waitForType<OpenUrl>(agent, 'open-url')
+    browser.send(JSON.stringify({ type: 'open-url', sessionId, requestId: 'req-fwd', payload: { url: 'myapp://home' } }))
+    const received = await msgPromise
+    expect(received.type).toBe('open-url')
+    expect((received.payload as { url: string }).url).toBe('myapp://home')
+    // The forward re-serialises the whole message, so the correlator survives it untouched — which is
+    // what lets the agent echo it. An id-less request reaches the agent too and is dropped there.
+    expect(received.requestId).toBe('req-fwd')
+
+    agent.close()
+    browser.close()
+  })
+
+  // The trigger is the agent having announced a stream, not the device having been up at register
+  // time. This used to register with `status: 'booted'` and join — which is the case #440 was
+  // about: a session for an already-running simulator looked ready before the agent touched it.
+  it('requests an IDR from the agent when a browser joins a streaming session', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-25', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    agent.send(JSON.stringify({ type: 'device:ready', sessionId, payload: { deviceId: 'devA' } }))
+    // Round-trip on the agent socket rather than a sleep: the browser joins on a different
+    // connection, so nothing orders its session:start against the device:ready above.
+    const listed = waitForType<AgentsListed>(agent, 'agents:listed')
+    agent.send(JSON.stringify({ type: 'agents:list' }))
+    await listed
+
+    const idrPromise = waitForType<StreamRequestIdr>(agent, 'stream:request-idr')
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    const idr = await idrPromise
+    expect(idr.sessionId).toBe(sessionId)
+
+    agent.close()
+    browser.close()
+  })
+
+  it('routes open-url:done from agent to browser', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-26', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    const msgPromise = waitForMessage(browser)
+    agent.send(JSON.stringify({ type: 'open-url:done', sessionId, requestId: 'rq-done' }))
+    const received = await msgPromise
+    expect(received.type).toBe('open-url:done')
+
+    agent.close()
+    browser.close()
+  })
+
+  it('routes open-url:error from agent to browser', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-27', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    const msgPromise = waitForMessage(browser)
+    agent.send(JSON.stringify({ type: 'open-url:error', sessionId, requestId: 'rq-err', message: 'URL handler not found' }))
+    const received = await msgPromise
+    expect(received.type).toBe('open-url:error')
+    expect(received.message).toBe('URL handler not found')
+
+    agent.close()
+    browser.close()
+  })
+
+  it('returns open-url:error to browser when session does not exist', async () => {
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+
+    const msgPromise = waitForMessage(browser)
+    browser.send(JSON.stringify({ type: 'open-url', sessionId: 'nonexistent-session', requestId: 'req-nos', payload: { url: 'myapp://home' } }))
+    const received = await msgPromise
+    expect(received.type).toBe('open-url:error')
+    // **Was `'agent offline'`, and that was the wrong diagnosis** — the same one #492 fixed for
+    // `device:boot` and `input:error`: the relay has no session for this id, which says nothing about any
+    // agent's health, and telling an MCP caller its Mac is down sends the reader after the wrong problem.
+    // `open-url` still had it, and routing this branch through `dispatchTarget` corrected it for free.
+    expect(received.message).toBe('Session not found')
+    expect(received.requestId).toBe('req-nos')
+
+    browser.close()
+  })
+
+  it('does not forward an open-url with no correlator to a connected agent', async () => {
+    // The door check, which the offline-branch one is not a substitute for: both in-repo agents drop an
+    // id-less request, but an agent predating the field would execute it and reply uncorrelated, and
+    // nothing downstream could attribute that reply. So the request does not travel.
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-28', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    browser.send(JSON.stringify({ type: 'open-url', sessionId, payload: { url: 'myapp://home' } }))
+    // Two barriers, on two sockets, and both are load-bearing. Order is preserved **within** a
+    // connection, not across them, so a round-trip on the agent proves nothing about a message sent on
+    // the browser — the relay can answer the agent's ping before it has looked at the browser's request.
+    // So: barrier the **browser** to prove the relay processed the request and forwarded it if it was
+    // going to, then barrier the **agent** to prove anything sent there has arrived, and only then read
+    // the recording with a 0 ms deadline.
+    //
+    // Reading before any barrier is worse and was the first version of this test: a 0 ms deadline
+    // resolves `null` on the next tick, so it passed whether the drop happened or not. Barriering the
+    // wrong socket was the second, which happened to pass its mutation on today's timing — a mutation
+    // proves a test *can* fail, not that it always will.
+    await barrier(browser)
+    await barrier(agent)
+    expect(await waitForTypeOrNull<OpenUrl>(agent, 'open-url', 0)).toBeNull()
+
+    agent.close(); browser.close()
+  })
+
+  it('answers nothing rather than an open-url:error with no correlator', async () => {
+    // `requestId` is required on `open-url:error`, so answering an id-less request would mean shipping a
+    // frame that violates its own declaration — `JSON.stringify` drops the key and every correlating
+    // consumer discards it, turning "agent offline" into a caller waiting out its full deadline. Both
+    // agents drop the same input; this keeps the relay's policy identical rather than opposite.
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+
+    browser.send(JSON.stringify({ type: 'open-url', sessionId: 'nonexistent-session', payload: { url: 'myapp://home' } }))
+    await barrier(browser)
+    expect(await waitForTypeOrNull<OpenUrlError>(browser, 'open-url:error', 0)).toBeNull()
+
+    browser.close()
+  })
+
+  it('returns open-url:error to browser when agent socket is closed', async () => {
+    const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+    const agent = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(agent)
+    agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-29', devices }))
+    const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+    const sessionId = registeredSessions[0]!.sessionId
+
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+    await waitForMessage(browser)
+
+    agent.close()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // By type, not "the next message": losing the agent also produces a `session:terminated`, and
+    // whichever lands first is not this test's subject.
+    browser.send(JSON.stringify({ type: 'open-url', sessionId, requestId: 'req-closed', payload: { url: 'myapp://home' } }))
+    const received = await waitForType<OpenUrlError>(browser, 'open-url:error')
+    expect(received.message).toBe('agent offline')
+    expect(received.requestId).toBe('req-closed')
+
+    browser.close()
+  })
+
+  describe('resource-based session rejection', () => {
+    async function setupAgentWithSession(p: number) {
+      const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }]
+      const agent = new WebSocket(`ws://localhost:${p}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-30', devices }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+      return { agent, sessionId }
+    }
+
+    it('rejects session:start when CPU exceeds threshold', async () => {
+      const { agent, sessionId } = await setupAgentWithSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 85, memUsedMB: 4000, memTotalMB: 16000, slotsAvailable: 2, slotsTotal: 4, reportedAt: Date.now() } }))
+      await new Promise((r) => setTimeout(r, 50))
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      const msg = await waitForMessage(browser)
+      expect(msg.type).toBe('error')
+      expect(msg.message).toBe('Agent resources exhausted')
+      expect(msg.sessionId).toBe(sessionId)
+
+      agent.close()
+      browser.close()
+    })
+
+    it('rejects session:start when RAM exceeds threshold', async () => {
+      const { agent, sessionId } = await setupAgentWithSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 20, memUsedMB: 15000, memTotalMB: 16000, slotsAvailable: 2, slotsTotal: 4, reportedAt: Date.now() } }))
+      await new Promise((r) => setTimeout(r, 50))
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      const msg = await waitForMessage(browser)
+      expect(msg.type).toBe('error')
+      expect(msg.message).toBe('Agent resources exhausted')
+      expect(msg.sessionId).toBe(sessionId)
+
+      agent.close()
+      browser.close()
+    })
+
+    it('allows session:start when both CPU and RAM are within threshold', async () => {
+      const { agent, sessionId } = await setupAgentWithSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 50, memUsedMB: 6000, memTotalMB: 16000, slotsAvailable: 2, slotsTotal: 4, reportedAt: Date.now() } }))
+      await new Promise((r) => setTimeout(r, 50))
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      const msg = await waitForMessage(browser)
+      expect(msg.type).toBe('session:joined')
+
+      agent.close()
+      browser.close()
+    })
+
+    it('allows session:start when CPU is exactly at threshold (> not >=)', async () => {
+      const { agent, sessionId } = await setupAgentWithSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 80, memUsedMB: 4000, memTotalMB: 16000, slotsAvailable: 2, slotsTotal: 4, reportedAt: Date.now() } }))
+      await new Promise((r) => setTimeout(r, 50))
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      const msg = await waitForMessage(browser)
+      expect(msg.type).toBe('session:joined')
+
+      agent.close()
+      browser.close()
+    })
+
+    it('allows session:start (fail-open) when no resource data reported yet', async () => {
+      const { agent, sessionId } = await setupAgentWithSession(port)
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId }))
+      const msg = await waitForMessage(browser)
+      expect(msg.type).toBe('session:joined')
+
+      agent.close()
+      browser.close()
+    })
+  })
+
+  describe('security', () => {
+    it('path traversal: /uploads/../ is blocked (auth blocks before containment check reaches)', async () => {
+      // fetch normalizes URLs, so use a raw socket to preserve the `..` segment.
+      // Without auth, the relay returns 401 (auth check) before the containment check —
+      // either way the traversal is blocked and the response is never 200.
+      const status = await rawHttpGet(port, '/uploads/../package.json')
+      expect(status).not.toBe(200)
+    })
+
+    it('/uploads/ without auth returns 401', async () => {
+      const res = await fetch(`http://localhost:${port}/uploads/file.zip`)
+      expect(res.status).toBe(401)
+    })
+
+    it('browser socket sending agent:register is disconnected (role gating)', async () => {
+      // Establish browser role by sending a browser-type message first
+      const ws = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(ws)
+      ws.send(JSON.stringify({ type: 'session:start', sessionId: 'nonexistent' }))
+      await waitForMessage(ws) // error: Session not found — browser role assigned
+
+      // Agent-only message from a browser-role socket must close the connection
+      const closePromise = new Promise<number>((resolve) =>
+        ws.once('close', (code) => resolve(code))
+      )
+      ws.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-31', devices: [] }))
+      const code = await closePromise
+      expect(code).toBe(1008)
+    })
+
+    // CodeRabbit #272 ① — browser 소켓이 stream:register로 세션의 streamSocket을 탈취하지 못한다
+    it('browser socket sending stream:register is disconnected (stream hijack guard)', async () => {
+      // 정당한 agent + 세션을 만들어 탈취 대상 sessionId를 확보
+      const agent = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-32', devices: [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }] }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      // browser 역할을 확정시킨 뒤 stream:register 시도
+      const ws = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(ws)
+      ws.send(JSON.stringify({ type: 'session:start', sessionId: 'nonexistent' }))
+      await waitForMessage(ws) // error → browser role assigned
+
+      const closePromise = new Promise<number>((resolve) =>
+        ws.once('close', (code) => resolve(code))
+      )
+      ws.send(JSON.stringify({ type: 'stream:register', sessionId }))
+      expect(await closePromise).toBe(1008)
+      agent.close()
+    })
+  })
+
+  // #271 — 원격(비-루프백) 에이전트는 agent 스코프 PAT로 인증한다.
+  // 테스트 연결은 전부 루프백이므로 remoteAddressOf를 스파이해 원격 출발지를 시뮬레이션한다.
+  describe('remote agent auth (#271)', () => {
+    const mockRemote = (addr = '192.168.0.99') =>
+      vi.spyOn(server as unknown as { remoteAddressOf: () => string }, 'remoteAddressOf')
+        .mockReturnValue(addr)
+
+    const insertPat = (scope: string, expiresAt: string | null = null): string => {
+      const raw = `tflw_pat_${crypto.randomBytes(16).toString('hex')}`
+      const db = getDb()
+      db.prepare(
+        "INSERT OR IGNORE INTO users (id, email, display_name, role, password_hash) VALUES (9001, 'agent-pat@test.local', 'Agent PAT', 'Admin', 'x')",
+      ).run()
+      db.prepare(
+        'INSERT INTO personal_access_tokens (user_id, name, token_hash, scope, expires_at) VALUES (9001, ?, ?, ?, ?)',
+      ).run(`t-${raw.slice(-8)}`, hashPat(raw), scope, expiresAt)
+      return raw
+    }
+
+    const agentWs = (token?: string) =>
+      new WebSocket(`ws://localhost:${port}`, token ? { headers: { authorization: `Bearer ${token}` } } : undefined)
+
+    const waitForClose = (ws: WebSocket) =>
+      new Promise<{ code: number; reason: string }>((resolve) =>
+        ws.once('close', (code, reason) => resolve({ code, reason: reason.toString() })))
+
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('토큰 없는 원격 연결은 업그레이드 직후 1008 + 진단 가능한 사유로 거절된다', async () => {
+      mockRemote()
+      const ws = agentWs()
+      const { code, reason } = await waitForClose(ws)
+      expect(code).toBe(1008)
+      expect(reason).toContain('agent')
+      expect(reason).toContain('--token')
+      const logBuffer = (server as unknown as { logBuffer: string[] }).logBuffer
+      expect(logBuffer.some((l) => l.includes('192.168.0.99'))).toBe(true)
+    })
+
+    it('agent 스코프 PAT를 가진 원격 에이전트는 등록에 성공한다', async () => {
+      mockRemote()
+      const token = insertPat('agent')
+      const ws = agentWs(token)
+      await waitForOpen(ws)
+      ws.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-49', devices: [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }] }))
+      const msg = await waitForMessage<AgentRegistered>(ws)
+      expect(msg.type).toBe('agent:registered')
+      expect(msg.registeredSessions).toHaveLength(1)
+      ws.close()
+    })
+
+    it('agent 스코프 없는 PAT는 browser 역할 — agent:register 시 1008 (스푸핑 가드 유지)', async () => {
+      mockRemote()
+      const token = insertPat('view,builds:write')
+      const ws = agentWs(token)
+      await waitForOpen(ws)
+      ws.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-50', devices: [] }))
+      const { code } = await waitForClose(ws)
+      expect(code).toBe(1008)
+    })
+
+    it('만료된 agent PAT는 업그레이드 직후 거절된다', async () => {
+      mockRemote()
+      const token = insertPat('agent', '2000-01-01T00:00:00Z')
+      const ws = agentWs(token)
+      const { code } = await waitForClose(ws)
+      expect(code).toBe(1008)
+    })
+
+    it('원격 stream WS도 같은 토큰으로 stream:register 할 수 있다', async () => {
+      mockRemote()
+      const token = insertPat('agent')
+      const agent = agentWs(token)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-51', devices: [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' }] }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+
+      const stream = agentWs(token)
+      await waitForOpen(stream)
+      stream.send(JSON.stringify({ type: 'stream:register', sessionId }))
+      const msg = await waitForMessage(stream)
+      expect(msg.type).toBe('stream:registered')
+      agent.close()
+      stream.close()
+    })
+  })
+
+  describe('stop', () => {
+    let stopServer: RelayServer
+
+    beforeEach(async () => {
+      stopServer = new RelayServer({ port: 0 })
+      await stopServer.start()
+    })
+
+    it('clears all interval timers', async () => {
+      await stopServer.stop()
+      const s = stopServer as unknown as {
+        purgeRecordingsTimer: ReturnType<typeof setInterval> | null
+        purgeOldResourcesTimer: ReturnType<typeof setInterval> | null
+        purgeBuildsTimer: ReturnType<typeof setInterval> | null
+        flushResourcesTimer: ReturnType<typeof setInterval> | null
+      }
+      expect(s.purgeRecordingsTimer).toBeNull()
+      expect(s.purgeOldResourcesTimer).toBeNull()
+      expect(s.purgeBuildsTimer).toBeNull()
+      expect(s.flushResourcesTimer).toBeNull()
+    })
+  })
+})

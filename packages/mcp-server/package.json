@@ -1,0 +1,57 @@
+{
+  "name": "@tapflowio/mcp-server",
+  "version": "0.28.0",
+  "description": "MCP server for tapflow — lets LLM agents control iOS/Android simulators via Model Context Protocol",
+  "keywords": [
+    "tapflow",
+    "mcp",
+    "model-context-protocol",
+    "ios",
+    "android",
+    "simulator",
+    "ai-agent"
+  ],
+  "homepage": "https://github.com/jo-duchan/tapflow",
+  "bugs": "https://github.com/jo-duchan/tapflow/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jo-duchan/tapflow.git",
+    "directory": "packages/mcp-server"
+  },
+  "license": "MIT",
+  "author": "tapflow contributors",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "tapflow-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit && tsc -p src/__tests__/tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@tapflowio/protocol": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@tapflowio/flow-runner": "workspace:*",
+    "ws": "^8.22.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.12"
+  }
+}

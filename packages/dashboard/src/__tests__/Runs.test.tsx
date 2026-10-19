@@ -1,0 +1,390 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { useEffect } from 'react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { Link, MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { Runs } from '@/src/pages/Runs'
+import { RunDetail } from '@/src/pages/RunDetail'
+import { failureBadge, pollWhileRunning, runOutcomeText, runSourceLabel, RUNS_POLL_MS } from '@/lib/runs'
+import type { RunDetail as Run, RunListItem } from '@/lib/types'
+import { withQuery } from './withQuery'
+
+function listItem(overrides: Partial<RunListItem> = {}): RunListItem {
+  return {
+    id: 'r1', status: 'passed', finishedBy: 'client', failureKind: null, errorMessage: null, exitCode: 0,
+    isCi: true, ci: { provider: 'github', branch: 'main', commit: 'abcdef123456', jobUrl: 'https://github.com/o/r/actions/runs/1' },
+    build: { id: 7, appName: 'Coffee', versionName: '1.2.0', buildNumber: '42', platform: 'ios' },
+    createdBy: 'ci', flowsTotal: 2, createdAt: '2026-10-11 01:00:00', finishedAt: '2026-10-11 01:01:05',
+    flowsPassed: 2, flowsFailed: 0,
+    ...overrides,
+  }
+}
+
+/** The relay as the page sees it: every GET it made, and an answer chosen by path. */
+function stubRelay(answer: (url: string) => Response) {
+  const urls: string[] = []
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => { urls.push(url); return answer(url) }))
+  return urls
+}
+
+/** Where the router is, so a test can read the filters the page put in the URL. */
+const probe = { location: '' }
+function LocationProbe() {
+  const l = useLocation()
+  useEffect(() => { probe.location = `${l.pathname}${l.search}` })
+  return null
+}
+
+function renderAt(path: string) {
+  return render(withQuery(
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route path="/automation/runs" element={<Runs />} />
+        <Route path="/automation/runs/:runId" element={<RunDetail />} />
+      </Routes>
+      {/* What the sidebar's Runs item is: a link to the same route with no filters. */}
+      <Link to="/automation/runs">Sidebar Runs</Link>
+      <LocationProbe />
+    </MemoryRouter>,
+  ))
+}
+
+afterEach(() => vi.unstubAllGlobals())
+
+describe('Runs list', () => {
+  beforeEach(() => { probe.location = '' })
+
+  it('shows CI runs by default, each row a link to the run', async () => {
+    const urls = stubRelay(() => Response.json({ items: [listItem()], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    const link = await screen.findByRole('link', { name: /^Coffee 1\.2\.0 · build 42, Passed, / })
+    expect(link.getAttribute('href')).toBe('/automation/runs/r1')
+    expect(urls[0]).toBe('/api/v1/runs?ci=1&limit=25')
+    expect(screen.getByText('GitHub Actions · main')).toBeTruthy()
+    expect(link.closest('tr')?.textContent).toContain('2/2')
+  })
+
+  it('tells a run the environment failed apart from one the app failed, in the row and its name', async () => {
+    stubRelay(() => Response.json({
+      items: [
+        listItem({ id: 'r1', status: 'failed', failureKind: 'product', exitCode: 1 }),
+        listItem({ id: 'r2', status: 'failed', failureKind: 'environment', exitCode: 2, build: { id: 8, appName: 'Tea', versionName: '2.0.0', buildNumber: '9', platform: 'android' } }),
+      ],
+      nextCursor: null, prevCursor: null,
+    }))
+    renderAt('/automation/runs')
+    expect(await screen.findByRole('link', { name: /^Coffee 1\.2\.0 · build 42, Failed, / })).toBeTruthy()
+    const env = screen.getByRole('link', { name: /^Tea 2\.0\.0 · build 9, Environment problem, / })
+    expect(env.closest('tr')?.textContent).toContain('Environment problem')
+  })
+
+  it('opens a run from anywhere on its row, and in a new tab with Cmd', async () => {
+    const item = listItem({ status: 'failed', flowsPassed: 1, flowsFailed: 1 })
+    stubRelay((url) => url.startsWith('/api/v1/runs/r1')
+      ? Response.json({ ...item, flows: [], watchSessionId: null })
+      : Response.json({ items: [item], nextCursor: null, prevCursor: null }))
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    renderAt('/automation/runs')
+    const link = await screen.findByRole('link', { name: /, Failed, / })
+    const row = link.closest('tr')!
+    expect(row.textContent).toContain('1/2')
+    // The status column says how it ended; the cell does not repeat it.
+    expect(row.textContent).not.toContain('failed')
+    fireEvent.click(screen.getByText('GitHub Actions · main'), { metaKey: true })
+    expect(open).toHaveBeenCalledWith('/automation/runs/r1', '_blank', 'noopener')
+    // A drag that selected text is a copy, not a click on the row.
+    const selection = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'main' } as Selection)
+    await userEvent.click(screen.getByText('GitHub Actions · main'))
+    expect(probe.location).toBe('/automation/runs')
+    selection.mockRestore()
+    await userEvent.click(screen.getByText('GitHub Actions · main'))
+    await waitFor(() => expect(probe.location).toBe('/automation/runs/r1'))
+  })
+
+  it('asks for local runs, and for every run, when the source changes', async () => {
+    const urls = stubRelay(() => Response.json({ items: [], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    await screen.findByText(/No CI runs yet/)
+    await userEvent.click(screen.getByRole('tab', { name: 'Local' }))
+    await waitFor(() => expect(urls).toContain('/api/v1/runs?ci=0&limit=25'))
+    await userEvent.click(screen.getByRole('tab', { name: 'All' }))
+    await waitFor(() => expect(urls).toContain('/api/v1/runs?limit=25'))
+    expect(probe.location).toBe('/automation/runs?source=all')
+  })
+
+  it('filters by the build in the URL, names it, and can let it go', async () => {
+    const urls = stubRelay(() => Response.json({ items: [listItem()], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs?source=all&build=7')
+    await screen.findByRole('link', { name: /, Passed, / })
+    expect(urls[0]).toBe('/api/v1/runs?build=7&limit=25')
+    await userEvent.click(screen.getByRole('button', { name: 'Show runs of every build, not only Coffee 1.2.0 · build 42' }))
+    await waitFor(() => expect(probe.location).toBe('/automation/runs?source=all'))
+  })
+
+  it('searches by flow name after a pause, not on every key', async () => {
+    const urls = stubRelay(() => Response.json({ items: [], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    await screen.findByText(/No CI runs yet/)
+    await userEvent.type(screen.getByRole('textbox', { name: 'Flow name' }), 'login')
+    await waitFor(() => expect(urls).toContain('/api/v1/runs?ci=1&flow=login&limit=25'))
+    expect(urls.filter((u) => u.includes('flow='))).toEqual(['/api/v1/runs?ci=1&flow=login&limit=25'])
+  })
+
+  it('clears the flow box with the rest when a link to the bare page is followed', async () => {
+    stubRelay(() => Response.json({ items: [], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs?flow=login&status=failed')
+    const box = await screen.findByRole('textbox', { name: 'Flow name' })
+    expect((box as HTMLInputElement).value).toBe('login')
+    await userEvent.click(screen.getByRole('link', { name: 'Sidebar Runs' }))
+    await waitFor(() => expect((box as HTMLInputElement).value).toBe(''))
+    // Past the debounce: the box must not have written the old flow back.
+    await new Promise((r) => setTimeout(r, 450))
+    expect(probe.location).toBe('/automation/runs')
+  })
+
+  it('holds a failed filter as the failure while it is tried again, not the previous filter\'s rows', async () => {
+    let answerRetry: (r: Response) => void = () => {}
+    let failedOnce = false
+    stubRelay((url) => {
+      if (!url.includes('status=failed')) return Response.json({ items: [listItem()], nextCursor: null, prevCursor: null })
+      if (!failedOnce) { failedOnce = true; return new Response('', { status: 500 }) }
+      return new Promise<Response>((resolve) => { answerRetry = resolve }) as unknown as Response
+    })
+    renderAt('/automation/runs')
+    await screen.findByRole('link', { name: /, Passed, / })
+    await userEvent.click(screen.getByRole('combobox', { name: 'Status' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Failed' }))
+    await screen.findByText("Couldn't load flow runs.")
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    expect(screen.getByText("Couldn't load flow runs.")).toBeTruthy()
+    expect(screen.queryByRole('link', { name: /, Passed, / })).toBeNull()
+    answerRetry(Response.json({ items: [], nextCursor: null, prevCursor: null }))
+    await screen.findByText('No runs match these filters.')
+  })
+
+  it('says a failure is a failure, with a way to try again', async () => {
+    let fail = true
+    stubRelay(() => fail ? new Response('', { status: 500 }) : Response.json({ items: [listItem()], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    await screen.findByText("Couldn't load flow runs.")
+    fail = false
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    await screen.findByRole('link', { name: /, Passed, / })
+  })
+
+  it('pages by cursor: Older, Newer, and the URL holds the page', async () => {
+    const urls = stubRelay((url) => url.includes('before=41')
+      ? Response.json({ items: [listItem({ id: 'r0', status: 'failed', flowsPassed: 1, flowsFailed: 1 })], nextCursor: null, prevCursor: '40' })
+      : Response.json({ items: [listItem()], nextCursor: '41', prevCursor: null }))
+    renderAt('/automation/runs')
+    await screen.findByRole('link', { name: /, Passed, / })
+    const newer = screen.getByRole('button', { name: 'Newer' })
+    expect(newer.getAttribute('aria-disabled')).toBe('true')
+    await userEvent.click(screen.getByRole('button', { name: 'Older' }))
+    await screen.findByRole('link', { name: /, Failed, / })
+    expect(urls).toContain('/api/v1/runs?ci=1&before=41&limit=25')
+    expect(probe.location).toBe('/automation/runs?before=41')
+    // Still focused and still a button at the oldest page, only unavailable.
+    expect(screen.getByRole('button', { name: 'Older' }).getAttribute('aria-disabled')).toBe('true')
+    await userEvent.click(screen.getByRole('button', { name: 'Newer' }))
+    await waitFor(() => expect(urls).toContain('/api/v1/runs?ci=1&after=40&limit=25'))
+    expect(probe.location).toBe('/automation/runs?after=40')
+  })
+
+  it('keeps a way back from a page that came back empty', async () => {
+    stubRelay((url) => url.includes('before=')
+      ? Response.json({ items: [], nextCursor: null, prevCursor: null })
+      : Response.json({ items: [listItem()], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs?before=5')
+    await screen.findByText(/No runs on this page any more/)
+    const newer = screen.getByRole('button', { name: 'Newer' })
+    expect(newer.getAttribute('aria-disabled')).toBe('false')
+    await userEvent.click(newer)
+    await waitFor(() => expect(probe.location).toBe('/automation/runs'))
+    await screen.findByRole('link', { name: /, Passed, / })
+  })
+
+  it('holds the page buttons while the next page loads', async () => {
+    let answerOlder: (r: Response) => void = () => {}
+    stubRelay((url) => url.includes('before=41')
+      ? new Promise<Response>((resolve) => { answerOlder = resolve }) as unknown as Response
+      : Response.json({ items: [listItem()], nextCursor: '41', prevCursor: null }))
+    renderAt('/automation/runs')
+    await userEvent.click(await screen.findByRole('button', { name: 'Older' }))
+    expect(screen.getByRole('button', { name: 'Older' }).getAttribute('aria-disabled')).toBe('true')
+    answerOlder(Response.json({ items: [listItem({ id: 'r0', status: 'failed' })], nextCursor: null, prevCursor: '40' }))
+    await screen.findByRole('link', { name: /, Failed, / })
+  })
+
+  it('starts from the newest page when a filter changes', async () => {
+    stubRelay(() => Response.json({ items: [listItem()], nextCursor: '41', prevCursor: '50' }))
+    renderAt('/automation/runs?before=60')
+    await screen.findByRole('link', { name: /, Passed, / })
+    await userEvent.click(screen.getByRole('tab', { name: 'All' }))
+    await waitFor(() => expect(probe.location).toBe('/automation/runs?source=all'))
+  })
+
+  it('shows no page buttons when everything fits on one page', async () => {
+    stubRelay(() => Response.json({ items: [listItem()], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    await screen.findByRole('link', { name: /, Passed, / })
+    expect(screen.queryByRole('navigation', { name: 'Pages of flow runs' })).toBeNull()
+  })
+})
+
+describe('Run detail', () => {
+  function detail(overrides: Partial<Run> = {}): Run {
+    return {
+      ...listItem(), watchSessionId: null,
+      flows: [
+        { idx: 0, name: 'login', file: 'flows/login.yaml', status: 'passed', device: { id: 'd', name: 'iPhone 16', platform: 'ios' }, failureKind: null, failureMessage: null, durationMs: 1200, steps: [], hasScreenshot: false },
+        { idx: 1, name: 'checkout', file: null, status: 'not-run' },
+      ],
+      ...overrides,
+    }
+  }
+
+  it('offers to watch only while the relay says which session the runner holds', async () => {
+    stubRelay(() => Response.json(detail({ status: 'running', finishedAt: null, exitCode: null, watchSessionId: 's1' })))
+    const { unmount } = renderAt('/automation/runs/r1')
+    const watch = await screen.findByRole('link', { name: 'Watch the device' })
+    expect(watch.getAttribute('href')).toBe('/automation/sessions/s1')
+    unmount()
+
+    stubRelay(() => Response.json(detail({ status: 'running', finishedAt: null, exitCode: null, watchSessionId: null })))
+    renderAt('/automation/runs/r1')
+    await screen.findByText('Running. This page follows the run.')
+    expect(screen.queryByRole('link', { name: 'Watch the device' })).toBeNull()
+    expect(screen.getByText(/^Running for/)).toBeTruthy()
+  })
+
+  it('shows a failed flow with its message, steps and screenshot, and the flows never reached', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'failed', exitCode: 1, failureKind: 'product',
+      flows: [
+        {
+          idx: 0, name: 'login', file: 'flows/login.yaml', status: 'failed', device: null, failureKind: 'product',
+          failureMessage: 'no element "Pay"', durationMs: 900, hasScreenshot: true,
+          steps: [
+            { index: 0, name: 'launchApp', status: 'passed', durationMs: 400 },
+            { index: 1, name: 'tap Pay', status: 'failed', durationMs: 500, message: 'not found within 10s' },
+          ],
+        },
+        { idx: 1, name: 'checkout', file: null, status: 'not-run' },
+      ],
+    })))
+    renderAt('/automation/runs/r1')
+    expect(await screen.findByText('no element "Pay"')).toBeTruthy()
+    expect(screen.getByText('not found within 10s')).toBeTruthy()
+    const shot = screen.getByRole('img', { name: 'The screen when login failed' })
+    expect(shot.getAttribute('src')).toBe('/api/v1/runs/r1/flows/0/screenshot')
+    expect(screen.getByText('Not run')).toBeTruthy()
+    expect(screen.getByRole('link', { name: /Open the CI run/ }).getAttribute('href')).toBe('https://github.com/o/r/actions/runs/1')
+  })
+
+  it('marks a run and a flow that failed only on the environment as such, not as the app failing', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'failed', exitCode: 2, failureKind: 'environment', errorMessage: 'no booted device',
+      flows: [{ idx: 0, name: 'login', file: null, status: 'failed', device: null, failureKind: 'environment', failureMessage: 'agent went away', durationMs: 300, steps: [], hasScreenshot: false }],
+    })))
+    renderAt('/automation/runs/r1')
+    await screen.findByText('agent went away')
+    // One for the run, one for its flow; neither says Failed.
+    expect(screen.getAllByText('Environment problem')).toHaveLength(2)
+    expect(screen.queryByText('Failed')).toBeNull()
+  })
+
+  it('keeps a run with an app failure red while its environment-only flow is gray', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'failed', exitCode: 1, failureKind: 'product',
+      flows: [
+        { idx: 0, name: 'login', file: null, status: 'failed', device: null, failureKind: 'product', failureMessage: 'no element "Pay"', durationMs: 900, steps: [], hasScreenshot: false },
+        { idx: 1, name: 'checkout', file: null, status: 'failed', device: null, failureKind: 'environment', failureMessage: 'agent went away', durationMs: 300, steps: [], hasScreenshot: false },
+      ],
+    })))
+    renderAt('/automation/runs/r1')
+    await screen.findByText('agent went away')
+    // The run's badge and login's are both Failed; only checkout's says the environment.
+    expect(screen.getAllByText('Failed')).toHaveLength(2)
+    expect(screen.getAllByText('Environment problem')).toHaveLength(1)
+  })
+
+  // B2: a failed tapOn's suggestions, each in a field (selectable without a clipboard) with a copy button.
+  it('offers a failed tapOn\'s suggested lines to copy, and moves to the line when there is no clipboard', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'failed', exitCode: 1, failureKind: 'product',
+      flows: [{
+        idx: 0, name: 'login', file: null, status: 'failed', device: null, failureKind: 'product', failureMessage: 'no element', durationMs: 900, hasScreenshot: false,
+        steps: [
+          { index: 0, name: 'launchApp', status: 'passed', durationMs: 400 },
+          { index: 1, name: 'tapOn("Sign inn")', status: 'failed', durationMs: 500, message: 'no element matched "Sign inn"',
+            suggestions: [{ yaml: 'tapOn: "Sign in"', element: { role: 'button', label: 'Sign in' } }] },
+        ],
+      }],
+    })))
+    renderAt('/automation/runs/r1')
+    const line = await screen.findByRole('textbox', { name: 'Suggested line 1 for tapOn("Sign inn")' })
+    expect((line as HTMLInputElement).value).toBe('tapOn: "Sign in"')
+    expect((line as HTMLInputElement).readOnly).toBe(true)
+    vi.stubGlobal('navigator', { ...navigator, clipboard: undefined })
+    fireEvent.click(screen.getByRole('button', { name: 'Copy suggested line 1' }))
+    await waitFor(() => expect(document.activeElement).toBe(line))
+  })
+
+  it('shows no suggestions where a step has none', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'failed', exitCode: 1, failureKind: 'product',
+      flows: [{ idx: 0, name: 'login', file: null, status: 'failed', device: null, failureKind: 'product', failureMessage: 'x', durationMs: 1, hasScreenshot: false,
+        steps: [{ index: 0, name: 'assertVisible("Pay")', status: 'failed', durationMs: 1, message: 'no element' }] }],
+    })))
+    renderAt('/automation/runs/r1')
+    await screen.findByText('no element')
+    expect(screen.queryByText(/Try instead/)).toBeNull()
+  })
+
+  it('shows the screen a passed flow ended on, as its evidence', async () => {
+    stubRelay(() => Response.json(detail({
+      flows: [{ idx: 0, name: 'login', file: null, status: 'passed', device: null, failureKind: null, failureMessage: null, durationMs: 1200, steps: [], hasScreenshot: true }],
+    })))
+    renderAt('/automation/runs/r1')
+    const shot = await screen.findByRole('img', { name: 'The screen login ended on' })
+    expect(shot.getAttribute('src')).toBe('/api/v1/runs/r1/flows/0/screenshot')
+  })
+
+  it('says a run is gone rather than failing to load', async () => {
+    stubRelay(() => Response.json({ error: 'Run not found' }, { status: 404 }))
+    renderAt('/automation/runs/r1')
+    await screen.findByText(/This run is gone/)
+  })
+})
+
+describe('run wording and polling', () => {
+  it('polls only while something shown is running', () => {
+    expect(pollWhileRunning(['passed', 'running'])).toBe(RUNS_POLL_MS)
+    expect(pollWhileRunning(['passed', 'failed', 'aborted'])).toBe(false)
+    expect(pollWhileRunning(undefined)).toBe(false)
+  })
+
+  it('draws only an app failure red', () => {
+    expect(failureBadge('failed', 'product')).toEqual({ label: 'Failed', tone: 'rejected' })
+    expect(failureBadge('failed', null)).toEqual({ label: 'Failed', tone: 'rejected' })
+    expect(failureBadge('failed', 'environment')).toEqual({ label: 'Environment problem', tone: 'backlog' })
+    // The relay writes failure_kind 'holder-lost' on a run it closes; that run is aborted, and stays Cancelled.
+    expect(failureBadge('aborted', 'holder-lost')).toEqual({ label: 'Cancelled', tone: 'backlog' })
+    expect(failureBadge('passed', null)).toEqual({ label: 'Passed', tone: 'done' })
+  })
+
+  it('keeps a cancel, a disconnect, an environment failure and a regression apart', () => {
+    const base = listItem()
+    expect(runOutcomeText({ ...base, status: 'aborted', finishedBy: 'relay' })).toBe('The flow runner disconnected before the run finished.')
+    expect(runOutcomeText({ ...base, status: 'aborted', errorMessage: 'cancelled (SIGINT)' })).toBe('Cancelled (SIGINT).')
+    expect(runOutcomeText({ ...base, status: 'failed', failureKind: 'environment', errorMessage: 'no booted device' })).toBe('Environment problem: no booted device')
+    expect(runOutcomeText({ ...base, status: 'failed', failureKind: 'product' })).toBe('At least one flow failed on the app.')
+    expect(runOutcomeText(base)).toBeNull()
+  })
+
+  it('names a local run by who ran it', () => {
+    expect(runSourceLabel({ isCi: false, ci: null, createdBy: 'jo' })).toBe('Local · jo')
+    expect(runSourceLabel({ isCi: true, ci: { provider: 'gitlab', branch: null, commit: null, jobUrl: null }, createdBy: 'ci' })).toBe('GitLab CI')
+  })
+})

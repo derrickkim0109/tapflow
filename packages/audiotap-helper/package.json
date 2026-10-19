@@ -1,0 +1,61 @@
+{
+  "name": "@tapflowio/audiotap-helper",
+  "version": "0.3.12",
+  "description": "Shared macOS Core Audio process-tap helper for tapflow — iOS simulator audio capture and Android emulator host-mute",
+  "keywords": [
+    "tapflow",
+    "macos",
+    "core-audio",
+    "process-tap",
+    "audio",
+    "qa"
+  ],
+  "homepage": "https://github.com/jo-duchan/tapflow",
+  "bugs": "https://github.com/jo-duchan/tapflow/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jo-duchan/tapflow.git",
+    "directory": "packages/audiotap-helper"
+  },
+  "license": "MIT",
+  "author": "tapflow contributors",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "tsx": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "postinstall": "node -e \"if (process.platform === 'darwin') { try { require('fs').chmodSync('bin/audiotap-helper.app/Contents/MacOS/audiotap-helper', 0o755) } catch {} }\"",
+    "build": "tsc -b",
+    "typecheck": "tsc -b && tsc -p src/__tests__/tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@tapflowio/agent-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.12"
+  }
+}

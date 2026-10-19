@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>tapflow</title>
+    <script>
+      // Applies the theme before first paint, so a dark-mode reader does not see a light flash while the bundle loads.
+      // next-themes renders its own script for this, but React never runs a script it renders on the client, and this
+      // app has no server render. Mirrors main.tsx's ThemeProvider: `class` attribute, default `system`, next-themes'
+      // default `theme` storage key; it takes over on mount.
+      try {
+        var t = null
+        // Storage can throw (blocked site data); fall back to the system theme, as next-themes does.
+        try { t = localStorage.getItem('theme') } catch (e) {}
+        var dark = t === 'dark' || (t !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.classList.add(dark ? 'dark' : 'light')
+        document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

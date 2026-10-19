@@ -1,0 +1,27 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.1.4/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [
+    [
+      "tapflow",
+      "@tapflowio/protocol",
+      "@tapflowio/agent-core",
+      "@tapflowio/ios-agent",
+      "@tapflowio/android-agent",
+      "@tapflowio/relay",
+      "@tapflowio/flow-runner",
+      "@tapflowio/mcp-server"
+    ]
+  ],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": [
+    "@tapflowio/dashboard",
+    "@tapflowio/playground",
+    "@tapflowio/test-utils",
+    "@tapflowio/docs"
+  ]
+}

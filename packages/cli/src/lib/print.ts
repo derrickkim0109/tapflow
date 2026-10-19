@@ -1,0 +1,83 @@
+export const R = '\x1b[0m'
+export const BOLD = '\x1b[1m'
+export const DIM = '\x1b[2m'
+export const GREEN = '\x1b[32m'
+export const RED = '\x1b[31m'
+export const YELLOW = '\x1b[33m'
+
+const MAX_WIDTH = 72
+
+export function wrap(line: string, maxWidth: number): string[] {
+  if (!Number.isInteger(maxWidth) || maxWidth < 1) {
+    throw new Error('maxWidth must be a positive integer')
+  }
+
+  if (line.length <= maxWidth) return [line]
+  const chunks: string[] = []
+
+  let remaining = line
+  while (remaining.length > maxWidth) {
+    const breakAt = remaining.lastIndexOf(' ', maxWidth)
+    if (breakAt > 0) {
+      chunks.push(remaining.slice(0, breakAt))
+      remaining = remaining.slice(breakAt + 1).trimStart()
+      continue
+    }
+
+    chunks.push(remaining.slice(0, maxWidth))
+    remaining = remaining.slice(maxWidth)
+  }
+
+  if (remaining.length > 0) chunks.push(remaining)
+  return chunks
+}
+
+export function banner(type: 'success' | 'error', title: string, lines: string[] = []): void {
+  const color = type === 'success' ? GREEN : RED
+  const icon = type === 'success' ? '✓' : '✗'
+  const wrappedLines = lines.flatMap((l) => wrap(l, MAX_WIDTH))
+  const contentWidth = Math.min(
+    MAX_WIDTH,
+    Math.max(title.length + 5, ...wrappedLines.map((l) => l.length + 2), 40),
+  )
+  const bar = '─'.repeat(contentWidth)
+
+  console.log()
+  console.log(`${color}${BOLD}  ┌${bar}┐${R}`)
+  console.log(`${color}${BOLD}  │  ${icon}  ${title.padEnd(contentWidth - 5)}│${R}`)
+  console.log(`${color}${BOLD}  └${bar}┘${R}`)
+  for (const line of wrappedLines) {
+    console.log(`${DIM}     ${line}${R}`)
+  }
+  console.log()
+}
+
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+export function createSpinner(msg: string) {
+  let frame = 0
+  let id: ReturnType<typeof setInterval> | null = null
+
+  return {
+    start() {
+      process.stdout.write(`\n  ${SPINNER_FRAMES[0]}  ${msg}`)
+      id = setInterval(() => {
+        frame = (frame + 1) % SPINNER_FRAMES.length
+        process.stdout.write(`\r  ${SPINNER_FRAMES[frame]}  ${msg}`)
+      }, 80)
+    },
+    stop(ok: boolean) {
+      if (id) clearInterval(id)
+      const icon = ok ? `${GREEN}✓${R}` : `${RED}✗${R}`
+      process.stdout.write(`\r  ${icon}  ${msg}\n`)
+    },
+  }
+}
+
+export function step(msg: string): void {
+  console.log(`  ${DIM}→${R}  ${msg}`)
+}
+
+export function warn(msg: string): void {
+  console.warn(`${YELLOW}${BOLD}  ⚠  ${msg}${R}`)
+}

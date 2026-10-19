@@ -1,0 +1,64 @@
+{
+  "name": "@tapflowio/protocol",
+  "version": "0.28.0",
+  "description": "Wire protocol contract for tapflow — the WebSocket message types exchanged between browser, relay, and device agents",
+  "keywords": [
+    "tapflow",
+    "protocol",
+    "websocket",
+    "types",
+    "qa"
+  ],
+  "homepage": "https://github.com/jo-duchan/tapflow",
+  "bugs": "https://github.com/jo-duchan/tapflow/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jo-duchan/tapflow.git",
+    "directory": "packages/protocol"
+  },
+  "license": "MIT",
+  "author": "tapflow contributors",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "tsx": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./validate": {
+      "types": "./dist/validate/index.d.ts",
+      "source": "./src/validate/index.ts",
+      "tsx": "./src/validate/index.ts",
+      "import": "./dist/validate/index.js",
+      "default": "./dist/validate/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b && tsc -p tsconfig.assertions.json && tsc -p src/__tests__/tsconfig.json",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.12"
+  }
+}

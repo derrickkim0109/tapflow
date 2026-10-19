@@ -1,0 +1,176 @@
+import net from 'net'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import { execFile, spawn } from 'child_process'
+import type { ChildProcess } from 'child_process'
+import { randomBytes } from 'crypto'
+import { promisify } from 'util'
+import { ScrcpyVideo } from './ScrcpyVideo.js'
+import { ScrcpyControl } from './ScrcpyControl.js'
+import type { ScrcpyDeviceInfo } from './ScrcpyVideo.js'
+import { getAdbPath } from '../sdk.js'
+import { createLogger, PlatformError } from '@tapflowio/agent-core'
+
+const logger = createLogger('android-agent:scrcpy')
+
+const execFileAsync = promisify(execFile)
+
+// 3.3 fixes the locked capture_orientation direction on Android 15+ (scrcpy #6010):
+// 3.1 captured rotated content in the wrong direction on API 35+, so the client-side CSS
+// rotation showed it sideways. Keep this in sync with download-scrcpy-server.mjs.
+const SCRCPY_SERVER_VERSION = '3.3'
+const DEVICE_PATH = '/data/local/tmp/scrcpy-server.jar'
+
+function getServerJarPath(): string {
+  const dir = path.dirname(fileURLToPath(import.meta.url))
+  // src/scrcpy/ → ../../bin/  (or dist/scrcpy/ → ../../bin/)
+  return path.resolve(dir, '../../bin/scrcpy-server.jar')
+}
+
+// Each session gets its own port; control connects to the same forwarded port
+let nextPort = 27183
+function allocatePort(): number {
+  return nextPort++
+}
+
+export class ScrcpySession {
+  private readonly scid: string
+  private readonly socketName: string
+  private serverProc: ChildProcess | null = null
+  private videoSocket: net.Socket | null = null
+  private controlSocket: net.Socket | null = null
+  private _video: ScrcpyVideo | null = null
+  private _control: ScrcpyControl | null = null
+  private port = 0
+  /** The process we killed on purpose — compared by identity so a late exit from an old
+   *  process is never blamed on the one running now. */
+  private stoppedProc: ChildProcess | null = null
+
+  constructor() {
+    const buf = randomBytes(4)
+    buf[0]! &= 0x7f  // Java Integer.parseInt rejects values > 0x7FFFFFFF
+    this.scid = buf.toString('hex')
+    this.socketName = `scrcpy_${this.scid}`
+  }
+
+  get video(): ScrcpyVideo {
+    if (!this._video) throw new PlatformError('ScrcpySession not started')
+    return this._video
+  }
+
+  get control(): ScrcpyControl {
+    if (!this._control) throw new PlatformError('ScrcpySession not started')
+    return this._control
+  }
+
+  async start(serial: string): Promise<ScrcpyDeviceInfo> {
+    const adb = getAdbPath()
+    const port = allocatePort()
+    this.port = port
+    const jarPath = getServerJarPath()
+
+    await execFileAsync(adb, ['-s', serial, 'push', jarPath, DEVICE_PATH])
+
+    const serverProc = spawn(adb, [
+      '-s', serial, 'shell',
+      `CLASSPATH=${DEVICE_PATH} app_process / com.genymobile.scrcpy.Server`,
+      SCRCPY_SERVER_VERSION,
+      `scid=${this.scid}`,
+      'tunnel_forward=true',
+      'video_codec=h264',
+      'video_encoder=OMX.google.h264.encoder', // software encoder — avoids c2.android.avc.encoder stalling under GPU load
+      'video_bit_rate=8000000',
+      'max_fps=30',
+      'audio=false',
+      'stay_awake=true',         // prevent device display from sleeping during capture
+      // Lock the captured stream to portrait so device rotation never resizes it (no SPS
+      // re-init → no decoder reset / black flash). Rotation is shown client-side via CSS,
+      // matching the iOS viewer; rotation-capable apps still re-layout (we set user_rotation)
+      // and scrcpy rotates that content into the locked portrait frame, which CSS undoes.
+      'capture_orientation=@0',
+      'send_device_meta=true',   // 64-byte name + codec-id + width + height header
+      // 12-byte frame header per packet (pts + config/keyframe flags + length). Gives
+      // authoritative keyframe/config boundaries so the agent marks the TFFE envelope
+      // (codec=H.264, keyframe) correctly → relay keyframe-aware backpressure works
+      // (no P-frame tearing under LAN congestion). See ScrcpyVideo packet framer.
+      'send_frame_meta=true',
+      'send_dummy_byte=false',   // skip the 1-byte connection-check byte
+      // profile=1 (AVCProfileBaseline): the browser WASM decoder (tinyh264) only
+      // decodes (constrained-)baseline — force it so Android shares the HTTP→WASM path.
+      // i-frame-interval=1s for faster keyframe recovery after restart.
+      'video_codec_options=profile:int=1,i-frame-interval:int=1',
+    ], { stdio: ['ignore', 'pipe', 'ignore'] })
+
+    this.serverProc = serverProc
+    // adb shell mixes server stdout+stderr into the local process stdout
+    serverProc.stdout?.on('data', (d: Buffer) => {
+      const msg = d.toString().trim()
+      if (msg) logger.debug(msg)
+    })
+    // Without a handler, an unhandled 'error' event (e.g. spawn() failing with ENOENT/EACCES,
+    // or EPERM from kill()) throws and crashes the whole agent — taking down every device it manages.
+    serverProc.on('error', (e) => logger.error(`server process: ${e.message}`))
+    // Log why the server exited so restart loops have a recorded cause. Expected exits (our own
+    // stop() records stoppedProc) are debug-level noise; unexpected ones are warnings.
+    serverProc.on('exit', (code, signal) => {
+      const detail = `code=${code ?? '-'} signal=${signal ?? '-'}`
+      if (this.stoppedProc === serverProc) {
+        logger.debug(`server process exited (${detail})`)
+      } else {
+        logger.warn(`server process exited unexpectedly (${detail})`)
+      }
+    })
+    serverProc.unref()
+
+    try {
+      // Wait for server to bind the abstract socket
+      await new Promise((r) => setTimeout(r, 1500))
+
+      await execFileAsync(adb, ['-s', serial, 'forward', `tcp:${port}`, `localabstract:${this.socketName}`])
+
+      // scrcpy accepts connections sequentially on the same socket:
+      // 1st accept() → video stream, 2nd accept() → control stream
+      this.videoSocket = await this.connectTcp(port)
+      this.controlSocket = await this.connectTcp(port)
+
+      this._video = new ScrcpyVideo(this.videoSocket)
+      const info = await this._video.deviceInfo()
+
+      this._control = new ScrcpyControl(this.controlSocket, info.width, info.height)
+      logger.info(`ready — ${info.deviceName} ${info.width}×${info.height}`)
+      return info
+    } catch (e) {
+      this.stoppedProc = serverProc
+      serverProc.kill()
+      this.serverProc = null
+      throw e
+    }
+  }
+
+  stop(serial: string): void {
+    // Keep the previous marker when there is nothing to mark — a stop() that finds serverProc
+    // already null would erase it, and the exit we caused would come back as unexpected. No
+    // caller does that today (both null the session immediately after stopping it), so this
+    // keeps the invariant in the class that owns it rather than in two call sites that happen
+    // to be written correctly.
+    if (this.serverProc) this.stoppedProc = this.serverProc
+    this.serverProc?.kill()
+    this.serverProc = null
+    this.videoSocket?.destroy()
+    this.controlSocket?.destroy()
+    this.videoSocket = null
+    this.controlSocket = null
+    this._video = null
+    this._control = null
+
+    const adb = getAdbPath()
+    execFile(adb, ['-s', serial, 'forward', '--remove', `tcp:${this.port}`], () => {})
+  }
+
+  private connectTcp(port: number): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+      const socket: net.Socket = net.connect(port, '127.0.0.1', () => resolve(socket))
+      socket.once('error', (error) => reject(new PlatformError(`Failed to connect to scrcpy on port ${port}`, { cause: error })))
+    })
+  }
+}

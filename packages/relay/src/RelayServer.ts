@@ -1,0 +1,3464 @@
+import http from 'http'
+import https from 'https'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { randomUUID } from 'crypto'
+import { WebSocketServer, WebSocket } from 'ws'
+import { SessionManager, isAiClientKind } from './SessionManager.js'
+import type { Session } from './SessionManager.js'
+import type { DeviceDetails, UIElement } from './types.js'
+import type { ChromePayload, InputErrorReason, RelayOutbound, PosturesPayload, WatchActionKind, WatchRefusal } from '@tapflowio/protocol'
+import { gestureAction, keyForWatchers } from './lib/watchActions.js'
+import { directionOf, parseInbound } from '@tapflowio/protocol/validate'
+import type { ParsedInbound, ParseFailure, ParseResult } from '@tapflowio/protocol/validate'
+import { Router, json } from './router.js'
+import { requireViewAuth, requireAuth, getAuth, verifyPat, touchPat, findPat, findUser } from './middleware/auth.js'
+import { AGENT_SCOPE, VIEW_SCOPE, WS_ACCESS_CHANGED_REASON, WS_AGENT_OWNER_REASON, WS_SCOPE_REASON, classifyConnection, isAffectedBy, revalidatePrincipal, type AuthChange, type SocketPrincipal } from './lib/connectionAuth.js'
+import { isTunnelIngress, markTunnelIngress, proxiedWithoutForwardedFor, resolveClientAddress, resolveRequestClient } from './lib/clientAddress.js'
+import { BuildTicketStore } from './lib/buildTickets.js'
+import { resolveBuildFile } from './lib/buildFiles.js'
+import { resolveCorsHeaders } from './lib/cors.js'
+import { isCsrfBlocked } from './lib/csrf.js'
+import { pickLanAddress, runningInContainer } from './lib/lanAddress.js'
+import { config, getJwtSecret } from './lib/config.js'
+import { forTeammates, resolveAgentRelayUrl, resolvePublicBaseUrl, type TunnelRuntime } from './lib/publicUrl.js'
+import { createTrailingRequester, systemTimerScheduler, type TrailingRequester } from './lib/trailingRequester.js'
+import { getDb } from './db.js'
+import { handleLogin, handleLogout, handleMe, handleChangePassword, handleInit, handleAuthStatus } from './api/auth.js'
+import { handleVerify, handleAccept } from './api/invitations.js'
+import { createLogger, hasCapability } from '@tapflowio/agent-core'
+import { acquireLoopStallWatch } from '@tapflowio/agent-core/utils'
+import {
+  createKeyframeAwareSender,
+  createRateLimitedDropWarn,
+  sendAudioYieldingToVideo,
+  DEFAULT_BACKPRESSURE_BYTES,
+  hasEnvelope,
+  patchRelayedAt,
+  readEnvelopeFlags,
+  CODEC_JPEG,
+  CODEC_AUDIO,
+} from '@tapflowio/agent-core/utils'
+import type { KeyframeAwareSender } from '@tapflowio/agent-core/utils'
+
+const logger = createLogger('relay')
+
+// True when a remote IP is public — i.e. not loopback, private LAN, or link-local. Used to pick the
+// downscale tier (external viewers are bandwidth-constrained). Behind a reverse proxy the relay sees
+// the proxy's address, so set TAPFLOW_MAX_SIZE_EXTERNAL=0 / a global override for those deployments.
+export function isExternalAddress(addr: string): boolean {
+  if (!addr) return false
+  const a = addr.replace(/^::ffff:/, '') // unwrap IPv4-mapped IPv6
+  if (a === '127.0.0.1' || a === '::1' || a === 'localhost') return false
+  if (/^10\./.test(a) || /^192\.168\./.test(a) || /^169\.254\./.test(a)) return false
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(a)) return false
+  if (/^(f[cd]|fe80)/i.test(a)) return false // IPv6 ULA / link-local
+  return true
+}
+// Min gap between IDR requests per session — one IDR resyncs the stream, so avoid
+// spamming the agent in the frames between request and the IDR arriving.
+/** Exported for the re-join test, which pins both edges of this window rather than hardcoding 500 —
+ *  a test carrying its own copy of the number passes when the constant moves, which is the drift the
+ *  wire-contract work keeps finding. Not re-exported from the package index. */
+export const IDR_REQUEST_THROTTLE_MS = 500
+/** The same window for `network:request-state`, and a **separate constant on purpose**: the two share
+ *  a number today and not a policy. IDR drops inside the window; this one coalesces onto its trailing
+ *  edge (see `networkStateRequester`). Sharing the constant would mean tuning one tunes the other. */
+export const NETWORK_STATE_REQUEST_THROTTLE_MS = 500
+
+// Ping every socket each interval; a missed pong window (~2× this) terminates the dead socket.
+const HEARTBEAT_MS = 30_000
+// How long a session outlives its agent's socket, waiting for that agent to come back (#426).
+// An agent registers ~1s after its process starts, so this covers an automatic respawn several
+// times over and about half of a hand-typed restart. What bounds it is the other direction: the
+// device stays claimed by a session nobody can use until the window closes.
+const DEFAULT_AGENT_GRACE_MS = 15_000
+
+/**
+ * What a buffer actually is, from its magic bytes, or `null` for anything else.
+ *
+ * Duplicated in `mcp-server` rather than shared: `protocol`'s entry must erase under `import type`
+ * so it cannot hold a runtime value, and `mcp-server` does not depend on `agent-core`. The same
+ * situation as `correlatesWith` across the two clients, and the same answer — each copy has tests.
+ * These two signatures have not changed since 1992 and 1996, so there is little for them to drift to.
+ */
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+
+function sniffImageFormat(buf: Buffer): 'png' | 'jpeg' | null {
+  // All eight signature bytes — see the note on the `mcp-server` copy for why the trailing four earn
+  // their place. Here a false `png` would report a mismatch that is not one.
+  if (buf.length >= PNG_SIGNATURE.length && PNG_SIGNATURE.every((b, i) => buf[i] === b)) return 'png'
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) return 'jpeg'
+  return null
+}
+import { handleVerifyReset, handleDoReset, handleSendMemberReset } from './api/passwordReset.js'
+import { EMAIL_KEY_SQL } from './lib/email.js'
+import { handleListBuilds, handleGetBuild, handleUpdateBuild, handleUploadBuild, handleScheduleBuildDeletion, handleCancelBuildDeletion, purgeExpiredBuilds } from './api/builds.js'
+import type { BuildFileDirs } from './lib/buildDeletion.js'
+import { handleListApps, handleCreateApp, handleUpdateApp, handleDeleteApp } from './api/apps.js'
+import { handleListWebhooks, handleCreateWebhook, handleUpdateWebhook, handleDeleteWebhook } from './api/webhooks.js'
+import { handleListComments, handleCreateComment, handleDeleteComment } from './api/comments.js'
+import { handleListMembers, handleInvite, handleUpdateMember, handleDeleteMember } from './api/team.js'
+import { handleListTokens, handleCreateToken, handleRevokeToken } from './api/tokens.js'
+import { handleGetSettings, handleUpdateSettings } from './api/settings.js'
+import { handleUpdateProfile } from './api/profile.js'
+import { handleUploadRecording, handleListRecordings, handleDownloadRecording, purgeExpiredRecordings } from './api/recordings.js'
+import { handleEndVideo, handleOpenVideo, handleVideoChunk, handleVideoData, handleVideoIndex, purgeRunVideos, releaseStaleVideoReservations, runVideosDirFor, videoSummaries } from './api/runVideos.js'
+import { abandonRunsOf, handleCreateRun, handleFinishRun, handleGetFlowScreenshot, handleGetRun, handleListRuns, handleReportFlow, handleUploadFlowScreenshot, purgeExpiredRuns, runScreenshotsDirFor, type RunHolders } from './api/runs.js'
+import { handleListAgents, handleGetAgentResources } from './api/agents.js'
+
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html',
+  '.js': 'application/javascript',
+  '.css': 'text/css',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+}
+
+const _parsedThreshold = parseInt(process.env['TAPFLOW_RESOURCE_THRESHOLD_PERCENT'] ?? '80', 10)
+const RESOURCE_THRESHOLD = Number.isFinite(_parsedThreshold) ? _parsedThreshold : 80
+
+// Messages that only agents are allowed to send. Authenticated browser sockets
+// that send any of these are disconnected immediately.
+// Terminal input messages the MCP client awaits an ack for — if the agent is offline
+// the relay replies input:error so the client fails truthfully (non-terminal moves/starts
+// expect no ack and are dropped silently).
+/** Why a session is not this socket's to command. One reason, two prose strings — the treatment `#492`
+ *  settled for `agent offline` / `Session not found`: telling a caller the session is in use when it is
+ *  idle steers it off a device it could have had. Shared so the two never drift. */
+function ownershipRefusal(session: Session): string {
+  return session.browserSocket ? 'session held by another client' : 'session not joined'
+}
+
+/**
+ * The owner key a connection speaks for, from the authenticated user and the client id it claimed.
+ *
+ * **Both halves, and a pure function so both can be tested.** The user id is what keeps a leaked client id
+ * useless to anyone else — without it this would be the relay's first ownership claim a caller can forge,
+ * where socket identity could not be. It comes from the cookie *or* the PAT: reading only the cookie would
+ * have made every agent and every non-browser client `anon:`, which is the population most likely to have
+ * its handshake URL end up in a reverse proxy's access log. The mint is what removes the fallback branch: a connection that
+ * claims nothing gets an identity of its own, which is per-socket, which is the behaviour ownership had
+ * before it moved off the socket.
+ *
+ * Exported for the test that holds the pairing. Inline in the handler it was unreachable without standing
+ * up an authenticated handshake, and a mutation dropping the user id survived the whole suite.
+ */
+export function ownerKeyFor(
+  userId: number | string | undefined,
+  claimed: string | null,
+): { key: string; user: string; minted: boolean } {
+  const user = String(userId ?? 'anon')
+  // **Mintedness is a separate field, not a marker inside the key.** A first version prefixed the mint
+  // with `minted-` and had `mayShutDown` recover the fact with `includes(':minted-')` — which the client
+  // controls, because `claimed` comes straight off the handshake query and is never validated. Connecting
+  // as `?client=minted-1` produced `anon:minted-1` and silently disabled the shutdown gate for that
+  // holder; `?client=x:minted-y` did it while keeping a real user id, so a *different* user could then
+  // power the device off. Encoding a security-relevant fact in a caller-supplied string is the forgery
+  // this whole key was introduced to avoid, reintroduced one layer down.
+  return { key: `${user}:${claimed || randomUUID()}`, user, minted: !claimed }
+}
+
+/** One line per rejecting socket per second, at most. See `RelayServer.logInboundRejection`. */
+const REJECT_LOG_INTERVAL_MS = 1_000
+
+/** One line per refused credential per minute. See `RelayServer.logConnectionRejection`. */
+const CONNECTION_REJECT_LOG_INTERVAL_MS = 60_000
+
+export const LOGS_FORBIDDEN_MESSAGE = 'Logs are only available on the relay host. Run `tapflow logs` there.'
+
+/**
+ * `?lines=` for `/api/v1/logs`: an integer in [1, 500], 100 when absent or not a number. A bare
+ * `Number()` let `abc` through as NaN, and `slice(-NaN)` returns the whole buffer; `-5` became
+ * `slice(5)`, everything but the oldest five.
+ */
+export function parseLogLines(raw: string | null): number {
+  if (raw === null || raw.trim() === '') return 100
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 100
+  return Math.min(500, Math.max(1, Math.trunc(n)))
+}
+
+/** What the door refused, as one line. The throttling that decides whether to write it is the
+ *  caller's, because it is per socket and this function has no state. */
+function describeRejection(failure: ParseFailure, suppressed: number): string | null {
+  if (failure.reason === 'not-an-object') return null
+  const also = suppressed > 0 ? ` (+${suppressed} more from this socket in the last second)` : ''
+  if (failure.reason === 'unknown-type') {
+    return `[tapflow] inbound frame of unknown type ${failure.type} — dropped${also}`
+  }
+  const outcome = failure.reason === 'bad-payload' ? 'refused, and the sender told' : 'dropped'
+  return `[tapflow] inbound ${failure.type} does not match the contract — ${outcome}${also}:\n${failure.detail}`
+}
+/** One member of the parse product, by literal. `route` narrows to these; a handler that takes one
+ *  gets exactly what the door proved for that type and nothing else. */
+type Inbound<T extends ParsedInbound['type']> = Extract<ParsedInbound, { type: T }>
+
+/** The five inputs an ack answers, and the six it does not. Written as unions of `Inbound<…>` rather
+ *  than as `& { requestId: string }` intersections: the correlator is now declared on the members
+ *  themselves, so an intersection would re-state a fact the union already carries — and would keep
+ *  compiling if one of them lost the field. */
+type Acked = Inbound<'input:touch:end' | 'input:pinch:end' | 'input:key' | 'input:button' | 'input:type'>
+type Unacked = Inbound<
+  'input:touch:start' | 'input:touch:move' | 'input:pinch:start' | 'input:pinch:move'
+  | 'input:rotate' | 'input:posture' | 'input:keyboard:toggle'
+>
+
+/** Just past `mcp-server`'s 30s shutdown deadline, so an entry outlives every caller still waiting on it. */
+const SHUTDOWN_REQUESTER_TTL_MS = 35_000
+/**
+ * How long a tracked boot lives without an answer. The same horizon as both clients'
+ * `BOOT_DEADLINE_MS`: past it the caller has already timed out, so the entry is pure
+ * bookkeeping. Expiry forgets silently — it sends no failure, because the client timeout
+ * owns that case. This bounds the map, not the boot: it changes nothing about how long a
+ * boot may take, which is #588's question, not this one's.
+ */
+const PENDING_BOOT_TTL_MS = 180_000
+/** Said when a session ends with a shutdown unanswered — which is not the same as the shutdown failing. */
+const SHUTDOWN_OUTCOME_LOST =
+  'The session ended before its agent confirmed the shutdown, so whether the device shut down is unknown.'
+const shutdownRequesterKey = (sessionId: string, requestId: string): string => `${sessionId}\n${requestId}`
+
+export class RelayServer {
+  private httpServer: http.Server | https.Server
+  /**
+   * **The port tunnel clients are pointed at, and the only thing that tells their traffic apart.**
+   * rathole's client and `tailscale serve` run on this machine and connect from loopback on behalf of
+   * someone on the internet or the tailnet; rathole forwards raw TCP, so no header marks it either. On
+   * the main port such a socket is indistinguishable from `tapflow start`'s own agent, which is
+   * unauthenticated by design — so every tunnel visitor was too. Everything accepted here is remote
+   * (`resolveClientAddress`'s `viaTunnel`), whatever its address.
+   *
+   * Loopback-only, because only a tunnel client on this machine has any business here; a remote client
+   * belongs on the main port, where it is classified by address as before. Same handler, same
+   * `WebSocketServer`, same TLS material — rathole carried a TLS relay's own handshake through before
+   * this existed, and still does.
+   */
+  private tunnelServer: http.Server | https.Server | null = null
+  private wss: WebSocketServer
+  private sessions: SessionManager
+  private publicDir: string
+  private uploadsDir: string
+  private router: Router
+  private resourceBuffers = new Map<string, { cpu: number[]; mem: number[] }>()
+  private logBuffer: string[] = []
+  private recordingsDir: string = ''
+  private runScreenshotsDir: string = ''
+  private runVideosDir: string = ''
+  private purgeRecordingsTimer: ReturnType<typeof setInterval> | null = null
+  private purgeOldResourcesTimer: ReturnType<typeof setInterval> | null = null
+  private purgeBuildsTimer: ReturnType<typeof setInterval> | null = null
+  private flushResourcesTimer: ReturnType<typeof setInterval> | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  /** When the last heartbeat sweep ran, by the same clock `isAlive` judges with. */
+  private lastSweepAt = 0
+  /** Names agents give at registration, kept apart from the session map so an agent with no sessions
+   *  can still be named when its socket goes. */
+  private agentNames = new WeakMap<WebSocket, string>()
+  private releaseStallWatch: (() => void) | null = null
+  /** Agent sockets whose close was already explained — ended by a sweep, or replaced by the same agent
+   *  registering again — so the close handler does not log them as a fresh drop. */
+  private explainedCloses = new WeakMap<WebSocket, 'terminated' | 'replaced'>()
+  /**
+   * When each socket last answered a ping. WeakMap → no manual cleanup on close (GC handles it).
+   *
+   * **A timestamp, not the swept boolean it replaced.** That flag was set `false` for *every* socket at the
+   * start of each sweep and back to `true` only when the pong returned, so a perfectly healthy socket read
+   * as dead for the whole round trip — a normal state on a 30s cycle rather than an edge case. And the
+   * window is longest for exactly the socket that matters: video goes out on `browserSocket`, and the ping
+   * is written behind whatever is already queued there, so an external viewer's pong can take a second or
+   * two.
+   *
+   * That was invisible while the flag only decided termination, because a sweep that finds `false` has by
+   * definition already waited a full interval. Reading it to answer *"is this holder alive right now"* is
+   * what exposes it: occupancy would hand a live tester's session away, and `busy` would flash a device as
+   * free every 30 seconds — the dashboard polls every 5s and `disabled={isBusy}`, so the UI would open the
+   * button rather than a race being needed.
+   */
+  private lastPongAt = new WeakMap<WebSocket, number>()
+  /**
+   * Who each socket speaks for — `<userId>:<clientId>`, the key a session's ownership is compared against.
+   *
+   * **Two parts, and both are load-bearing.** The client id is supplied by the caller (`?client=`), so on
+   * its own it is the relay's first *forgeable* ownership claim: today's ownership is socket identity,
+   * which nothing can spoof. Binding it to the authenticated user — which `getAuth` already resolves at
+   * the handshake — keeps a leaked id useless to anyone else's account.
+   *
+   * **A connection that supplies no client id is given one**, rather than falling back to socket identity.
+   * There is deliberately no fallback branch: one model, and a client that does not identify itself gets an
+   * identity that happens to be per-socket, which is exactly today's behaviour.
+   */
+  private ownerKey = new WeakMap<WebSocket, { key: string; user: string; minted: boolean }>()
+  private dropHandlers = new Map<string, () => void>()
+  // Per-session throttled drop-warn for audio (kept separate so audio drops don't mask video drops in logs).
+  private audioDropHandlers = new Map<string, () => void>()
+  // Per-session keyframe-aware sender: drops to the next keyframe under backpressure (no H.264 P-frame tearing).
+  private droppers = new Map<string, KeyframeAwareSender>()
+  // Per-session throttled "request an IDR from the agent" callbacks (drop recovery).
+  private idrRequesters = new Map<string, () => void>()
+  /**
+   * **One keyframe-aware sender per watcher, never the session's.** The sender's `dropping` state lives in
+   * its closure, so sharing the holder's would let a slow watcher put the holder into drop-to-keyframe
+   * too — every P-frame to the holder discarded until the next IDR because someone else's link is slow.
+   * Keyed by socket, then session, because one socket can watch several sessions.
+   */
+  private watcherDroppers = new Map<WebSocket, Map<string, KeyframeAwareSender>>()
+  /**
+   * Whether this connection may watch: a cookie, or a remote PAT with `view` — decided once at the
+   * handshake, from the credential. **Not** an unauthenticated loopback socket: a page in any browser on
+   * the relay's Mac reaches loopback without a credential, and watching shows a device's screen.
+   */
+  private mayWatch = new WeakMap<WebSocket, boolean>()
+  /** Unlike `idrRequesters` these hold a timer, which is why the value is not a bare closure — see
+   *  `forgetSessionState`. */
+  private networkStateRequesters = new Map<string, TrailingRequester>()
+  private wsRoles = new Map<WebSocket, 'agent' | 'browser' | 'stream'>()
+  /** Per-socket throttle state for `logInboundRejection`. A `WeakMap` so a closed socket's entry goes
+   *  with the socket — there is no cleanup to forget, unlike the maps keyed by session id nearby. */
+  private readonly rejectionLog = new WeakMap<WebSocket, { at: number; suppressed: number }>()
+  /**
+   * The credential each remote socket was accepted with, re-checked by `revalidateSockets` on every
+   * heartbeat and after every write that can take access away (`onAuthChanged`). Local sockets have
+   * no entry and are never re-checked: they needed no credential.
+   */
+  private readonly principals = new WeakMap<WebSocket, SocketPrincipal>()
+  /** For a `first-message` socket: what its first frame may make of it. Absent means anything (local). */
+  private readonly firstMessageGrants = new WeakMap<WebSocket, { mayBrowse: boolean; mayRegisterAgent: boolean }>()
+  /**
+   * Sockets the relay closed because their credential stopped being valid. Their frames are dropped
+   * from the moment of the close rather than from the peer's close reply, and an agent socket among
+   * them skips the reconnect grace: the agent will be refused when it comes back, so holding its
+   * sessions for 15 s would only postpone the same end.
+   */
+  private readonly revokedSockets = new WeakSet<WebSocket>()
+  /** Per-credential throttle for `logConnectionRejection`: agents retry forever on a refusal. */
+  private readonly connectionRejectLog = new Map<string, { at: number; suppressed: number }>()
+  // Agent sockets whose sessions are being held open, and the timer that gives up on each.
+  // Keyed by the dead socket, never by session id: a rebind moves sessions off that socket, so an
+  // expiry that fires late has nothing left to evict. That is the invariant — releasing the hold
+  // on the way back is hygiene on top of it, not a second thing holding the property up. The late
+  // expiry is not a complete no-op either: it still drops the socket's resource entry.
+  private agentHolds = new Map<WebSocket, ReturnType<typeof setTimeout>>()
+  // Set by `stop()`. Its own `terminate()` loop fires a close for every socket, and a hold armed
+  // from there would outlive the server it belongs to — the exact hazard the clearing above it is
+  // for, arriving a few lines later.
+  private stopping = false
+  // True when the connection's remote IP is public (not loopback / private LAN) — the agent uses
+  // this to downscale harder for bandwidth on external viewers.
+  private wsExternal = new Map<WebSocket, boolean>()
+  private readonly backpressureBytes: number
+  private readonly screenshotTimeoutMs: number
+  private readonly agentGraceMs: number
+  /** How long a tracked boot lives without an answer. An option so tests can shrink the
+   *  180s horizon; production always takes the default. */
+  private readonly pendingBootTtlMs: number
+  private readonly corsAllowed: Set<string>
+  // One-shot warning when XFF arrives on a loopback socket but TAPFLOW_TRUSTED_PROXIES is unset.
+  private warnedProxyMisconfig = false
+  private warnedTrustedProxyWithoutXff = false
+  /** Agent identities already warned about a missing `build-download`. See `warnLegacyInstaller`. */
+  private readonly warnedLegacyInstaller = new Set<string>()
+  private readonly buildTickets = new BuildTicketStore()
+  private pendingScreenshots = new Map<string, {
+    sessionId: string
+    resolve: (buf: Buffer, format: 'png' | 'jpeg') => void
+    reject: (err: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  private readonly uiTreeTimeoutMs: number
+  private pendingUITrees = new Map<string, {
+    sessionId: string
+    resolve: (elements: UIElement[]) => void
+    reject: (err: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  /**
+   * Who asked for each correlated `device:shutdown` still waiting on its agent (#567). The agent's answer
+   * goes to the session's `browserSocket`, and a caller that never joined — an MCP client shutting down a
+   * session nobody holds, which `mayShutDown` permits — has no socket there, so it waited out its 30s for a
+   * shutdown that had happened. Keyed by session **and** id, because the id is chosen by the client and
+   * would alone let one session's answer reach another session's caller.
+   *
+   * **Settled when the session is removed, never when the agent socket drops — the opposite of a boot.**
+   * Both agents reconnect without restarting, and a shutdown that finishes after the reconnect is answered
+   * on the new socket, so an agent going away or being rebound is not evidence that the answer is lost.
+   * For a boot it is (#885): the binding a boot creates is exactly what a rebind loses. Folding the two
+   * into one rule would tell a caller its shutdown failed for a device that then powered off.
+   */
+  private readonly shutdownRequesters = new Map<string, {
+    sessionId: string
+    requestId: string
+    ws: WebSocket
+    timer: ReturnType<typeof setTimeout>
+  }>()
+
+  /**
+   * In-flight `device:boot` requests, keyed by session and correlator (#885).
+   *
+   * The relay is the only layer that knows which agent socket each boot was actually dispatched
+   * to, so it owns settling the ones a rebind strands. The client cannot tell "issued before the
+   * rebound" from "delivered to the old agent", which is why the previous client-side settle on
+   * `session:rebound` answered boots the new agent was already handling. Entries record the
+   * concrete agent socket from the `device:boot` dispatch, so a rebind invalidates only the boots
+   * tied to the replaced socket and leaves a boot dispatched to the new socket alone.
+   *
+   * Cleared when a correlated `device:ready` or `device:boot-error` arrives, when the boot is
+   * invalidated at rebind, when its session is forgotten or evicted — and by its own expiry
+   * (`PENDING_BOOT_TTL_MS`) when none of those happen first, so a live agent that never answers
+   * cannot pin the entry past every caller that could have waited on it. An absent `requestId`
+   * answers no request (protocol/AGENTS.md 「Lifecycle correlation」), so id-less replies clear
+   * nothing. A leftover entry is harmless: its id names no waiter, so both clients and the
+   * dashboard drop the synthetic error it would produce.
+   */
+  private readonly pendingBoots = new Map<string, {
+    sessionId: string
+    requestId: string
+    agentSocket: WebSocket
+    timer: ReturnType<typeof setTimeout>
+  }>()
+
+  constructor(private readonly options: { port: number; publicDir?: string; uploadsDir?: string; idleTimeoutMs?: number; wsBackpressureBytes?: number; screenshotTimeoutMs?: number; uiTreeTimeoutMs?: number; trustedProxies?: string[]; corsOrigins?: string[]; tls?: { cert: string; key: string }; agentGraceMs?: number; pendingBootTtlMs?: number; tunnel?: TunnelRuntime; tunnelPort?: number }) {
+    // 0 on both sides is two ephemeral ports, which is what the tests ask for.
+    if (options.tunnelPort !== undefined && options.tunnelPort !== 0 && options.tunnelPort === options.port) {
+      throw new Error(`The tunnel port (${options.tunnelPort}) must differ from the relay port. Set TAPFLOW_TUNNEL_PORT to another port.`)
+    }
+    this.backpressureBytes = options.wsBackpressureBytes ?? DEFAULT_BACKPRESSURE_BYTES
+    this.screenshotTimeoutMs = options.screenshotTimeoutMs ?? 10_000
+    // Longer than the screenshot default: the Android agent's device-side dump
+    // itself may take up to 10s before it errors out.
+    this.uiTreeTimeoutMs = options.uiTreeTimeoutMs ?? 15_000
+    this.corsAllowed = new Set(options.corsOrigins ?? [])
+    // Constructor option first, then env. It cannot be env-only: `IDLE_TIMEOUT_MS` is read at module
+    // load, which is why no test can set it, and the tests that need a different window here run in
+    // the same process as the default.
+    // Validated, not just parsed, and blank treated as unset rather than as a number. Three ways
+    // this silently switches the feature off if read naively: `parseInt('15s')` is 15 — and the
+    // documented default reads "15000 (15 s)", so that is the typo the docs invite; a non-numeric
+    // value is NaN, which `setTimeout` rounds to ~1ms; and `Number('')` is 0, not NaN, so an empty
+    // `.env` line would pass a `>= 0` check and give a zero-length window.
+    const graceRaw = process.env['TAPFLOW_AGENT_GRACE_MS']?.trim()
+    const graceEnv = graceRaw ? Number(graceRaw) : NaN
+    const graceUsable = Number.isFinite(graceEnv) && graceEnv >= 0
+    this.agentGraceMs = options.agentGraceMs ?? (graceUsable ? graceEnv : DEFAULT_AGENT_GRACE_MS)
+    this.pendingBootTtlMs = options.pendingBootTtlMs ?? PENDING_BOOT_TTL_MS
+    // Say so rather than only documenting it. Both times this parsing was wrong the symptom was
+    // the same — the hold switched off and nothing mentioned it — and somebody who types `15s` is
+    // reading their terminal, not the configuration table.
+    if (options.agentGraceMs === undefined && graceRaw && !graceUsable) {
+      logger.warn(`TAPFLOW_AGENT_GRACE_MS="${graceRaw}" is not a usable number of milliseconds — using ${DEFAULT_AGENT_GRACE_MS}`)
+    }
+    this.sessions = new SessionManager({
+      idleTimeoutMs: options.idleTimeoutMs,
+      // Before the sockets are forgotten, so each one is told why its picture stopped.
+      onWatchersEvicted: (sessionId, sockets, reason) => {
+        for (const w of sockets) {
+          this.forgetWatcherDropper(w, sessionId)
+          this.sendTo(w, { type: 'watch:ended', sessionId, reason })
+        }
+      },
+    })
+    this.publicDir = options.publicDir ?? path.join(import.meta.dirname, '../public')
+    this.uploadsDir = options.uploadsDir ?? path.join(import.meta.dirname, '../uploads')
+    this.router = new Router()
+    this.registerRoutes()
+    // WebCodecs는 secure context(HTTPS)에서만 동작 — tls가 주어지면 https로 종단하고 WSS가 자동 승계한다.
+    const handler = (req: http.IncomingMessage, res: http.ServerResponse) => this.handleRequest(req, res)
+    this.httpServer = options.tls
+      ? https.createServer({ cert: options.tls.cert, key: options.tls.key }, handler)
+      : http.createServer(handler)
+    // Disable Nagle on every accepted socket (browsers + agents): small writes (touch, frame tails)
+    // must not be held waiting for an ACK. Negligible on localhost, but ~40ms stalls on LAN.
+    this.httpServer.on('connection', (socket) => socket.setNoDelay(true))
+    this.wss = new WebSocketServer({ server: this.httpServer })
+    this.wss.on('connection', (ws, request) => this.handleConnection(ws, request))
+    this.wss.on('error', () => { /* propagated from httpServer */ })
+
+    if (options.tunnelPort !== undefined) {
+      // Marked before anything reads it: the router hands this same request object to `handleInit`, and
+      // `handleUpgrade` passes it on to the `connection` event.
+      const tunnelHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
+        markTunnelIngress(req)
+        return handler(req, res)
+      }
+      const tunnelServer = options.tls
+        ? https.createServer({ cert: options.tls.cert, key: options.tls.key }, tunnelHandler)
+        : http.createServer(tunnelHandler)
+      tunnelServer.on('connection', (socket) => socket.setNoDelay(true))
+      // `handleUpgrade` adds the socket to `wss.clients`, so the heartbeat and `stop()` cover it.
+      tunnelServer.on('upgrade', (req: http.IncomingMessage, socket, head: Buffer) => {
+        markTunnelIngress(req)
+        this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req))
+      })
+      this.tunnelServer = tunnelServer
+    }
+  }
+
+  private registerRoutes(): void {
+    const u = this.uploadsDir
+
+    // auth
+    this.router.get('/api/v1/auth/status', (req, res) => handleAuthStatus(req, res, this.options.trustedProxies ?? []))
+    this.router.post('/api/v1/auth/init', (req, res) => handleInit(req, res, this.options.trustedProxies ?? []))
+    this.router.get('/api/v1/auth/me', handleMe)
+    this.router.post('/api/v1/auth/login', (req, res) => handleLogin(req, res, this.options.trustedProxies ?? []))
+    this.router.post('/api/v1/auth/logout', handleLogout)
+    this.router.post('/api/v1/auth/change-password', (req, res) => handleChangePassword(req, res, this.onAuthChanged))
+    this.router.get('/api/v1/auth/reset-password/verify', handleVerifyReset)
+    this.router.post('/api/v1/auth/reset-password', (req, res) => handleDoReset(req, res, this.onAuthChanged))
+
+    // invitations
+    this.router.get('/api/v1/invitations/verify', handleVerify)
+    this.router.post('/api/v1/invitations/accept', (req, res) => handleAccept(req, res, u))
+
+    // apps
+    this.router.get('/api/v1/apps', handleListApps)
+    this.router.post('/api/v1/apps', handleCreateApp)
+    this.router.patch('/api/v1/apps/:id', handleUpdateApp)
+    this.router.delete('/api/v1/apps/:id', (req, res, params) => handleDeleteApp(req, res, params, this.buildFileDirs()))
+
+    // builds
+    this.router.get('/api/v1/builds', handleListBuilds)
+    this.router.get('/api/v1/builds/:id', handleGetBuild)
+    this.router.patch('/api/v1/builds/:id', handleUpdateBuild)
+    this.router.post('/api/v1/builds/:id/schedule-deletion', handleScheduleBuildDeletion)
+    this.router.delete('/api/v1/builds/:id/schedule-deletion', handleCancelBuildDeletion)
+    this.router.post('/api/v1/builds', (req, res) => handleUploadBuild(req, res, u))
+    // **Deliberately not under `/api/v1/builds/`.** `:id` compiles to `([^/]+)` and the router
+    // returns on the first registered match, so `/api/v1/builds/download` is captured by
+    // `/api/v1/builds/:id` as `id="download"` — `requireBuildAuth` then answers 401 to a ticketed
+    // agent carrying no PAT. Registration order could avoid it, which is exactly the objection:
+    // that makes the order load-bearing with nothing to say so.
+    this.router.get('/api/v1/build-download', (req, res) => this.handleBuildDownload(req, res))
+
+    // webhooks (outbound build-status notifications)
+    this.router.get('/api/v1/webhooks', handleListWebhooks)
+    this.router.post('/api/v1/webhooks', handleCreateWebhook)
+    this.router.patch('/api/v1/webhooks/:id', handleUpdateWebhook)
+    this.router.delete('/api/v1/webhooks/:id', handleDeleteWebhook)
+
+    // comments
+    this.router.get('/api/v1/comments', handleListComments)
+    this.router.post('/api/v1/comments', (req, res) => handleCreateComment(req, res, u))
+    this.router.delete('/api/v1/comments/:id', handleDeleteComment)
+
+    // team
+    this.router.get('/api/v1/team/members', handleListMembers)
+    this.router.post('/api/v1/team/invite', (req, res) => handleInvite(req, res, this.options.tunnel))
+    this.router.patch('/api/v1/team/members/:id', (req, res, params) => handleUpdateMember(req, res, params, this.onAuthChanged))
+    this.router.delete('/api/v1/team/members/:id', (req, res, params) => handleDeleteMember(req, res, params, this.onAuthChanged))
+    this.router.post('/api/v1/team/members/:id/send-reset', (req, res, params) => handleSendMemberReset(req, res, params, this.options.tunnel))
+
+    // tokens
+    this.router.get('/api/v1/tokens', handleListTokens)
+    this.router.post('/api/v1/tokens', handleCreateToken)
+    this.router.delete('/api/v1/tokens/:id', (req, res, params) => handleRevokeToken(req, res, params, this.onAuthChanged))
+
+    // settings
+    this.router.get('/api/v1/settings', (req, res) => handleGetSettings(req, res, this.runVideosDir))
+    this.router.patch('/api/v1/settings', (req, res) => handleUpdateSettings(req, res, u))
+    this.router.patch('/api/v1/profile', (req, res) => handleUpdateProfile(req, res, u))
+
+    // recordings
+    this.recordingsDir = path.join(u, '../recordings')
+    this.router.post('/api/v1/recordings/upload', (req, res) => handleUploadRecording(req, res, this.recordingsDir))
+    this.router.get('/api/v1/recordings', (req, res) => handleListRecordings(req, res))
+    this.router.get('/api/v1/recordings/:filename', (req, res) => handleDownloadRecording(req, res, this.recordingsDir))
+
+    // flow run records — written by `tapflow flow run`, read by the runs page
+    this.runScreenshotsDir = runScreenshotsDirFor(u)
+    this.router.post('/api/v1/runs', handleCreateRun)
+    this.router.get('/api/v1/runs', (req, res) => handleListRuns(req, res, this.runHolders))
+    this.router.get('/api/v1/runs/:id', (req, res, params) => handleGetRun(req, res, params, this.runHolders, videoSummaries))
+    this.router.post('/api/v1/runs/:id/finish', handleFinishRun)
+    this.router.post('/api/v1/runs/:id/flows/:idx', handleReportFlow)
+    this.router.post('/api/v1/runs/:id/flows/:idx/screenshot', (req, res, params) => handleUploadFlowScreenshot(req, res, params, this.runScreenshotsDir))
+    this.router.get('/api/v1/runs/:id/flows/:idx/screenshot', (req, res, params) => handleGetFlowScreenshot(req, res, params, this.runScreenshotsDir))
+    // a flow's video (A4) — uploaded by the runner while the flow runs, kept by the retention policy
+    this.runVideosDir = runVideosDirFor(u)
+    this.router.post('/api/v1/runs/:id/flows/:idx/video/open', (req, res, params) => handleOpenVideo(req, res, params, this.runVideosDir))
+    this.router.post('/api/v1/runs/:id/flows/:idx/video/chunks/:seq', (req, res, params) => handleVideoChunk(req, res, params, this.runVideosDir, this.runHolders))
+    this.router.post('/api/v1/runs/:id/flows/:idx/video/end', handleEndVideo)
+    this.router.get('/api/v1/runs/:id/flows/:idx/video/index', (req, res, params) => handleVideoIndex(req, res, params, this.runHolders))
+    this.router.get('/api/v1/runs/:id/flows/:idx/video', (req, res, params) => handleVideoData(req, res, params, this.runHolders, this.runVideosDir))
+
+    // logs — the relay host only. The buffer holds the addresses of refused connections, nothing
+    // remote reads it (`tapflow logs` is its only consumer), and every line is also in the relay's own
+    // output. Same locality rule and proxy list as `auth/init` and the WebSocket handshake, so the tunnel
+    // listener is remote here too.
+    this.router.get('/api/v1/logs', (req, res) => {
+      if (!resolveRequestClient(req, this.options.trustedProxies ?? []).isLocal) {
+        return json(res, 403, { error: LOGS_FORBIDDEN_MESSAGE })
+      }
+      const url = new URL(req.url ?? '/', `http://localhost`)
+      const lines = parseLogLines(url.searchParams.get('lines'))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(this.logBuffer.slice(-lines)))
+    })
+
+    // What the dashboard needs to build an address for someone else (#271, #788): a link base for a
+    // teammate's browser and an agent address, reported separately because they come from different
+    // settings (see lib/publicUrl.ts). Config comes from the singleton, as in the team handlers; whether a
+    // tunnel actually came up is known only to the entry point that started it, hence the `tunnel` option.
+    this.router.get('/api/v1/relay/host', (req, res) => {
+      if (!requireAuth(req, res)) return
+      const addr = this.httpServer.address()
+      const port = typeof addr === 'object' && addr !== null ? addr.port : this.options.port
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        lanHost: runningInContainer() ? null : pickLanAddress(os.networkInterfaces()),
+        port,
+        publicBaseUrl: forTeammates(resolvePublicBaseUrl(config, this.options.tunnel)),
+        agentRelayUrl: forTeammates(resolveAgentRelayUrl(config)),
+      }))
+    })
+
+    // agent resources
+    this.router.get('/api/v1/agents', handleListAgents)
+    this.router.get('/api/v1/agents/:name/resources', handleGetAgentResources)
+
+    // screenshot
+    this.router.get('/api/v1/sessions/:sessionId/screenshot',
+      (req, res, params) => this.handleGetScreenshot(req, res, params))
+    this.router.get('/api/v1/sessions/:sessionId/ui-tree',
+      (req, res, params) => this.handleGetUITree(req, res, params))
+  }
+
+  pushLog(msg: string): void {
+    const line = `[${new Date().toISOString()}] ${msg}`
+    this.logBuffer.push(line)
+    if (this.logBuffer.length > 500) this.logBuffer.shift()
+    logger.info(msg)
+  }
+
+  start(): Promise<void> {
+    // Creates this install's JWT secret if it has none. Here rather than at import, so commands
+    // that never run a relay stop leaving one behind — and a write failure is still a boot failure.
+    getJwtSecret()
+    this.warnOrphanedAgentTokens()
+    this.warnDuplicateEmails()
+    purgeExpiredRecordings(this.recordingsDir)
+    this.purgeRecordingsTimer = setInterval(() => purgeExpiredRecordings(this.recordingsDir), 24 * 60 * 60 * 1000)
+    this.purgeRecordingsTimer.unref()
+
+    const purgeOldResources = () => {
+      getDb().prepare(`DELETE FROM agent_resources WHERE recorded_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days')`).run()
+    }
+    purgeOldResources()
+    this.purgeOldResourcesTimer = setInterval(purgeOldResources, 24 * 60 * 60 * 1000)
+    this.purgeOldResourcesTimer.unref()
+
+    // Runs ride the builds' daily tick rather than a timer of their own: a build's runs go with it, and the
+    // runs left over (no build) expire on the same clock.
+    const purgeBuildsAndRuns = () => {
+      purgeExpiredBuilds(this.buildFileDirs())
+      purgeExpiredRuns(this.runScreenshotsDir, this.runVideosDir, this.runHolders)
+      purgeRunVideos(this.runVideosDir, this.runHolders)
+    }
+    // Before the first purge or write: no write in flight survived the last process.
+    releaseStaleVideoReservations()
+    purgeBuildsAndRuns()
+    this.purgeBuildsTimer = setInterval(purgeBuildsAndRuns, 24 * 60 * 60 * 1000)
+    this.purgeBuildsTimer.unref()
+
+    this.flushResourcesTimer = setInterval(() => this.flushResourceBuffers(), 60_000)
+    this.flushResourcesTimer.unref()
+
+    this.lastSweepAt = Date.now()
+    this.heartbeatTimer = setInterval(() => { this.noteLateSweep(); this.runHeartbeat() }, HEARTBEAT_MS)
+    this.heartbeatTimer.unref()
+    this.releaseStallWatch ??= acquireLoopStallWatch()
+    // The rule a proxy has to follow, said once to whoever set the list: the case it covers (a proxy that
+    // sends no forwarding header at all) is one no request-time check can see.
+    const trustedProxies = this.options.trustedProxies ?? []
+    if (trustedProxies.length > 0) {
+      logger.info(
+        `Trusted proxies: ${trustedProxies.join(', ')}. A request from one of these without ` +
+        'X-Forwarded-For is treated as coming from that address itself, so the proxy must send X-Forwarded-For.'
+      )
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      this.httpServer.once('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          reject(new Error(`Port ${this.options.port} is already in use. Stop the existing process and try again.`))
+        } else {
+          reject(err)
+        }
+      })
+      // Bind dual-stack (IPv4 + IPv6). A bare listen(port) binds IPv6-only on some
+      // macOS/node setups, so LAN agents connecting over IPv4 (ws://<ipv4>:port) time out.
+      this.httpServer.listen({ port: this.options.port, host: '::', ipv6Only: false }, () => resolve())
+    }).then(() => this.listenTunnel())
+  }
+
+  private listenTunnel(): Promise<void> {
+    const tunnelServer = this.tunnelServer
+    if (!tunnelServer) return Promise.resolve()
+    const port = this.options.tunnelPort ?? 0
+    return new Promise<void>((resolve, reject) => {
+      tunnelServer.once('error', (err: NodeJS.ErrnoException) => reject(
+        err.code === 'EADDRINUSE'
+          ? new Error(`Tunnel port ${port} is already in use. Stop the process holding it, or set TAPFLOW_TUNNEL_PORT to a free port.`)
+          : err,
+      ))
+      // 127.0.0.1, not `localhost`: rathole's client dials that address literally, and `tailscale serve
+      // <port>` proxies to it.
+      tunnelServer.listen({ port, host: '127.0.0.1' }, () => {
+        // The main server's later errors reach `wss`, which swallows them; nothing forwards this one's.
+        tunnelServer.on('error', (err) => logger.error(`tunnel listener error: ${String(err)}`))
+        resolve()
+      })
+    }).catch(async (err: unknown) => {
+      // A relay whose tunnel port failed must not keep serving on the main one: the caller treats this
+      // as a failed start and moves on, and the port would stay held by a server nobody stops.
+      await this.stop().catch(() => {})
+      throw err
+    })
+  }
+
+  stop(): Promise<void> {
+    if (this.purgeRecordingsTimer) { clearInterval(this.purgeRecordingsTimer); this.purgeRecordingsTimer = null }
+    if (this.purgeOldResourcesTimer) { clearInterval(this.purgeOldResourcesTimer); this.purgeOldResourcesTimer = null }
+    if (this.purgeBuildsTimer) { clearInterval(this.purgeBuildsTimer); this.purgeBuildsTimer = null }
+    if (this.flushResourcesTimer) { clearInterval(this.flushResourcesTimer); this.flushResourcesTimer = null }
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null }
+    this.releaseStallWatch?.(); this.releaseStallWatch = null
+    // `unref()` would not do: the test runner's process outlives the server, so an un-cleared hold
+    // still fires — against a server that has already stopped.
+    this.stopping = true
+    for (const timer of this.agentHolds.values()) clearTimeout(timer)
+    this.agentHolds.clear()
+    // Same argument one line up. **Not** because the send would land — `sendTo` drops a socket that is
+    // not OPEN, which is why `fire` carries no check of its own — but because `unref()` only excuses a
+    // timer from keeping the process alive, and the test runner's process outlives the server anyway.
+    // An armed edge therefore still runs, holding a closure over the session map of a relay that has
+    // already stopped.
+    for (const requester of this.networkStateRequesters.values()) requester.dispose()
+    this.networkStateRequesters.clear()
+    for (const entry of this.shutdownRequesters.values()) clearTimeout(entry.timer)
+    this.shutdownRequesters.clear()
+    // Same argument as the holds above: an expiry firing after `stop()` would run against a dead
+    // server, and an unref'd 180s timer still outlives the test runner's process.
+    for (const key of this.pendingBoots.keys()) this.forgetBoot(key)
+    const closeTunnel = new Promise<void>((resolve, reject) => {
+      // Not listening means `start()` never reached it, or its listen failed; `close()` would reject.
+      if (!this.tunnelServer?.listening) return resolve()
+      this.tunnelServer.close((err) => (err ? reject(err) : resolve()))
+    })
+    const closeMain = new Promise<void>((resolve, reject) => {
+      this.wss.clients.forEach((ws) => ws.terminate())
+      this.wss.close(() => {
+        this.httpServer.close((err) => (err ? reject(err) : resolve()))
+      })
+    })
+    return Promise.all([closeMain, closeTunnel]).then(() => undefined)
+  }
+
+  address() {
+    return this.httpServer.address()
+  }
+
+  /** The tunnel listener's address, or null when this relay was given no `tunnelPort`. */
+  tunnelAddress() {
+    return this.tunnelServer?.address() ?? null
+  }
+
+  /**
+   * Migration 014 normalizes stored addresses but leaves alone any two that normalize to the same one —
+   * rewriting them would break `UNIQUE(email)` and the migration with it. Each still signs in by its
+   * exact address; name them so an Admin can remove the duplicate.
+   */
+  private warnDuplicateEmails(): void {
+    const groups = getDb().prepare(`
+      SELECT ${EMAIL_KEY_SQL} AS email, GROUP_CONCAT(id) AS ids FROM users
+      GROUP BY ${EMAIL_KEY_SQL} HAVING COUNT(*) > 1
+    `).all() as { email: string; ids: string }[]
+    for (const g of groups) {
+      logger.warn(`Accounts ${g.ids} differ only in letter case or spaces (${g.email}). Each signs in only with its exact address; remove the duplicate in Dashboard → Settings → Team.`)
+    }
+  }
+
+  /**
+   * An install upgrading to a relay that checks an agent token's owner stops connecting agents whose
+   * token belongs to a since-demoted Admin. Say how many at boot, with the fix, rather than leaving the
+   * operator to read 1008s off each agent.
+   */
+  private warnOrphanedAgentTokens(): void {
+    const row = getDb().prepare(`
+      SELECT COUNT(*) AS n FROM personal_access_tokens pat JOIN users u ON u.id = pat.user_id
+      WHERE u.role <> 'Admin'
+        AND (',' || REPLACE(pat.scope, ' ', '') || ',') LIKE '%,${AGENT_SCOPE},%'
+        AND (pat.expires_at IS NULL OR datetime(pat.expires_at) > datetime('now'))
+    `).get() as { n: number }
+    if (row.n > 0) {
+      logger.warn(`${row.n} agent token(s) belong to a member who is no longer an Admin and will be refused. An Admin must issue a new agent token (Dashboard → Settings → Tokens) for each agent that uses one.`)
+    }
+  }
+
+  // Terminate sockets that missed the previous pong; ping the rest. Covers all roles via wss.clients.
+  // Every socket's credential is re-checked on the same sweep: this is the guarantee that a removed
+  // member, a revoked or expired token, or an expired session cookie loses an open socket within one
+  // interval, whatever path the change took. `onAuthChanged` is the same check run early.
+  private runHeartbeat(clients: Iterable<WebSocket> = this.wss.clients): void {
+    this.revalidateSockets(clients)
+    // Agents one line each; everything else summed, because a relay waking from sleep finds every socket
+    // stale at once and one line per browser tab would push the agent lines out of the log buffer.
+    const others = new Map<string, number>()
+    for (const ws of clients) {
+      if (!this.isAlive(ws)) {
+        const role = this.wsRoles.get(ws)
+        if (role === 'agent') {
+          this.pushLog(`heartbeat terminated agent ${this.agentNames.get(ws) ?? 'unknown'} — last pong ${this.pongAgeSeconds(ws)}s ago`)
+          this.explainedCloses.set(ws, 'terminated')
+        } else {
+          const key = role ?? 'unregistered'
+          others.set(key, (others.get(key) ?? 0) + 1)
+        }
+        ws.terminate()
+        continue
+      }
+      if (ws.readyState === WebSocket.OPEN) ws.ping()
+    }
+    if (others.size > 0) {
+      this.pushLog(`heartbeat terminated ${[...others].map(([role, n]) => `${n} ${role}`).join(', ')} socket(s)`)
+    }
+  }
+
+  /** A sweep that runs late means this process was held, or the machine slept: the pongs it judges were
+   *  never read, so its terminations say nothing about the clients. Same clock as `isAlive`. */
+  private noteLateSweep(now: number = Date.now()): void {
+    const late = now - this.lastSweepAt - HEARTBEAT_MS
+    if (late > HEARTBEAT_MS / 2) {
+      this.pushLog(`heartbeat sweep ran ${Math.round(late / 1000)}s late — the relay was stalled or the system slept; this sweep may end sockets that were alive`)
+    }
+    this.lastSweepAt = now
+  }
+
+  private pongAgeSeconds(ws: WebSocket): number | string {
+    const at = this.lastPongAt.get(ws)
+    return at === undefined ? '?' : Math.round((Date.now() - at) / 1000)
+  }
+
+  /**
+   * Injected into the handlers whose write can take access away — member update and removal, token
+   * revocation, a password reset or change — and called after the write commits. The sweep re-derives
+   * every socket's standing from the database, so when the database answers, no handler has to know which
+   * sockets its change affects.
+   *
+   * `affected` names the credential the write just reduced (`AuthChange`), and matters only when a lookup
+   * fails: the sockets resting on that credential are closed anyway (fail closed), because the one thing
+   * known for certain is that it just went down. Scoped to what the write touched, so revoking an unused
+   * CI token cannot take down the owner's agents and every session running on them. Every other socket is
+   * left alone as before.
+   */
+  private readonly onAuthChanged = (affected?: AuthChange): void => {
+    this.revalidateSockets(this.wss.clients, affected)
+  }
+
+  private revalidateSockets(clients: Iterable<WebSocket>, affected?: AuthChange): void {
+    const now = Math.floor(Date.now() / 1000)
+    let fault: unknown = null
+    for (const ws of clients) {
+      const principal = this.principals.get(ws)
+      if (!principal || this.revokedSockets.has(ws) || ws.readyState !== WebSocket.OPEN) continue
+      let reason: string | null
+      try {
+        const pat = principal.via === 'pat' ? findPat(principal.patId) : null
+        const role = this.wsRoles.get(ws)
+        reason = revalidatePrincipal(principal, role, {
+          userPasswordVersion: principal.via === 'cookie' ? findUser(principal.userId)?.pwv ?? null : null,
+          pat,
+        }, now)
+        // A socket that has not introduced itself yet takes what a fresh handshake would give it now.
+        if (reason === null && role === undefined && pat) {
+          const again = classifyConnection({ isLocal: false, hasCookieAuth: false, patScopes: pat.scopes, patOwnerRole: pat.ownerRole })
+          if (again.action === 'accept') {
+            this.firstMessageGrants.set(ws, again.role === 'browser'
+              ? { mayBrowse: true, mayRegisterAgent: false }
+              : { mayBrowse: again.mayBrowse, mayRegisterAgent: again.mayRegisterAgent })
+          }
+        }
+      } catch (err) {
+        // A database fault is not a revocation: closing every socket on a transient `SQLITE_BUSY` would
+        // disconnect the whole team, so the others wait for the next sweep. The exception is the member
+        // whose access this sweep was run for: a write just took it away, and letting their socket keep
+        // sending until the database recovers is the hole this closes. Keep going rather than stopping at
+        // the first fault, or a socket of that member later in the set would never be reached.
+        fault ??= err
+        if (affected && isAffectedBy(principal, affected)) this.closeForAuth(ws, WS_ACCESS_CHANGED_REASON)
+        continue
+      }
+      if (reason !== null) this.closeForAuth(ws, reason)
+    }
+    if (fault !== null) logger.error('socket re-validation failed:', fault)
+  }
+
+  private closeForAuth(ws: WebSocket, reason: string): void {
+    this.revokedSockets.add(ws)
+    this.pushLog(`WS connection closed — ${reason}`)
+    ws.close(1008, reason)
+  }
+
+  /**
+   * One line per refused credential per interval. Agents retry forever on a refusal, so logging each
+   * attempt would fill the 500-line buffer with one agent's reconnects. Keyed by PAT id when there is
+   * one and by address otherwise; the first refusal of each is always written.
+   */
+  private logConnectionRejection(addr: string, reason: string, patId: number | undefined): void {
+    const key = patId !== undefined ? `pat:${patId}` : `addr:${addr}`
+    const now = Date.now()
+    const state = this.connectionRejectLog.get(key)
+    if (state && now - state.at < CONNECTION_REJECT_LOG_INTERVAL_MS) {
+      state.suppressed++
+      return
+    }
+    if (this.connectionRejectLog.size > 1000) {
+      for (const [k, v] of this.connectionRejectLog) {
+        if (now - v.at >= CONNECTION_REJECT_LOG_INTERVAL_MS) this.connectionRejectLog.delete(k)
+      }
+    }
+    const also = state && state.suppressed > 0 ? ` (+${state.suppressed} more in the last minute)` : ''
+    this.connectionRejectLog.set(key, { at: now, suppressed: 0 })
+    this.pushLog(`WS connection rejected from ${addr} — ${reason}${also}`)
+  }
+
+  /**
+   * Has this socket answered recently enough to be treated as present?
+   *
+   * `1.5` intervals rather than one: a pong that arrives *during* a sweep must not be read as late, and a
+   * socket pinged at the end of one interval has until halfway through the next. The cost is that a
+   * genuinely dead socket is recognised in up to 45s instead of 30 — **and 45 seconds with no false
+   * negative beats 30 with one every cycle**, because a false negative here does not merely delay: it
+   * hands a live tester's session to whoever asked next.
+   */
+  private buildFileDirs(): BuildFileDirs {
+    return { uploadsDir: this.uploadsDir, recordingsDir: this.recordingsDir, runScreenshotsDir: this.runScreenshotsDir, runVideosDir: this.runVideosDir }
+  }
+
+  /** Open sockets speaking for any of these owner keys. */
+  private openSocketsOf(keys: string[]): WebSocket[] {
+    return [...this.wss.clients].filter((ws) => ws.readyState === WebSocket.OPEN && keys.includes(this.ownerKey.get(ws)?.key ?? ''))
+  }
+
+  private readonly runHolders: RunHolders = {
+    connectedKeys: () => {
+      const keys = new Set<string>()
+      for (const ws of this.wss.clients) {
+        const key = ws.readyState === WebSocket.OPEN ? this.ownerKey.get(ws)?.key : undefined
+        if (key) keys.add(key)
+      }
+      return keys
+    },
+    heldSession: (keys) => {
+      for (const ws of this.openSocketsOf(keys)) {
+        const held = this.sessions.getByBrowserSocket(ws)
+        if (held.length > 0) return held[0].id
+      }
+      return null
+    },
+  }
+
+  private isAlive(ws: WebSocket): boolean {
+    const at = this.lastPongAt.get(ws)
+    // **No entry means just connected, not dead.** `handleConnection` seeds one, but a socket is in
+    // `wss.clients` from the upgrade, so there is a tick where a sweep could see it first — and the flag
+    // this replaced was explicitly safe there ("alive until proven otherwise"). Reading absence as dead
+    // would terminate a connection that had done nothing wrong, and occupancy would read the same absence
+    // as a free session.
+    if (at === undefined) return true
+    return Date.now() - at <= HEARTBEAT_MS * 1.5
+  }
+
+  // 갱신된 cert를 재시작 없이 핫스왑한다(https 종단일 때만 의미 있음).
+  updateTlsContext(material: { cert: string; key: string }): void {
+    for (const server of [this.httpServer, this.tunnelServer]) {
+      if (server instanceof https.Server) {
+        server.setSecureContext({ cert: material.cert, key: material.key })
+      }
+    }
+  }
+
+  /**
+   * Drop every per-session stream record keyed by this id.
+   *
+   * **Four maps that have to move together, called from four places that did not.** They were deleted
+   * inline in `session:end` and `session:leave` and nowhere else, so a session ending any other way —
+   * the agent going away, the idle timer, a device disappearing from a re-register — left all four
+   * behind for the life of the process.
+   *
+   * Pre-existing, and this slice is what makes it worth fixing here rather than filing: `idrRequesters`
+   * used to be populated only by the binary drop path, i.e. only under backpressure, and a re-join now
+   * creates an entry for any streaming session (#515). The leak went from rare to ordinary.
+   *
+   * **Now five maps, and the fifth is not dropped the same way.** `networkStateRequesters` holds a
+   * *coalescing* requester, so its closure owns a pending `setTimeout` — and deleting a map entry does
+   * not cancel a timer. Leaving it armed is not a leak but a double send: `session:leave` followed by a
+   * re-join inside the window fires the orphaned trailing edge *and* the new requester's leading edge,
+   * which is the second budget for one session that this map exists to prevent. Hence `dispose()`
+   * rather than `delete` alone. It was named `forgetSessionStreamState` while all four were stream
+   * records; the network requester is not one, so the name lost the word rather than the entry
+   * lost the function.
+   */
+  private forgetSessionState(sessionId: string): void {
+    this.dropHandlers.delete(sessionId)
+    this.dropHandlers.delete(`${sessionId} watchers`)
+    this.audioDropHandlers.delete(sessionId)
+    this.droppers.delete(sessionId)
+    this.idrRequesters.delete(sessionId)
+    this.networkStateRequesters.get(sessionId)?.dispose()
+    this.networkStateRequesters.delete(sessionId)
+    // Tracked boots die with the session too (#885 review). These paths — `session:end`,
+    // `session:leave`, the cross-identity removal — bypass `evictAgentSocket`, so without this
+    // the entry outlives the session it names. Harmless but unbounded: a late correlated reply
+    // still clears via `settleBoot`, and `invalidateBootsFor` sends nothing for a gone session,
+    // so this only bounds the map. Scoped by session, never by socket, so a rebound session's
+    // entry — which lives on under the same id — is untouched.
+    this.forgetEvictedBoots(new Set([sessionId]))
+  }
+
+  /**
+   * Throttled callback asking the session's agent for an on-demand IDR (fast drop recovery); ignored by
+   * agents that don't support it.
+   *
+   * **One per session, and the construction is folded in here on purpose.** The throttle is `lastAt` in
+   * the closure, so a second requester for the same session is a second budget — which is what the
+   * `idrRequesters` map exists to prevent, and it prevented it only as long as every caller remembered
+   * to look the session up first. There are two callers now (the drop path and the re-join in
+   * `handleSessionStart`), and a separate `makeIdrRequester` was a factory either of them could reach
+   * past the map. Measured: calling it directly from one caller left every test green.
+   */
+  private idrRequester(sessionId: string): () => void {
+    const existing = this.idrRequesters.get(sessionId)
+    if (existing) return existing
+    let lastAt = 0
+    const requester = () => {
+      const now = Date.now()
+      if (now - lastAt < IDR_REQUEST_THROTTLE_MS) return
+      lastAt = now
+      const session = this.sessions.get(sessionId)
+      if (session?.agentSocket.readyState === WebSocket.OPEN) {
+        this.sendTo(session.agentSocket, { type: 'stream:request-idr', sessionId })
+      }
+    }
+    this.idrRequesters.set(sessionId, requester)
+    return requester
+  }
+
+  /**
+   * Throttled callback asking the session's agent to re-read and report the device's network
+   * condition (#614); ignored by agents that don't support it.
+   *
+   * **Coalescing, where `idrRequester` above drops — and the difference is not a preference.** A
+   * dropped IDR request costs nothing: the next periodic keyframe repairs it. Nothing re-produces a
+   * `network:state`, so a request dropped inside the window leaves that viewer rendering "unknown"
+   * for the life of the session. The trailing edge fires after the last join in a burst, and the
+   * relay addresses the reply to whichever socket holds the session *when it arrives* — so the
+   * viewer that ends up watching is the one served, which a leading edge cannot promise.
+   *
+   * The burst this is for is the dirty blip, not two people: `join()` refuses a live holder, and a
+   * clean `session:leave` runs `forgetSessionState` and builds a fresh requester. A browser socket
+   * that dies in its close handler does neither, so `lastAt` survives into the re-join — which is
+   * the very path this slice exists to serve.
+   *
+   * One per session, constructed here, for the reason written on `idrRequester`: the throttle lives
+   * in the closure, so a second requester is a second budget.
+   */
+  private networkStateRequester(sessionId: string): TrailingRequester {
+    const existing = this.networkStateRequesters.get(sessionId)
+    if (existing) return existing
+    const requester = createTrailingRequester({
+      scheduler: systemTimerScheduler,
+      windowMs: NETWORK_STATE_REQUEST_THROTTLE_MS,
+      fire: () => {
+        const session = this.sessions.get(sessionId)
+        // `sendTo` already drops a socket that is not OPEN, so a closed agent needs no check here —
+        // an earlier draft duplicated it and no mutation could tell the copy from the original.
+        //
+        // The lookup is the guard that remains, and it should be unreachable: **every path that removes
+        // a session runs `forgetSessionState`, which disposes this timer.** It is kept as the cheap half
+        // of that pair rather than as a live case — a trailing edge is the one call here that outlives
+        // the statement scheduling it, so the invariant holding is worth not assuming.
+        if (session) this.sendTo(session.agentSocket, { type: 'network:request-state', sessionId })
+      },
+    })
+    this.networkStateRequesters.set(sessionId, requester)
+    return requester
+  }
+
+  // Extracted so tests can simulate non-loopback origins (all test traffic is loopback).
+  private remoteAddressOf(request: http.IncomingMessage): string {
+    return request.socket.remoteAddress ?? ''
+  }
+
+  /**
+   * Called on both doors — the WebSocket upgrade and every HTTP request — since `auth/init` and the logs
+   * route decide locality on the HTTP side. Not on the tunnel listener, where every request is remote
+   * whatever it carries.
+   */
+  private warnTrustedProxyWithoutXffOnce(request: http.IncomingMessage): void {
+    if (this.warnedTrustedProxyWithoutXff || isTunnelIngress(request)) return
+    const header = proxiedWithoutForwardedFor(this.remoteAddressOf(request), request.headers, this.options.trustedProxies ?? [])
+    if (!header) return
+    logger.warn(
+      `A request from a trusted proxy (TAPFLOW_TRUSTED_PROXIES) carried ${header} but no X-Forwarded-For. ` +
+      'Without that header the relay cannot see the real client, so it treats the request as coming from the ' +
+      'proxy itself: local, and so unauthenticated, when that address is loopback. Configure the proxy to ' +
+      'send X-Forwarded-For. A proxy on this host can instead use the tunnel port, which is open only when a ' +
+      'tunnel is configured or TAPFLOW_TUNNEL_PORT names a port.'
+    )
+    this.warnedTrustedProxyWithoutXff = true
+  }
+
+  private warnProxyMisconfigOnce(socketAddr: string, forwardedFor: string | undefined): void {
+    if (this.warnedProxyMisconfig) return
+    if ((this.options.trustedProxies?.length ?? 0) > 0 || !forwardedFor) return
+    const a = socketAddr.replace(/^::ffff:/, '')
+    if (a === '::1' || a.startsWith('127.')) {
+      logger.warn(
+        'Received X-Forwarded-For from a loopback connection but TAPFLOW_TRUSTED_PROXIES is unset. ' +
+        'If a same-host reverse proxy or `tailscale serve` forwards to this port, every client it forwards is ' +
+        'treated as localhost (unauthenticated). Point it at the tunnel port instead (open only when a tunnel ' +
+        'is configured or TAPFLOW_TUNNEL_PORT names a port), or set TAPFLOW_TRUSTED_PROXIES so the real ' +
+        'client IP is used.'
+      )
+      this.warnedProxyMisconfig = true
+    }
+  }
+
+  private handleConnection(ws: WebSocket, request: http.IncomingMessage): void {
+    // **First, before anything can return.** A frame that breaks the protocol makes `ws` emit `'error'` on
+    // this socket (a reset it handles itself), and an EventEmitter with no `'error'` listener throws: from
+    // inside `ws`'s receiver, with nothing above it to catch. One client could end the relay for everyone,
+    // signed in or not. `ws` closes the socket itself after emitting, so the `'close'` handler below still runs.
+    // Debug, not warn: any client can produce this at will, and the close is already logged where it matters.
+    ws.on('error', (err) => logger.debug(`WebSocket error: ${err.message}`))
+    const socketAddr = this.remoteAddressOf(request)
+    const xff = request.headers['x-forwarded-for']
+    const forwardedFor = Array.isArray(xff) ? xff[0] : xff
+    const viaTunnel = isTunnelIngress(request)
+    // A proxy in front of the tunnel port adds the header too, and there it changes nothing about auth.
+    if (!viaTunnel) this.warnProxyMisconfigOnce(socketAddr, forwardedFor)
+    this.warnTrustedProxyWithoutXffOnce(request)
+    const { addr, isLocal } = resolveClientAddress({
+      socketAddr,
+      forwardedFor,
+      trustedProxies: this.options.trustedProxies ?? [],
+      viaTunnel,
+    })
+
+    // **Everything that reads the database is inside this try.** `getAuth` and `verifyPat` both query,
+    // and this handler runs synchronously in the `connection` event: a throw here is uncaught and takes
+    // the relay process down with every session on it. A fault closes this one socket instead (1011),
+    // and is never read as "no credentials".
+    let decision: ReturnType<typeof classifyConnection>
+    let userId: number | undefined
+    try {
+      // Resolved once: `hasCookieAuth`, the owner key and the principal all read this one answer. Two
+      // calls were two queries, with a window where they could disagree.
+      const cookie = getAuth(request)
+      // DB lookup — only when the connection can't be classified without it (remote, no cookie).
+      const pat = !isLocal && !cookie ? verifyPat(request) : null
+      decision = classifyConnection({
+        isLocal,
+        hasCookieAuth: cookie !== null,
+        patScopes: pat?.scopes ?? null,
+        patOwnerRole: pat?.ownerRole ?? null,
+      })
+      if (decision.action === 'reject') {
+        this.logConnectionRejection(addr, decision.reason, pat?.patId)
+        ws.close(1008, decision.reason)
+        return
+      }
+      // Only an accepted token was used; a refused one keeps its "last used".
+      if (pat) touchPat(pat.patId)
+      userId = cookie?.userId ?? pat?.userId
+      // A loopback cookie is not re-judged later — `principals` below records remote sockets only — so a
+      // watch on loopback lasts until the socket closes even if that user is removed. The same is true of
+      // everything else such a socket does; watching adds nothing to it.
+      this.mayWatch.set(ws, cookie !== null || (!isLocal && pat !== null && pat.scopes.includes(VIEW_SCOPE)))
+      if (!isLocal) {
+        if (cookie) this.principals.set(ws, { via: 'cookie', userId: cookie.userId, jwtExp: cookie.exp, pwv: cookie.pwv })
+        else if (pat) this.principals.set(ws, { via: 'pat', userId: pat.userId, patId: pat.patId })
+      }
+      if (decision.role === 'first-message') {
+        this.firstMessageGrants.set(ws, { mayBrowse: decision.mayBrowse, mayRegisterAgent: decision.mayRegisterAgent })
+      } else if (pat?.scopes.includes(AGENT_SCOPE)) {
+        // A `view,agent` token whose owner is no longer an Admin: browsing only, and a handshake is told why.
+        this.firstMessageGrants.set(ws, { mayBrowse: true, mayRegisterAgent: false })
+      }
+    } catch (err) {
+      logger.error(`WebSocket handshake failed for ${addr}:`, err)
+      ws.close(1011, 'Internal error')
+      return
+    }
+    this.wsExternal.set(ws, isExternalAddress(addr))
+    // Read from the upgrade URL because a browser cannot set WebSocket headers, and because it has to be
+    // known **per connection** rather than per join: the dashboard socket that sends the unmount teardown
+    // never joins anything. `new URL` against a dummy base — `request.url` is path-relative.
+    const claimed = new URL(request.url ?? '/', 'http://relay').searchParams.get('client')
+    // **The PAT counts as a principal, and a first version dropped it.** `getAuth` reads the cookie only,
+    // so every agent, `mcp-server` and `flow-runner` connection would have been `anon:` — and the whole
+    // point of pairing the claim with a user is that a leaked client id is useless to anyone else. Two
+    // processes on the same PAT are the same principal, which is right; two on different PATs are not,
+    // which is what this restores.
+    this.ownerKey.set(ws, ownerKeyFor(userId, claimed))
+
+    // Heartbeat liveness: a fresh socket counts as having just answered, and each pong renews it.
+    this.lastPongAt.set(ws, Date.now())
+    ws.on('pong', () => this.lastPongAt.set(ws, Date.now()))
+    if (decision.role === 'browser') this.wsRoles.set(ws, 'browser')
+    // 'first-message' → role is determined by the first message (agent:register / stream:register)
+
+    ws.on('message', (data, isBinary) => {
+      // Closed for a credential that stopped being valid: nothing it sends after that counts, even
+      // before its close reply arrives.
+      if (this.revokedSockets.has(ws)) return
+      if (isBinary) {
+        // Binary frames arrive on the dedicated stream WS, route to the session's browser and watchers.
+        const session = this.sessions.getByStreamSocket(ws)
+        if (!session) return
+        // **Not gated on the holder.** Watchers keep receiving frames while the holder is away inside its
+        // reconnect grace, which is when `browserSocket` is null.
+        const watchers = this.sessions.watchersOf(session.id)
+        // A holder that said it does not read the stream (`stream: false`) is sent nothing: the MCP server and a
+        // runner that is not recording discard every frame, and an iOS session is ~34 Mbit/s of JPEG to do it with.
+        const holder = session.holderStream ? session.browserSocket : null
+        if (!holder && watchers.length === 0) return
+        const frameBuf = data as Buffer
+        // Audio rides the same socket (codec-tagged). Route it through a sender that YIELDS to
+        // video — it drops audio unless the socket is near-empty, so audio never inflates
+        // bufferedAmount enough to trip the video backpressure path. Must branch before the
+        // video dropper, which would (wrongly) treat audio as a droppable P-frame.
+        //
+        // **The holder's alone.** A watch page has no audio control, and audio a teammate did not ask
+        // to hear should not start playing in their tab.
+        if (hasEnvelope(frameBuf) && readEnvelopeFlags(frameBuf).codec === CODEC_AUDIO) {
+          if (!holder) return
+          patchRelayedAt(frameBuf, Date.now())
+          let onAudioDrop = this.audioDropHandlers.get(session.id)
+          if (!onAudioDrop) {
+            onAudioDrop = createRateLimitedDropWarn(logger, `${session.id} audio`)
+            this.audioDropHandlers.set(session.id, onAudioDrop)
+          }
+          sendAudioYieldingToVideo(holder, frameBuf, onAudioDrop)
+          return
+        }
+        let onDrop = this.dropHandlers.get(session.id)
+        if (!onDrop) {
+          onDrop = createRateLimitedDropWarn(logger, session.id)
+          this.dropHandlers.set(session.id, onDrop)
+        }
+        const requestIdr = this.idrRequester(session.id)
+        // JPEG and H.264 IDRs are resync points; only P-frames must wait for a keyframe after a drop.
+        // Patched once: every recipient is sent the same buffer, so it carries one relay timestamp.
+        let isKeyframe = true
+        if (hasEnvelope(frameBuf)) {
+          patchRelayedAt(frameBuf, Date.now())
+          const flags = readEnvelopeFlags(frameBuf)
+          isKeyframe = flags.codec === CODEC_JPEG || flags.keyframe
+        }
+        if (holder) {
+          let dropper = this.droppers.get(session.id)
+          if (!dropper) {
+            dropper = createKeyframeAwareSender()
+            this.droppers.set(session.id, dropper)
+          }
+          dropper.send(holder, frameBuf, this.backpressureBytes, isKeyframe, onDrop, requestIdr)
+        }
+        // **No IDR request on a watcher's drop**, and its own drop warning. An IDR changes the encoder's
+        // output for everyone, so a watcher on a slow link asking for one on every drain would cost the
+        // holder up to two forced keyframes a second — the slow-watcher-hurts-holder case the separate
+        // sender exists to prevent, by another route. A watcher resyncs on the next periodic keyframe.
+        if (watchers.length > 0) {
+          let onWatcherDrop = this.dropHandlers.get(`${session.id} watchers`)
+          if (!onWatcherDrop) {
+            onWatcherDrop = createRateLimitedDropWarn(logger, `${session.id} watchers`)
+            this.dropHandlers.set(`${session.id} watchers`, onWatcherDrop)
+          }
+          for (const w of watchers) {
+            this.watcherDropper(w, session.id).send(w, frameBuf, this.backpressureBytes, isKeyframe, onWatcherDrop)
+          }
+        }
+        return
+      }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(data.toString())
+      } catch {
+        return // genuinely malformed — there is no type to answer on
+      }
+      // **The frame becomes a union here, and not by a cast.** `#550` asked for `RelayMessage` — a flat
+      // interface where `type` is the only required member — to become a discriminated union, and doing
+      // that with an `as` at this line would have been a downgrade: the visible cast at the
+      // `session:chrome` handler would have turned into an invisible `msg.payload`, with the compiler
+      // vouching for JSON that arrived over a socket. So the union is the *product* of a parse (#444),
+      // and what the parse could not prove is not in the type. Non-objects, unknown types and shape
+      // failures are all refused in there — including the bare `null` / number / string that
+      // `JSON.parse` returns without throwing.
+      const inbound = parseInbound(parsed)
+      // **Role and direction are settled before the shape is, and the order is load-bearing.** A first
+      // draft rejected a malformed frame and returned, which silently dropped an agent-only type a
+      // browser socket had spoofed *badly* — the 1008 that closes such a socket never fired, so the
+      // spoofer kept its connection. The direction is a fact about the `type` alone, and the type is
+      // known on a shape failure too, so nothing about that check needs the payload to be valid.
+      // **Logged before the gate, not after it.** A first draft called `settleRole` first and logged in
+      // the `!ok` branch below it — which never ran for two of the three failure reasons, because
+      // `settleRole` returns `false` for them. The case that mattered was a malformed handshake on a
+      // role-less socket: dropped in silence, which is precisely the agent-registration skew this log
+      // exists to make visible.
+      if (!inbound.ok) this.logInboundRejection(ws, inbound)
+      if (!this.settleRole(ws, inbound)) return
+      if (!inbound.ok) {
+        // **After the role gate, never before it**, so a browser spoofing an agent-only type gets 1008
+        // and no reply. That is the whole of the claim: an agent- or stream-role socket whose token also
+        // carries `view` (or a local one) sending a malformed browser request passes the gate and *is*
+        // answered — without `view` it was already closed above. Harmless, and worth stating rather than implying
+        // otherwise — such a socket already gets an answer on the well-formed path (`refuseInput` tells
+        // it `not-session-owner`), and this reply says strictly less than that one.
+        if (inbound.reason === 'bad-payload') this.refuseMalformed(ws, inbound)
+        return
+      }
+      try {
+        this.route(ws, inbound.msg, inbound.raw)
+      } catch (e) {
+        // A throw inside a handler used to land in the same catch as a parse failure and vanish.
+        // Anything reaching here is a bug in routing, not a bad message, and the caller is left
+        // waiting either way — so at least say so once instead of dropping it silently.
+        logger.error(`route failed for ${inbound.msg.type}:`, e)
+      }
+    })
+
+    ws.on('close', (code: number, reason: Buffer) => {
+      // Not while stopping: the relay ending every socket itself says nothing about the agents.
+      if (this.wsRoles.get(ws) === 'agent' && !this.stopping) {
+        const name = this.agentNames.get(ws) ?? 'unknown'
+        const explained = this.explainedCloses.get(ws)
+        if (explained === 'replaced') {
+          this.pushLog(`agent socket replaced: ${name} registered again on a new connection`)
+        } else if (!explained) {
+          const why = reason.length > 0 ? ` ${reason.toString()}` : ''
+          this.pushLog(`agent socket closed: ${name} (code ${code}${why}, last pong ${this.pongAgeSeconds(ws)}s ago)`)
+        }
+      }
+      this.wsRoles.delete(ws)
+      this.wsExternal.delete(ws)
+      this.forgetShutdownRequesters(ws)
+      // Agent main socket disconnected → hold its sessions open for a moment in case the agent is
+      // coming back (#426), rather than ending them where they stand.
+      if (this.holdAgentSocket(ws)) return
+
+      // Stream socket disconnected → clear the streamSocket reference.
+      //
+      // **No `return`.** One socket can be both: the role gate refuses a `browser`-role socket sending a
+      // non-browser type, and says nothing about a `stream`-role one sending `session:start` — so a
+      // socket that registered a stream first can go on to hold sessions. Returning here skipped the
+      // release below for exactly those, which is the state the loop exists to end.
+      const streamSession = this.sessions.getByStreamSocket(ws)
+      if (streamSession) this.sessions.clearStreamSocket(streamSession.id)
+
+      // A watcher leaving changes nothing for the session it watched — no release, no timer, no IDR.
+      this.sessions.removeWatcherSocket(ws)
+      this.watcherDroppers.delete(ws)
+
+      // Browser socket disconnected → release **every** session it held, each with its own idle timer.
+      //
+      // `getByBrowserSocket` used to answer with one session because the index held one, and a socket
+      // holding several is not exotic: `mcp-server` runs one socket for the whole process and joins a
+      // session per device. So closing it released the last join and left the rest bound to a dead
+      // socket — `busy: true` forever, no timer, and their devices booted with nobody watching (#507).
+      //
+      // The `stopping` guard is `holdAgentSocket`'s, for its stated reason: `stop()` terminates every
+      // client, and a timer armed on the way out survives the promise `stop()` resolves. That was one
+      // stray timer per relay before this loop and is one per held session after it.
+      if (this.stopping) return
+      for (const held of this.sessions.getByBrowserSocket(ws)) {
+        this.sessions.clearBrowser(held.id, () => this.idleShutdown(held.id))
+        this.tellWatchers(held.id, { type: 'watch:holder-left', sessionId: held.id })
+      }
+      // A run is its runner's socket: the flow runner does not reconnect, so the last socket with its key
+      // closing is the end of that run, finished or not. Not done while stopping (above) — a relay going
+      // down has not seen the runner go, and the runner may still finish the run against the next one.
+      //
+      // Caught because this is an event listener: a database fault here (a full disk) would be uncaught and end
+      // the relay — the rule `handleConnection` states for its own reads. A run missed here is closed by
+      // `settleOrphanedRuns` on the next read.
+      try {
+        abandonRunsOf(this.ownerOf(ws), this.runHolders)
+      } catch (e) {
+        logger.error('could not close the runs of a disconnected runner:', e)
+      }
+    })
+  }
+
+  /**
+   * @param msg  what the door proved — see `parseInbound`. An Envelope-tier member arrives carrying
+   *             `type` and its correlators and nothing else, so a payload the parser did not check
+   *             cannot be read off it.
+   * @param raw  the frame as it arrived. Agent-origin messages are **forwarded as this**, so a field
+   *             a newer agent added survives a relay that does not know it — `z.object` strips, and
+   *             stripping is wrong in the one direction where the sender is the more recently
+   *             updated side. Browser-origin messages are forwarded as `msg` instead, so a key an attacker
+   *             appended does not survive. It is also where the two stored Envelope payloads come
+   *             from, which is the point: a value read off `raw` is one the parser did not vouch for.
+   */
+  /**
+   * Assign this socket's role if it does not have one, then refuse a message its role may not send.
+   *
+   * @returns `false` when the caller must stop — the socket was closed, or the frame is a failed
+   *          handshake that must not confer a role.
+   */
+  private settleRole(ws: WebSocket, inbound: ParseResult): boolean {
+    // Every reason that carries a type, which is all of them but the two that have none to carry.
+    // Missing `bad-payload` here returned `false` before the caller could answer, so the thirteen
+    // answerable requests were classified correctly and then dropped anyway — the regression this
+    // whole path exists to prevent, reintroduced one line above it.
+    const type = inbound.ok ? inbound.msg.type
+      : inbound.reason === 'bad-shape' || inbound.reason === 'bad-payload' ? inbound.type
+      : undefined
+    if (type === undefined) return false
+
+    // **The role comes from the two handshake literals, deliberately not from `directionOf`.** Reading
+    // it from the message's own direction is the obvious simplification now that one exists, and it
+    // inverts the check below: a socket whose first frame is `screenshot:done` would be handed the
+    // `agent` role and then waved through the gate that exists to refuse exactly that.
+    const handshake = type === 'agent:register' || type === 'stream:register'
+    // What the credentials allow the first frame to make of this socket (`classifyConnection`). No entry
+    // is a socket that may become anything: a local one.
+    const grants = this.firstMessageGrants.get(ws)
+    if (!this.wsRoles.has(ws)) {
+      // A handshake that did not parse confers nothing. Returning here rather than falling through to
+      // `browser` is what keeps an agent whose register is malformed from being closed with
+      // `Forbidden` — the caller has already logged it, and the next frame still gets to introduce it.
+      if (handshake && !inbound.ok) return false
+      if (handshake && grants && !grants.mayRegisterAgent) {
+        ws.close(1008, WS_AGENT_OWNER_REASON)
+        return false
+      }
+      if (type === 'agent:register') this.wsRoles.set(ws, 'agent')
+      else if (type === 'stream:register') this.wsRoles.set(ws, 'stream')
+      // A first message that is not an agent/stream handshake makes the socket a browser (e.g. the
+      // dashboard opened on the same machine) — but only when its credentials could have opened a
+      // browser socket directly. An `agent`-only token used to land here as a browser too.
+      else if (grants && !grants.mayBrowse) {
+        ws.close(1008, WS_SCOPE_REASON)
+        return false
+      }
+      // This fallback is what puts such a socket under the gate below.
+      else this.wsRoles.set(ws, 'browser')
+    }
+    // A `view,agent` token whose owner lost Admin was accepted as a browser; its handshake is told why
+    // it cannot register rather than a bare `Forbidden`.
+    if (handshake && this.wsRoles.get(ws) === 'browser' && grants && !grants.mayRegisterAgent) {
+      ws.close(1008, WS_AGENT_OWNER_REASON)
+      return false
+    }
+
+    // Browser sockets must not spoof agent control messages.
+    //
+    // This was a hand-copied array of 29 literals with two type assertions holding it against the
+    // protocol. `directionOf` derives the same set from the schema map — verified member for member
+    // against the array it replaces, no literal added and none lost.
+    if (this.wsRoles.get(ws) === 'browser' && directionOf(type) !== 'browser') {
+      ws.close(1008, 'Forbidden')
+      return false
+    }
+    // The other direction of the same rule. An agent or stream socket on a token without `view` may
+    // not act as a browser after its handshake either — `session:start`, `input:*`, `device:*` — or an
+    // `agent`-only token would drive devices just by registering first. No agent needs this: their
+    // text frames go through `sendMsg`/`sendOn`, typed `AgentToRelay | AgentToBrowser`, and the stream
+    // socket sends only `stream:register`; none of those types is browser-direction (checked against
+    // `BrowserToRelay` when this was added). Local agents carry no grants and are not gated.
+    const role = this.wsRoles.get(ws)
+    if ((role === 'agent' || role === 'stream') && grants && !grants.mayBrowse && directionOf(type) === 'browser') {
+      ws.close(1008, WS_SCOPE_REASON)
+      return false
+    }
+    return true
+  }
+
+  /**
+   * What the door refused, said once and in a form an operator can act on.
+   *
+   * This is where `isAddressed` and `isCorrelated` ended up. Both were predicates whose whole
+   * observable output was a `console.warn` — an id-less request resolved no session and was dropped by
+   * the miss anyway — and the schemas now reject the same frames earlier, including the empty-string
+   * case a bare `z.string()` would have let through. What is new is that the log names the *field*:
+   * "requestId: Too small" instead of "dropped, cannot correlate a reply".
+   *
+   * Worth logging at all for the reason `isCorrelated` gave: the three places a bad frame can be
+   * dropped are otherwise silent, and an operator who upgrades the relay but not an independently
+   * installed `mcp-server` would watch commands do nothing with no trace.
+   *
+   * **Throttled per socket, and the "per socket" is the whole design.** A first draft wrote one line
+   * per rejected frame, on the direction a viewer with devtools controls and at the rate a gesture
+   * produces — the unbounded, attacker-driven log volume this file already refuses at
+   * `forwardUnacked`, with the reason written beside it. A single module-level timestamp would fix the
+   * volume and break the diagnostic: one noisy socket would silence the *other* socket's first bad
+   * frame, which is the skewed-client case the log exists for. So the state is keyed by socket, in a
+   * `WeakMap` that needs no cleanup, and **the first rejection from any socket is always written** —
+   * the one that names the skew is never the hundredth. What is dropped is only repetition, and the
+   * next line says how much.
+   *
+   * `unknown-type` stays at debug: eleven relay-produced literals land here whenever a client echoes
+   * one back, and none of them is a defect. It shares the throttle so turning debug on cannot
+   * reintroduce the volume.
+   */
+  private logInboundRejection(ws: WebSocket, failure: ParseFailure): void {
+    const now = Date.now()
+    const state = this.rejectionLog.get(ws)
+    if (state && now - state.at < REJECT_LOG_INTERVAL_MS) {
+      state.suppressed++
+      return
+    }
+    const line = describeRejection(failure, state?.suppressed ?? 0)
+    // Recorded even when there is nothing to write, so a burst of `not-an-object` frames cannot reset
+    // the window for the reasons that do write.
+    this.rejectionLog.set(ws, { at: now, suppressed: 0 })
+    if (line === null) return
+    if (failure.reason === 'unknown-type') logger.debug(line)
+    else logger.warn(line)
+  }
+
+  private route(ws: WebSocket, msg: ParsedInbound, raw: Readonly<Record<string, unknown>>): void {
+
+    switch (msg.type) {
+      // ── Agent → Relay ─────────────────────────────────────────────────────
+      case 'agent:resources':    this.handleAgentResources(ws, msg); break
+      case 'agent:register':     this.handleAgentRegister(ws, msg); break
+      case 'screenshot:done':    this.handleScreenshotDone(msg); break
+      case 'screenshot:error':   this.handleScreenshotError(msg); break
+      case 'ui:tree:response':   this.handleUITreeResponse(msg); break
+      case 'ui:tree:error':      this.handleUITreeError(msg); break
+      case 'agents:list': {
+        this.sendTo(ws, {
+          type: 'agents:listed',
+          sessions: this.sessions.list(this.ownerOf(ws), (holder) => this.isAlive(holder)),
+        })
+        break
+      }
+
+      // ── Session / Stream lifecycle ─────────────────────────────────────────
+      case 'session:start':    this.handleSessionStart(ws, msg); break
+      case 'session:activity': {
+        // A holder's name for what it is about to do (A2), for its watchers only. Unanswered either way, so an
+        // unowned one is simply dropped; the schema already capped its length. **Its content is trusted, not
+        // checked**: the rule that it carries nothing typed binds the sender (`activityLabel` is the only producer),
+        // and a holder that broke it could show no more than it already can on the screen its watchers see.
+        const session = this.sessions.get(msg.sessionId)
+        const label = msg.label.trim()
+        if (session && label && this.ownsSession(ws, session)) this.tellWatchersAction(session.id, { kind: 'label', label })
+        break
+      }
+      case 'watch:start':      this.handleWatchStart(ws, msg); break
+      // Unanswered, like `session:leave`: nobody waits on it, and closing the socket does the same.
+      case 'watch:stop': {
+        if (this.sessions.removeWatcher(msg.sessionId, ws)) this.forgetWatcherDropper(ws, msg.sessionId)
+        break
+      }
+      // ── the two session commands, gated but not answered ───────────────────────────────────────
+      //
+      // Both destroy state a viewer depends on, and until L5c both acted on the strength of the session
+      // existing. `session:leave` is the sharper of the two: it nulls `browserSocket`, so an unguarded one
+      // strips ownership out from under a mounted viewer — and then that tester's own input is refused,
+      // which is why `not-session-owner` needed real copy in the dashboard rather than the `null` a first
+      // draft gave it.
+      //
+      // No address check here at all any more: the schema declares `sessionId` with `.min(1)`, so an absent
+      // id, an empty one and a non-string are all refused before this case is reached. It used to be a bare
+      // `msg.sessionId &&` rather than the `isAddressed` predicate, because a falsy check already covered
+      // both halves and the predicate would have added only its log.
+      //
+      // **Dropped rather than refused, and that is the contract**: neither has a reply, so there is no
+      // waiter to tell. The same asymmetry as the input frames nothing acks. Inventing a
+      // `session:leave-error` would grow the wire for a message no consumer reads — and `session:end` has
+      // no in-repo sender at all, so it would be a reply to nobody.
+      case 'session:end': {
+        const ended = this.sessions.get(msg.sessionId)
+        if (this.ownsSession(ws, ended)) {
+          // Silently: the holder ended it, and the shutdown may still complete on the device — saying it
+          // failed would be a guess. The caller keeps its own deadline, as it did before #567.
+          if (ended) this.settleShutdownRequesters(ended, null)
+          this.sessions.remove(msg.sessionId)
+          this.forgetSessionState(msg.sessionId)
+        }
+        break
+      }
+      case 'session:leave': {
+        if (this.ownsSession(ws, this.sessions.get(msg.sessionId))) {
+          this.sessions.clearBrowser(msg.sessionId)
+          this.forgetSessionState(msg.sessionId)
+          // **A leave is the end, not a blip.** The holder said it is done — a flow run finishing, an MCP
+          // `disconnect_device` — so the watch ends. `watch:holder-left` is for a socket that dropped, which
+          // may come back; sent here it left a watcher of every finished CI run waiting forever.
+          this.sessions.endWatches(msg.sessionId, 'session-ended')
+        }
+        break
+      }
+      case 'stream:register': {
+        const session = this.sessions.get(msg.sessionId)
+        if (session) {
+          this.sessions.setStreamSocket(session.id, ws)
+          this.sendTo(ws, { type: 'stream:registered' })
+        }
+        break
+      }
+
+      // ── Agent → Browser ────────────────────────────────────────────────────
+      case 'session:chrome': {
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        // **Off `raw`, and still a cast — deliberately both.**
+        //
+        // `session:chrome` is Envelope tier, so the parser proved `type` and `sessionId` and nothing
+        // about this value; reading it from `raw` is what makes that visible at the line rather than
+        // in a header. The old comment here promised a validator would replace the cast. It did not,
+        // and the reason is worth having instead of the promise: `ChromePayload` is a **closed
+        // two-member union** while `AgentRegister.platform` is `string`, open so that a third-party
+        // platform can register through `AgentRegistry.register()` (root AGENTS.md, OCP). Validating
+        // this would refuse a platform the repo promises to support — and refusing costs more than a
+        // dropped frame: skipping `setChromeData` also
+        // empties what the re-join replay reads. It is no longer true that this arrives once per boot,
+        // either — a foldable re-sends it when the screen changes under the session — so the cost of
+        // a refusal is a viewer stuck with the previous screen's bezel rather than one frame.
+        // The relay never looks inside; the viewer does, and it is where the variants are already
+        // told apart.
+        this.sessions.setChromeData(session.id, raw['payload'] as ChromePayload)
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.forwardToWatchers(session.id, raw)
+        break
+      }
+      case 'device:postures': {
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        // Cached for the same reason `session:chrome` is: a viewer that re-joins (a tab reload, a
+        // socket blip) gets the session's state replayed, and without this the posture control would
+        // simply be missing until the device was rebooted — with the picture still fine, which is
+        // the hardest kind of gap to diagnose.
+        this.sessions.setPostures(session.id, raw['payload'] as PosturesPayload)
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.forwardToWatchers(session.id, raw)
+        break
+      }
+      case 'session:deviceInfo': {
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        // See `session:chrome` above for why this one is a cast off `raw` too.
+        this.sessions.setDeviceInfo(session.id, raw['payload'] as DeviceDetails)
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.forwardToWatchers(session.id, raw)
+        break
+      }
+      case 'device:booting': {
+        // clear cached device data so reconnecting browser doesn't get stale chrome
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        this.sessions.clearDeviceCache(session.id)
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.forwardToWatchers(session.id, raw)
+        break
+      }
+      case 'device:boot-error': {
+        // A correlated reply answers a tracked boot, whatever else it does — so the entry goes
+        // even when nobody is left to forward to. An id-less frame answers no request, so it
+        // clears nothing.
+        this.settleBoot(msg.sessionId, msg.requestId)
+        const session = this.sessions.get(msg.sessionId)
+        if (session?.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        break
+      }
+      case 'device:shutdown-done': {
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        this.sessions.updateDeviceStatus(session.id, 'shutdown')
+        this.sessions.setReadySent(session.id, false)
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.answerShutdownRequester(session, msg.requestId, raw)
+        break
+      }
+      case 'device:shutdown-error': {
+        // The agent's half of the pair (#455). Device status is left alone: the shutdown was attempted
+        // and not confirmed, so the device may well still be running.
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.answerShutdownRequester(session, msg.requestId, raw)
+        break
+      }
+      case 'device:ready': {
+        // The one inbound member whose `sessionId` is declared optional, and it is a reasoned deferral
+        // rather than an oversight — see `DeviceReady`. So this is a real guard, not a dropped `!`:
+        // an agent that omits it resolves no session here, exactly as before.
+        if (msg.sessionId === undefined) break
+        // Correlated only: a replay or an old agent's id-less ready answers no tracked boot.
+        this.settleBoot(msg.sessionId, msg.requestId)
+        const session = this.sessions.get(msg.sessionId)
+        if (!session) break
+        this.sessions.updateDeviceStatus(session.id, 'booted')
+        this.sessions.setReadySent(session.id, true)
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        this.forwardToWatchers(session.id, raw)
+        break
+      }
+      case 'app:install-done':
+      case 'app:install-error':
+      case 'app:launch-done':
+      case 'app:launch-error':
+      case 'open-url:done':
+      case 'open-url:error':
+      case 'app:clear-state-done':
+      case 'app:clear-state-error':
+      case 'input:type-done':
+      case 'input:type-error':
+      case 'input:done':
+      case 'input:error':
+      case 'keyboard:toggled': {
+        const session = this.sessions.get(msg.sessionId)
+        if (session?.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        break
+      }
+      // Bound to the session's own agent socket, unlike the replies above: this payload
+      // lands on the viewer's host OS clipboard, so a second agent (another Mac on the
+      // same relay) must not be able to address someone else's session.
+      // Bound to the session's own agent socket for the same reason clipboard is: this reply says
+      // whether a **specific tester's** device is on the network, and a second agent must not be
+      // able to tell that tester's viewer something about it.
+      case 'network:state':
+      case 'network:error':
+      case 'clipboard:data':
+      case 'clipboard:write-done':
+      case 'clipboard:error': {
+        const session = this.sessions.get(msg.sessionId)
+        if (session?.agentSocket !== ws) break
+        if (session.browserSocket?.readyState === WebSocket.OPEN) {
+          session.browserSocket.send(JSON.stringify(raw))
+        }
+        break
+      }
+
+      // ── Browser → Agent ────────────────────────────────────────────────────
+      //
+      // These two shared one fall-through clause. Separated because the sharing is the trap for
+      // whoever adds the door gate: a correlator check written into a shared body would gate
+      // `device:shutdown` too, and the relay originates that message with no id — so the dashboard's
+      // three id-less senders and the relay's own idle timer would stop reaching the agent, silently, in the
+      // one direction no reply reports. That gate is a schema now and cannot be written into a case at
+      // all, which is what makes the trap unreachable rather than merely avoided.
+      case 'device:boot': {
+        // The door gate that stood here is now the schema: `device:boot` declares `sessionId` and
+        // `requestId` required, and the parser rejects an absent **or empty** one before this case is
+        // reached. The policy it enforced is unchanged and its reason still holds — both things the
+        // relay could do with an id-less boot are downstream of here (forward it, or answer it with a
+        // `device:boot-error`), so gating only one of them would leave the guarantee resting on
+        // whichever branch was not gated.
+        //
+        // A boot the agent never receives leaves the viewer on "Waiting for first frame…" with nothing
+        // said, and the reasons it might not arrive are worth telling apart: `bootDevice` is the first
+        // call an MCP caller makes, so reporting a stale session id as a dead Mac sends the reader after
+        // the wrong problem. `dispatchTarget` decides which of the four it is.
+        //
+        // **The relay is a producer of this reply, so it echoes the correlator itself.** An MCP caller
+        // that receives this diagnosis uncorrelated reads it as unsolicited and waits out its deadline —
+        // the diagnosis arrives and is discarded. That defect shipped twice from agent code
+        // (`open-url:error`, then `clipboard:error`); here the producer is the relay, where
+        // `correlatedRequestsGated` cannot see it because the field is optional.
+        const boot = this.dispatchTarget(ws, msg.sessionId)
+        if (!boot.ok) {
+          this.sendTo(ws, {
+            type: 'device:boot-error',
+            sessionId: msg.sessionId,
+            requestId: msg.requestId,
+            message: boot.message,
+          })
+          break
+        }
+        // Tag the boot with whether the viewer is external (public IP) so the agent can pick the
+        // downscale tier. The browser already reports secureContext in the payload.
+        //
+        // **Mutating the parse product, not the frame that arrived**, which is what makes this safe as
+        // well as correct: `payload` is a fresh object the parser built, so `raw` is untouched. The
+        // presence check the old line carried is gone because the schema requires the payload — and
+        // `external` is deliberately not declared on `DeviceBoot`, since the browser never sends it.
+        (msg.payload as Record<string, unknown>)['external'] = this.wsExternal.get(ws) ?? false
+        // Whether an automation client (flow runner, MCP) is booting, so the iOS agent can start its UI-tree runner
+        // now instead of inside the first selector step's timeout. Only the holder can boot (`dispatchTarget`), so the
+        // holder's kind is the booter's. A dashboard boot is never warmed: the runner costs about 520 MB per device.
+        ;(msg.payload as Record<string, unknown>)['automation'] = isAiClientKind(boot.session.holderKind)
+        // Tracked by the socket it actually goes to (#885): a rebind invalidates only the boots
+        // tied to the replaced socket, so a boot dispatched after the rebind stays answerable.
+        this.rememberBoot(msg.sessionId, msg.requestId, boot.session.agentSocket)
+        // The parse product, so a key a viewer appended from devtools is gone before the agent sees it.
+        boot.session.agentSocket.send(JSON.stringify(msg))
+        break
+      }
+      case 'device:shutdown': {
+        // Deliberately **un**correlated: the relay sends this itself from the idle timer, with no browser and
+        // no id behind it, so a correlator cannot be required and an absent one is not an error.
+        //
+        // Addressing used to have no gate either, on the grounds that an unaddressed shutdown resolves no
+        // session and is dropped by the miss, so a gate would buy only its log. That reasoning is now moot
+        // rather than wrong: the schema declares `sessionId` required, so the parser refuses the frame and
+        // the log it would have bought is the one `logInboundRejection` writes.
+        //
+        // **`reachableTargetWithoutOwnership`, not `dispatchTarget`** — that clause is #527, and its blocker is in
+        // the dashboard, not here. What this fixes is the other half: until #542 this case resolved the
+        // session inline and dropped the frame when it could not, making it the only browser-originated
+        // command the relay never answers. `mcp-server`'s `shutdownDevice` waits 30s on `device:shutdown-done`
+        // and then reports `Request timed out` with no cause, which is the silence, not a diagnosis.
+        const session = this.sessions.get(msg.sessionId)
+        // A watcher's gate comes first: `mayShutDown` passes anyone while the session is unheld, and the
+        // holder's reconnect grace is exactly that — so a watch page closing at that moment would power
+        // off the device an agent is in the middle of testing.
+        if (session && this.sessions.isWatching(ws, session.id)) {
+          this.sendTo(ws, {
+            type: 'device:shutdown-error',
+            sessionId: msg.sessionId,
+            ...(msg.requestId === undefined ? {} : { requestId: msg.requestId }),
+            message: 'This connection is watching the session and cannot shut its device down.',
+          })
+          break
+        }
+        if (session && !this.mayShutDown(ws, session)) {
+          this.sendTo(ws, {
+            type: 'device:shutdown-error',
+            sessionId: msg.sessionId,
+            ...(msg.requestId === undefined ? {} : { requestId: msg.requestId }),
+            message: ownershipRefusal(session),
+          })
+          break
+        }
+        const target = this.reachableTargetWithoutOwnership(msg.sessionId)
+        if (!target.ok) {
+          // Echoed, and the relay is the producer — the same obligation `device:boot-error` carries and for
+          // the same reason: an MCP caller that receives a diagnosis uncorrelated reads it as unsolicited
+          // and waits out the deadline anyway, so the answer arrives and is discarded. `requestId` is
+          // optional on both sides here, so an absent one stays absent rather than being invented.
+          this.sendTo(ws, {
+            type: 'device:shutdown-error',
+            sessionId: msg.sessionId,
+            ...(msg.requestId === undefined ? {} : { requestId: msg.requestId }),
+            message: target.message,
+          })
+          break
+        }
+        this.rememberShutdownRequester(ws, target.session.id, msg.requestId)
+        target.session.agentSocket.send(JSON.stringify(msg))
+        break
+      }
+      // Door checks, one policy per request: an uncorrelatable request is not forwarded, not rebuilt and
+      // not answered, because every reply these produce declares `requestId` as required.
+      case 'app:install': this.handleBrowserAppInstall(ws, msg); break
+      case 'app:launch':  this.handleBrowserAppLaunch(ws, msg); break
+      case 'open-url': {
+        // **At the door, before either branch.** A correlator is required on this request, and the
+        // relay has two things it could do with one that lacks it — forward it, or answer it — so
+        // putting the check inside one branch means having two policies. A first draft did exactly
+        // that: it refused to *answer* without an id while still *forwarding* without one, which
+        // leaves the whole guarantee resting on the receiving agent. Both in-repo agents drop it, but
+        // an agent that predates this field would execute the request and reply uncorrelated, and
+        // then nothing downstream can attribute the reply.
+        //
+        // **The check is the validator now**, and the argument for it is unchanged. It read "here rather
+        // than in a validator because this is one required field on one message"; #444 built the
+        // validator, and the schema for `open-url` demands the correlator before this case is reached.
+        //
+        // Dropping is still the only honest answer: `open-url:error` requires the correlator too, so
+        // answering would mean shipping a frame that violates its own declaration — `JSON.stringify`
+        // erases the absent key, every correlating consumer discards the result, and "agent offline"
+        // becomes a caller waiting out its full deadline. That was the first draft's other half,
+        // `requestId: msg.requestId!` — an assertion in an *outbound* frame, unlike the inbound
+        // `sessionId!` this file used to carry, which fed a read whose miss still produced a visible
+        // error. Neither exists any more.
+        const target = this.dispatchTarget(ws, msg.sessionId)
+        if (target.ok) {
+          target.session.agentSocket.send(JSON.stringify(msg))
+          // No URL: a deep link can carry a token, and watchers are the whole team.
+          this.tellWatchersAction(msg.sessionId, { kind: 'open-url' })
+        } else {
+          this.sendTo(ws, {
+            type: 'open-url:error',
+            sessionId: msg.sessionId,
+            requestId: msg.requestId,
+            message: target.message,
+          })
+        }
+        break
+      }
+      case 'app:clear-state': {
+        // Verbatim forward like `open-url`, so the correlator rides for free; the door check and the echo
+        // are the same two lines.
+        const target = this.dispatchTarget(ws, msg.sessionId)
+        if (target.ok) {
+          target.session.agentSocket.send(JSON.stringify(msg))
+          this.tellWatchersAction(msg.sessionId, { kind: 'clear-state' })
+        } else {
+          this.sendTo(ws, {
+            type: 'app:clear-state-error',
+            sessionId: msg.sessionId,
+            requestId: msg.requestId,
+            message: target.message,
+          })
+        }
+        break
+      }
+      // ── input, split by whether an ack answers it ──────────────────────────────────────────────
+      //
+      // These eleven shared one clause until L5c, and the sharing was the trap. Only five of them are
+      // answered — the four terminal frames plus `input:type` — so only those five carry a
+      // required `requestId`, and a gate written into a shared body would have dropped every opening
+      // and move frame with it: no swipe, no pinch, no rotation, and nothing said. Splitting the clause
+      // is what makes the gate unable to reach them. `correlatedRequestsGated` resolves fall-through by
+      // sharing the next non-empty body, so it would have read one gate as covering all eleven.
+      case 'input:touch:start':
+      case 'input:touch:move':
+      case 'input:pinch:start':
+      case 'input:pinch:move':
+      case 'input:rotate':
+      case 'input:posture':
+      case 'input:keyboard:toggle': {
+        // No ack, so no correlator to check and nothing to answer. An unowned frame is dropped rather
+        // than refused for the same reason: there is no waiter to tell.
+        //
+        // These carry no correlator by declaration, so nothing was ever gated on one here — and the
+        // address is now the schema's business rather than this clause's. What the split still buys is
+        // unchanged and is the reason it exists: a correlator gate written into a shared body would have
+        // reached these six as well, dropping every opening and move frame with the answered five.
+        this.forwardUnacked(ws, msg)
+        break
+      }
+      case 'input:touch:end':
+      case 'input:pinch:end':
+      case 'input:key':
+      case 'input:button':
+      case 'input:type': {
+        // One policy at the door, as for the app commands: an uncorrelatable request is not forwarded and
+        // not answered, because every reply it could produce declares `requestId` required.
+        this.handleAckedInput(ws, msg)
+        break
+      }
+      // Kept out of the input:* chain above: these need their own error type, and the caller
+      // is waiting on a bounded deadline, so an undeliverable request fails now rather than
+      // hanging until the browser gives up.
+      case 'clipboard:read':
+      case 'clipboard:write': {
+        // Not part of this layer's pair set — clipboard has carried a required `requestId` since it was
+        // written — but it had the identical defect, and leaving it would make this layer's claim of one
+        // policy at the door false the moment it landed. It answered with `requestId: msg.requestId!`,
+        // which is a **write into an outbound frame**: `JSON.stringify` erases the absent key and ships a
+        // `clipboard:error` whose required correlator is missing, which `useClipboardBridge` discards on
+        // `if (!msg.requestId) return` — so "agent offline" became the caller waiting out its budget.
+        // Removed once already in `e98abd4`, for `open-url`, and still here.
+        // Ownership matters most here of all of them: a `clipboard:write` from a socket that does not hold
+        // the session pastes its text into someone else's device, and a `clipboard:read` presses the copy
+        // or cut chord on it — and the reply routes to the session's own browser, so the payload lands on
+        // **that** tester's host OS clipboard. The agent-side mirror of this check has been here since the
+        // bridge was written, with the reason beside it; the browser side had none.
+        const clip = this.dispatchTarget(ws, msg.sessionId)
+        if (clip.ok) {
+          clip.session.agentSocket.send(JSON.stringify(msg))
+        } else if (ws.readyState === WebSocket.OPEN) {
+          this.sendTo(ws, {
+            type: 'clipboard:error', sessionId: msg.sessionId, requestId: msg.requestId, message: clip.message,
+          })
+        }
+        break
+      }
+      // Ownership is not decoration here: taking a device off the network is the most disruptive
+      // thing a non-holder could do to someone else's session short of shutting it down, and unlike
+      // a shutdown it leaves the device *looking* fine. `dispatchTarget` rather than the weaker
+      // `reachableTarget` `device:shutdown` uses — there is no teardown race to accommodate.
+      case 'network:set': {
+        const net = this.dispatchTarget(ws, msg.sessionId)
+        if (net.ok) {
+          net.session.agentSocket.send(JSON.stringify(msg))
+        } else if (ws.readyState === WebSocket.OPEN) {
+          this.sendTo(ws, {
+            type: 'network:error', sessionId: msg.sessionId, requestId: msg.requestId, message: net.message,
+          })
+        }
+        break
+      }
+    }
+  }
+
+  private handleAgentResources(ws: WebSocket, msg: Inbound<'agent:resources'>): void {
+    this.sessions.setResources(ws, msg.resources)
+    const agentName = this.sessions.getAllByAgentSocket(ws)[0]?.agentName
+    if (agentName) {
+      const buf = this.resourceBuffers.get(agentName) ?? { cpu: [], mem: [] }
+      buf.cpu.push(msg.resources.cpuPercent)
+      buf.mem.push((msg.resources.memUsedMB / msg.resources.memTotalMB) * 100)
+      this.resourceBuffers.set(agentName, buf)
+    }
+  }
+
+  // Removes an agent socket's sessions + resources and rejects its in-flight
+  // screenshot / ui-tree requests. Shared by socket close and re-register
+  // eviction. Returns true if `ws` had agent sessions.
+  /**
+   * Every message the relay *originates* goes through here. The union checks the shape where the
+   * literal is written — a mistyped `type`, a missing field or one that does not belong are all
+   * compile errors — and the readyState guard replaces the check that was repeated (and sometimes
+   * omitted) at each call site.
+   *
+   * Messages the relay merely *forwards* do not use this: they are re-serialised unchanged, so
+   * they keep their inbound type and there is nothing new to check.
+   */
+  private rememberShutdownRequester(ws: WebSocket, sessionId: string, requestId: string | undefined): void {
+    // The idle timer's shutdown and the dashboard's teardown carry no id, and nobody waits on either.
+    if (requestId === undefined) return
+    const key = shutdownRequesterKey(sessionId, requestId)
+    const prior = this.shutdownRequesters.get(key)
+    if (prior) clearTimeout(prior.timer)
+    // Bounds an entry an older agent will never answer — it has no failure reply to send.
+    const timer = setTimeout(() => this.shutdownRequesters.delete(key), SHUTDOWN_REQUESTER_TTL_MS)
+    this.shutdownRequesters.set(key, { sessionId, requestId, ws, timer })
+  }
+
+  /** Hands the agent's answer to whoever asked for it, when that is not the holder — who already has it. */
+  private answerShutdownRequester(session: Session, requestId: string | undefined, raw: Readonly<Record<string, unknown>>): void {
+    if (requestId === undefined) return
+    const key = shutdownRequesterKey(session.id, requestId)
+    const entry = this.shutdownRequesters.get(key)
+    if (!entry) return
+    clearTimeout(entry.timer)
+    this.shutdownRequesters.delete(key)
+    // Compared now rather than at dispatch: a caller that has joined since holds the session, and was sent
+    // this a line ago.
+    if (entry.ws === session.browserSocket) return
+    if (entry.ws.readyState === WebSocket.OPEN) entry.ws.send(JSON.stringify(raw))
+  }
+
+  /**
+   * The session is being removed, so an answer from its agent — if one ever comes — is dropped at
+   * `sessions.get`. `message` null settles in silence; otherwise a caller that never joined is told.
+   */
+  private settleShutdownRequesters(session: Session, message: string | null): void {
+    for (const [key, entry] of this.shutdownRequesters) {
+      if (entry.sessionId !== session.id) continue
+      clearTimeout(entry.timer)
+      this.shutdownRequesters.delete(key)
+      if (message === null || entry.ws === session.browserSocket) continue
+      this.sendTo(entry.ws, { type: 'device:shutdown-error', sessionId: session.id, requestId: entry.requestId, message })
+    }
+  }
+
+  private forgetShutdownRequesters(ws: WebSocket): void {
+    for (const [key, entry] of this.shutdownRequesters) {
+      if (entry.ws !== ws) continue
+      clearTimeout(entry.timer)
+      this.shutdownRequesters.delete(key)
+    }
+  }
+
+  private sendTo(socket: WebSocket, msg: RelayOutbound): void {
+    if (socket.readyState !== WebSocket.OPEN) return
+    socket.send(JSON.stringify(msg))
+  }
+
+  /**
+   * Settle every in-flight screenshot / UI-tree request belonging to these sessions. Both callers
+   * are moments where the agent that was going to answer them no longer exists — it disconnected,
+   * or it restarted and its session moved to the new process. Left alone these reject on their own
+   * timeout, minutes later, having told the caller nothing in between.
+   */
+  private rejectPending(sessionIds: Set<string>, reason: string): void {
+    for (const pendings of [this.pendingScreenshots, this.pendingUITrees]) {
+      for (const [reqId, pending] of pendings.entries()) {
+        if (!sessionIds.has(pending.sessionId)) continue
+        clearTimeout(pending.timer)
+        pendings.delete(reqId)
+        pending.reject(new Error(reason))
+      }
+    }
+  }
+
+  private bootKey(sessionId: string, requestId: string): string {
+    return `${sessionId} ${requestId}`
+  }
+
+  /** Record a boot against the agent socket it was dispatched to. The door guarantees both ids. */
+  private rememberBoot(sessionId: string, requestId: string, agentSocket: WebSocket): void {
+    const key = this.bootKey(sessionId, requestId)
+    // Replacing, not doubling: a client never reuses a correlator, but forgetting the old timer
+    // here is what keeps a replaced entry from firing after its successor was settled.
+    this.forgetBoot(key)
+    const timer = setTimeout(() => this.forgetBoot(key), this.pendingBootTtlMs)
+    this.pendingBoots.set(key, { sessionId, requestId, agentSocket, timer })
+  }
+
+  /** The one way an entry leaves: every removal path funnels through here so no timer survives it. */
+  private forgetBoot(key: string): void {
+    const pending = this.pendingBoots.get(key)
+    if (!pending) return
+    clearTimeout(pending.timer)
+    this.pendingBoots.delete(key)
+  }
+
+  /**
+   * Drop the tracked boot a correlated reply answers. The key needs no live session: an agent
+   * answering after its session was removed still answers that request. An absent `requestId`
+   * is not the answer to anything, so it drops nothing.
+   */
+  private settleBoot(sessionId: string | undefined, requestId: string | undefined): void {
+    if (typeof sessionId !== 'string' || typeof requestId !== 'string') return
+    this.forgetBoot(this.bootKey(sessionId, requestId))
+  }
+
+  /**
+   * Answer the tracked boots tied to a replaced agent socket (#885). Called after the
+   * `session:rebound` frames are sent, so the client records `needsReboot` first and the error
+   * below is classified with the cause attached. Boots dispatched to any other socket — in
+   * particular to the new agent after the rebind — are left pending.
+   */
+  private invalidateBootsFor(oldSockets: Set<WebSocket>): void {
+    if (oldSockets.size === 0) return
+    for (const [key, pending] of this.pendingBoots.entries()) {
+      if (!oldSockets.has(pending.agentSocket)) continue
+      this.forgetBoot(key)
+      const session = this.sessions.get(pending.sessionId)
+      // `sendTo` skips a socket that is not OPEN, and a session nobody has joined has no
+      // `browserSocket` at all — either way the entry is still gone, so nothing later answers
+      // a request nobody holds.
+      if (!session?.browserSocket) continue
+      this.sendTo(session.browserSocket, {
+        type: 'device:boot-error',
+        sessionId: pending.sessionId,
+        requestId: pending.requestId,
+        message: `session ${pending.sessionId} rebounded to a new agent while this boot was in flight, ` +
+          'and that agent never saw this request',
+      })
+    }
+  }
+
+  /**
+   * Silently drop the tracked boots of sessions that no longer exist. Their callers were already
+   * settled with the better diagnosis (`session:terminated`), so answering as well would send a
+   * second failure for the same request. Scoped to the evicted sessions rather than the socket:
+   * rebound sessions have already moved off it, and their entries are `invalidateBootsFor`'s to
+   * answer, not this one's to drop.
+   */
+  private forgetEvictedBoots(sessionIds: Set<string>): void {
+    for (const [key, pending] of this.pendingBoots.entries()) {
+      if (sessionIds.has(pending.sessionId)) this.forgetBoot(key)
+    }
+  }
+
+  /**
+   * The agent's socket went away. Keep its sessions and wait for that agent to come back, instead
+   * of ending them here — a restarting agent registers about a second later, and until #426 stage 3
+   * the close always won that race, so a restart cost the tester their place.
+   *
+   * The sessions stay exactly where they are. They are NOT moved to a holding structure of their
+   * own: `getAgentSocketsByIdentity` finds the returning agent's previous socket by walking
+   * `sessions` and reading `agentSocket`, so a session parked anywhere else is a session that can
+   * never be reclaimed.
+   *
+   * @returns whether this was an agent socket, matching `evictAgentSocket`'s contract — the close
+   *   handler uses it to decide whether to keep looking.
+   */
+  private holdAgentSocket(ws: WebSocket): boolean {
+    // Shutting down: nothing is coming back, and arming a timer here would leave it running after
+    // `stop()` resolved. Closed by the relay for a credential that is no longer valid: the agent will be
+    // refused when it returns, so a hold would only postpone the same end.
+    if (this.stopping) return this.evictAgentSocket(ws)
+    if (this.revokedSockets.has(ws)) {
+      const evicted = this.evictAgentSocket(ws)
+      // `evictAgentSocket` keeps the resource entry when there were no sessions to end.
+      if (!evicted) this.sessions.removeResources(ws)
+      return evicted
+    }
+    const sessions = this.sessions.getAllByAgentSocket(ws)
+    if (sessions.length === 0) {
+      // No sessions to hold, but the socket may still own a resource entry — `evictAgentSocket`
+      // returns before dropping it in exactly this case.
+      this.sessions.removeResources(ws)
+      return false
+    }
+    // Not held for the window: these were addressed to a process that is gone, and a returning
+    // agent is a new one that never saw them. Waiting would only delay the same failure.
+    this.rejectPending(new Set(sessions.map((s) => s.id)), 'Agent disconnected')
+
+    for (const s of sessions) {
+      if (s.browserSocket) this.sendTo(s.browserSocket, { type: 'session:agent-away', sessionId: s.id })
+      this.tellWatchers(s.id, { type: 'session:agent-away', sessionId: s.id })
+    }
+    const timer = setTimeout(() => {
+      this.agentHolds.delete(ws)
+      // Whatever is still on this socket never got reclaimed. A rebind moves sessions off it, so
+      // after a successful one this evicts nothing.
+      if (this.evictAgentSocket(ws)) logger.info(`agent did not come back within ${this.agentGraceMs}ms — session(s) ended`)
+      // Not inside that branch: `evictAgentSocket` returns before dropping resources when the
+      // socket has no sessions left, and the sessions can leave by routes other than a rebind —
+      // `session:end` among them. This is the last moment anything holds a reference to the dead
+      // socket, so it is the last chance to drop its entry.
+      this.sessions.removeResources(ws)
+    }, this.agentGraceMs)
+    this.agentHolds.set(ws, timer)
+    logger.info(`agent socket lost — holding ${sessions.length} session(s) for ${this.agentGraceMs}ms`)
+    return true
+  }
+
+  /** Stop waiting on a socket, whether or not anything was reclaimed from it. */
+  private releaseHold(ws: WebSocket): void {
+    const timer = this.agentHolds.get(ws)
+    if (!timer) return
+    clearTimeout(timer)
+    this.agentHolds.delete(ws)
+  }
+
+  /**
+   * @param cause  `'disconnect'` — the socket closed. `'replaced'` — the same agent re-registered
+   *   and this is its previous socket. Only affects the log line: a restart otherwise reads as a
+   *   crash followed by a recovery, which is not what happened.
+   */
+  private evictAgentSocket(ws: WebSocket, cause: 'disconnect' | 'replaced' = 'disconnect'): boolean {
+    const agentSessions = this.sessions.getAllByAgentSocket(ws)
+    if (agentSessions.length === 0) return false
+    this.rejectPending(new Set(agentSessions.map((s) => s.id)), 'Agent disconnected')
+    // Their tracked boots go with them, silently: the `session:terminated` below settles those
+    // callers with the better diagnosis. Rebound sessions are not in this set — they moved off
+    // this socket — so their boots survive for `invalidateBootsFor` to answer.
+    this.forgetEvictedBoots(new Set(agentSessions.map((s) => s.id)))
+    // Tell whoever is attached before the session stops existing — after `remove()` the socket
+    // reference is gone. Without this the browser keeps a live socket addressed to a sessionId the
+    // relay no longer knows, so everything it sends is dropped as unknown and nothing streams back:
+    // the tab sits on "Waiting for first frame..." with no explanation (#426).
+    //
+    // `sendTo` skips a socket that is not OPEN, and a session nobody has joined has no
+    // `browserSocket` at all. An attached MCP client does have one and will receive this — and as of
+    // #512 it **acts** on it, settling that session's pending requests instead of waiting them out. The
+    // clause here used to say the client drops it as unmatched, which was true and was the problem.
+    for (const s of agentSessions) {
+      if (s.browserSocket) {
+        this.sendTo(s.browserSocket, {
+          type: 'session:terminated', sessionId: s.id, reason: 'agent-disconnected',
+        })
+      }
+    }
+    // After `session:terminated`, so a caller that holds the session is settled by that — it carries the
+    // better diagnosis — and only a caller that never joined hears from `settleShutdownRequesters`.
+    for (const s of agentSessions) {
+      this.settleShutdownRequesters(s, SHUTDOWN_OUTCOME_LOST)
+      this.sessions.remove(s.id)
+      this.forgetSessionState(s.id)
+    }
+    this.sessions.removeResources(ws)
+    logger.info(cause === 'replaced'
+      ? `agent re-registered — ${agentSessions.length} previous session(s) replaced`
+      : `agent disconnected — ${agentSessions.length} session(s) ended`)
+    return true
+  }
+
+  private handleAgentRegister(ws: WebSocket, msg: Inbound<'agent:register'>): void {
+    // Re-register from the same Mac (machine id + platform): the old socket's close may not have
+    // fired yet after an unclean drop (Wi-Fi loss, sleep) — its TCP teardown lags — which would
+    // leave a duplicate, eventually-"Stale" card. Evict the stale agent's sessions and terminate
+    // its socket before creating the new ones. Identity is agentId (unique per Mac) when present,
+    // else agentName. (Heartbeat backstop for never-reconnecting agents: #313.)
+    const identity = msg.agentId ?? msg.agentName
+    this.warnLegacyInstaller(identity, msg.capabilities ?? [])
+    // Deduplicate first. Everything below is keyed by device id, so a payload naming one device
+    // twice would collapse to a single entry in `registeredSessions` while `create()` had already
+    // made two sessions — leaving one the agent is never told about. That is the same orphan the
+    // rebind exists to prevent, arriving by a different door.
+    const devices = [...new Map((msg.devices ?? []).map((d) => [d.id, d])).values()]
+    const agent = {
+      agentId: msg.agentId, agentName: msg.agentName,
+      agentPlatform: msg.platform, agentCapabilities: msg.capabilities,
+    }
+    // deviceId → the session id kept across the restart. Also the guard that a device is rebound at
+    // most once (#426): before rebinding existed, `create()` ran after every old session had been
+    // evicted, so one device could not be behind two sessions. It can now, and `list()` does not
+    // deduplicate — the second card would name a session the agent has never heard of, which is the
+    // symptom this whole change is fixing.
+    const rebound = new Map<string, string>()
+    // Sockets a rebind actually moved a session off of. Only boots tied to one of these are
+    // stranded: a boot dispatched after the rebind below rides the new socket, and the eviction
+    // further down must not sweep the entries this set protects (see `forgetEvictedBoots`).
+    const reboundOldSockets = new Set<WebSocket>()
+    if (identity) {
+      for (const old of this.sessions.getAgentSocketsByIdentity(identity, msg.platform)) {
+        if (old === ws) continue
+        // Before any decision about what to rebind: the eviction below settles this socket either
+        // way, so the timer has nothing left to do. Releasing here rather than after a successful
+        // rebind also covers the case where nothing is rebound at all — a restart that reports a
+        // completely different device list still leaves a timer keyed to a dead socket.
+        this.releaseHold(old)
+        for (const s of this.sessions.getAllByAgentSocket(old)) {
+          if (rebound.has(s.deviceId)) continue
+          const device = devices.find((d) => d.id === s.deviceId)
+          // The device is gone from this agent's list — unplugged, deleted, renamed away. Leave it
+          // for the eviction below, which tells the browser the session ended.
+          if (!device) continue
+          this.sessions.rebind(s.id, ws, device, agent)
+          rebound.set(s.deviceId, s.id)
+          reboundOldSockets.add(old)
+        }
+        // Evict before terminate: the old socket's close fires async, by which point its sessions are
+        // gone and its in-flight screenshots would be undiscoverable — reject them here instead.
+        // The rebound sessions have already moved off `old`, so this no longer covers them.
+        this.evictAgentSocket(old, 'replaced')
+        this.explainedCloses.set(old, 'replaced')
+        old.terminate()
+      }
+    }
+    // Their in-flight requests are addressed to a process that is gone, and the eviction above can
+    // no longer see them. Nothing else would ever settle these.
+    // Shutdowns are deliberately not settled here — see `shutdownRequesters` for why they follow the session.
+    if (rebound.size > 0) this.rejectPending(new Set(rebound.values()), 'Agent restarted')
+
+    // A device can be back under an agent this session cannot be rebound to — identity is
+    // `agentId ?? agentName`, and the upgrade that prompted the restart is often the one that
+    // starts sending an agentId. The device is demonstrably present, so holding its old session
+    // any longer strands that viewer while someone else picks the very same simulator. End it now
+    // and say so, which is what would have happened before the hold existed.
+    for (const d of devices) {
+      if (rebound.has(d.id)) continue
+      for (const s of this.sessions.getAllByDeviceId(d.id)) {
+        if (s.agentSocket.readyState === WebSocket.OPEN) continue
+        if (s.browserSocket) {
+          this.sendTo(s.browserSocket, { type: 'session:terminated', sessionId: s.id, reason: 'agent-disconnected' })
+        }
+        this.settleShutdownRequesters(s, SHUTDOWN_OUTCOME_LOST)
+        this.sessions.remove(s.id)
+        this.forgetSessionState(s.id)
+      }
+    }
+
+    // Only devices without a surviving session get a new one. Passing all of them here is what
+    // would produce the duplicate card described above.
+    const fresh = devices.filter((d) => !rebound.has(d.id))
+    const freshIds = this.sessions.create(ws, fresh, msg.agentName, msg.platform, msg.agentId, msg.capabilities)
+    const byDeviceId = new Map(rebound)
+    fresh.forEach((d, i) => byDeviceId.set(d.id, freshIds[i]!))
+    // Keyed by deviceId, not by position. The old form paired `msg.devices[i]` with `sessionIds[i]`,
+    // which only held while every device got a session — now that some are rebound, the arrays have
+    // different lengths and index alignment would hand the agent someone else's session id.
+    const registeredSessions = devices.map((d) => ({ deviceId: d.id, sessionId: byDeviceId.get(d.id)! }))
+    this.sendTo(ws, { type: 'agent:registered', registeredSessions })
+
+    // After the state is final: the browser answers this with `device:boot` on the same session id.
+    for (const sessionId of rebound.values()) {
+      const s = this.sessions.get(sessionId)
+      if (s?.browserSocket) {
+        this.sendTo(s.browserSocket, { type: 'session:rebound', sessionId, capabilities: msg.capabilities ?? [] })
+      }
+      this.tellWatchers(sessionId, { type: 'session:rebound', sessionId, capabilities: msg.capabilities ?? [] })
+    }
+    // After the rebound frames, so the client records `needsReboot` before the error below
+    // arrives and classifies it with the cause attached. Only boots tied to the replaced
+    // sockets: a boot sent after the rebind above was dispatched to the new agent, which boots
+    // the device and answers — settling it here would fail a boot that succeeds (#885).
+    this.invalidateBootsFor(reboundOldSockets)
+    if (rebound.size > 0) logger.info(`agent restarted — ${rebound.size} session(s) kept across the restart`)
+    // The startup banner prints "Waiting for agents..." once and then the relay says nothing either
+    // way, so a terminal gives no signal about whether an agent is attached. One line per
+    // transition, matching the disconnect line in evictAgentSocket.
+    // `||`, not `??`: the schema defaults both of these to `''` for an agent that omits them, so `??`
+    // would print an empty name and an empty platform where this used to print `unknown`.
+    this.agentNames.set(ws, msg.agentName || msg.agentId || 'unknown')
+    // Through `pushLog` too, so `tapflow logs` shows an agent coming back after the line about it leaving.
+    this.pushLog(`agent connected: ${msg.agentName || msg.agentId || 'unknown'} (${msg.platform || 'unknown'}) — ${registeredSessions.length} device(s)`)
+  }
+
+  /** The only producer of `error` — all five exits below, and nothing else in the repo sends that message.
+   *
+   *  That is what makes the address possible rather than aspirational: `msg.sessionId` is narrowed to a
+   *  non-empty `string` by the door — the inbound schema, `isAddressed` before it — so every refusal can
+   *  name the join it refuses. Before
+   *  L5d they carried none, and the clients' join waiters matched `sessionId === undefined || sessionId ===
+   *  mine` — with no such key the left half was always true, so any refusal resolved any pending join. */
+  private handleSessionStart(ws: WebSocket, msg: Inbound<'session:start'>): void {
+    const session = this.sessions.get(msg.sessionId)
+    if (!session) {
+      this.sendTo(ws, { type: 'error', sessionId: msg.sessionId, message: 'Session not found', reason: 'session-not-found' })
+      return
+    }
+    // **A watcher may not take the session it watches.** Inside the holder's reconnect grace the session
+    // is unheld, so without this a watch page that re-sent `session:start` — a reused viewer path, a
+    // reconnect — would become the holder, and the agent's own re-join would then be refused as busy.
+    // `session-busy` because that is what the caller must act on: someone else's session, in use.
+    if (this.sessions.isWatching(ws, session.id)) {
+      this.sendTo(ws, {
+        type: 'error', sessionId: msg.sessionId, reason: 'session-busy',
+        message: 'This connection is watching the session. Stop watching to join it.',
+      })
+      return
+    }
+    // Occupancy first, because it is the more specific answer and both can be true at once. A tester
+    // joining a device someone else has open on a loaded Mac was being told "this Mac is overloaded,
+    // pick another" — advice for a problem they cannot act on, while the actual reason went unreported.
+    // It is a map read the relay has already done, so ordering it first costs nothing.
+    //
+    // `owner !== ownerOf(ws)` because a client re-joining a session it already holds is not contending
+    // with anyone: the viewer re-sends `session:start` each time its socket reconnects, and `mcp-server`
+    // and `flow-runner` keep one `clientId` per process, so their explicit re-join is the same client.
+    // The same three conditions `join()` applies, and they have to agree: this one answers the caller and
+    // that one performs the bind, so a disagreement is a refusal for a session the bind would have allowed.
+    if (
+      session.browserSocket &&
+      session.owner !== null &&
+      session.owner !== this.ownerOf(ws) &&
+      session.browserSocket.readyState === WebSocket.OPEN &&
+      this.isAlive(session.browserSocket)
+    ) {
+      this.sendTo(ws, { type: 'error', sessionId: msg.sessionId, message: 'Session busy', reason: 'session-busy' })
+      return
+    }
+    // Read before the resource gate, and answered before it too. The gate would otherwise read the
+    // dead socket's last sample — and an overloaded Mac is a common reason to restart an agent, so
+    // the tester would be told the Mac is exhausted at the exact moment it is recovering.
+    const agentAway = session.agentSocket.readyState !== WebSocket.OPEN
+    const resources = agentAway ? undefined : this.sessions.getResources(session.agentSocket)
+    if (resources) {
+      const memPercent = (resources.memUsedMB / resources.memTotalMB) * 100
+      if (resources.cpuPercent > RESOURCE_THRESHOLD || memPercent > RESOURCE_THRESHOLD) {
+        this.sendTo(ws, { type: 'error', sessionId: msg.sessionId, message: 'Agent resources exhausted', reason: 'agent-resources-exhausted' })
+        return
+      }
+    }
+    try {
+      const joined = this.sessions.join(
+        msg.sessionId, ws, this.ownerRecord(ws), (h) => this.isAlive(h),
+        // Recorded by the join itself, so it holds before the agent-away return below and across a rebind.
+        { kind: msg.clientKind, label: this.holderLabel(ws), ...(msg.stream === false ? { stream: false } : {}) },
+      )
+      if (!joined.ok) {
+        // Both of these are answered above, so arriving here means the state moved between that check and
+        // this call. They are **values now rather than throws** (#515), and that is what fixes the defect:
+        // the most common way into the old `catch` was a socket re-joining the session it already holds —
+        // exempted by the `!== ws` check above, then refused by `join()`, then reported as
+        // `session-not-found` for a live session the caller was holding.
+        const reason = joined.failure === 'held-by-another' ? 'session-busy' : 'session-not-found'
+        const message = joined.failure === 'held-by-another' ? 'Session busy' : 'Session not found'
+        this.sendTo(ws, { type: 'error', sessionId: msg.sessionId, message, reason })
+        return
+      }
+    } catch (e) {
+      // Only a bug reaches here now — the two expected failures return above instead of throwing, which is
+      // what stops this arm from having to guess. It still answers rather than dropping: both clients await
+      // `session:joined | error` on this request, so silence costs them a full deadline.
+      //
+      // `session-not-found` is chosen for **the action it names**, not as a diagnosis. Its own declaration
+      // says "nothing else is ever coming for it", and that half is true of any failed join — no
+      // `session:joined` will follow. `session-busy` would be the wrong action: it tells a viewer the
+      // session is alive and someone else has it. The prose carries what is actually known.
+      logger.error(`session:start could not join ${msg.sessionId}:`, e)
+      this.sendTo(ws, { type: 'error', sessionId: msg.sessionId, message: 'Session could not be joined', reason: 'session-not-found' })
+      return
+    }
+    // Include the agent's capabilities so the viewer knows up front what is implemented on
+    // the other end — an agent that predates a feature omits it, and the dashboard degrades
+    // deliberately instead of inferring anything from a timeout.
+    this.sendTo(ws, {
+      type: 'session:joined', sessionId: msg.sessionId, capabilities: session.agentCapabilities ?? [],
+      ...(isAiClientKind(msg.clientKind) ? this.watchUrlField(msg.sessionId) : {}),
+    })
+    if (agentAway) {
+      // Joining into a held session. Refusing instead would be worse than it sounds: the viewer
+      // sends `session:start` exactly once per reconnect and ignores a plain `error`, so a browser
+      // blip inside the window would leave a tab that no later `session:rebound` can reach — it is
+      // addressed to `browserSocket`, which the refusal never set. Saying what is happening keeps
+      // the tab inside the contract instead.
+      //
+      // Everything below describes the agent that went away, so it stops here. The viewer will get
+      // it all again from the boot it sends on `session:rebound`.
+      this.sendTo(ws, { type: 'session:agent-away', sessionId: msg.sessionId })
+      return
+    }
+    // These three replay a session's cached state to a re-joining viewer. They carry `sessionId`
+    // because both agents stamp it on every copy they send, and the relay was the only producer that
+    // did not — so the shared declaration had to be `sessionId?` to stay honest about the two of us.
+    // Stamping it here is what let that be tightened to required.
+    if (session.chromeData) {
+      this.sendTo(ws, { type: 'session:chrome', sessionId: session.id, payload: session.chromeData })
+    }
+    if (session.deviceInfo) {
+      this.sendTo(ws, { type: 'session:deviceInfo', sessionId: session.id, payload: session.deviceInfo })
+    }
+    if (session.postures) {
+      this.sendTo(ws, { type: 'device:postures', sessionId: session.id, payload: session.postures })
+    }
+    // Replay device:ready only if this session actually announced one (browser WS blip reconnect).
+    // Not `deviceStatus`: that starts from the agent's `simctl list` snapshot, so a session for a
+    // simulator that was already running would fire this before the agent had done anything —
+    // telling the viewer a stream exists when none does (#440).
+    if (session.readySent) {
+      this.sendTo(ws, { type: 'device:ready', payload: { deviceId: session.deviceId } })
+      // (Re)joining a live stream: ask the agent for an IDR so this viewer gets a decodable
+      // keyframe immediately, instead of waiting for the next periodic one — and so it isn't
+      // left blank when the encoder is static-skipping an unchanged screen. Agents that don't
+      // support on-demand IDR ignore the message.
+      //
+      // **Through the session's throttled requester, not a bare `sendTo`.** This was unreachable for a
+      // socket that already held the session — `join()` threw and the handler answered above this line —
+      // and #515 made a re-join run the whole body. A client re-sending `session:start` therefore drives
+      // one forced keyframe per frame it sends, and a 1080p IDR is two orders of magnitude larger than
+      // the P-frames around it, so the amplification lands on the tester who is actually watching. The
+      // backpressure path already throttles this exact message per session; sharing that requester is
+      // what keeps the two callers from having two policies.
+      // Not for a holder that takes no frames: the keyframe would go to watchers alone, and it would spend the
+      // throttle window a watcher's own `watch:start` request needs.
+      if (session.holderStream) this.idrRequester(session.id)()
+      // And ask what the device's network is doing (#614). `NetworkState` is agent-produced and is not
+      // among the three replayed above, so without this a viewer that reconnects has no way to learn
+      // whether the device is offline and its control renders in a guessed position.
+      //
+      // **Gated on the capability, unlike the IDR request beside it.** That one is safe to send blind
+      // because an agent without it loses nothing — the next periodic keyframe arrives anyway. This one
+      // has no such repair, so an agent that never answers is indistinguishable from one that failed to
+      // read; a viewer arming a deadline would then render "could not read" on every re-join, for an
+      // agent that already said it cannot do this at all. iOS is exactly that agent until #607's last
+      // slice. Fifty lines up, `session:joined` carries these capabilities for the stated reason that a
+      // consumer must not infer support from a timeout — asking anyway would make the relay do it.
+      //
+      // **Inside `readySent` too, and there as an optimisation rather than a correctness condition.**
+      // `readySent` is the *stream's* readiness: `clearStreamSocket` lowers it while `deviceStatus`
+      // stays `'booted'`, so a booted, genuinely offline device with a dead stream socket is not asked
+      // about here — and the agent would have answered, since it still holds that serial. What makes
+      // skipping safe is not the agent's silence but the viewer's: with `readySent` false the
+      // `device:ready` above is not replayed either, so nothing is rendering a live device to be wrong
+      // about. `deviceStatus` is not the fix — the comment on `device:ready` says why (#440).
+      if (hasCapability(session.agentCapabilities, 'network-control')) this.networkStateRequester(session.id)()
+    }
+  }
+
+  /**
+   * Admit `ws` as a read-only watcher, or say why not. The order of the refusals is the order a viewer
+   * can act on them: a connection that may never watch is told so before it learns anything about the
+   * session.
+   */
+  private handleWatchStart(ws: WebSocket, msg: Inbound<'watch:start'>): void {
+    const refuse = (reason: WatchRefusal, message: string) =>
+      this.sendTo(ws, { type: 'watch:refused', sessionId: msg.sessionId, reason, message })
+    if (!this.mayWatch.get(ws)) return refuse('not-permitted', 'Sign in to watch a session.')
+    const session = this.sessions.get(msg.sessionId)
+    if (!session) return refuse('session-not-found', 'Session not found')
+    if (session.owner === null || !isAiClientKind(session.holderKind)) {
+      return refuse('not-watchable', 'Only a session an AI client is driving can be watched.')
+    }
+    // The holder already receives everything. Watching too would deliver each frame twice to one socket,
+    // and the watcher gates would then refuse the holder's own shutdown and re-join.
+    if (this.ownsSession(ws, session)) return refuse('not-watchable', 'This connection already holds the session.')
+    if (this.sessions.addWatcher(session.id, ws, session.owner) === 'full') {
+      return refuse('watchers-full', 'This session already has as many watchers as it allows.')
+    }
+    this.sendTo(ws, { type: 'watch:started', sessionId: session.id })
+    // The same replay a re-joining viewer gets, for the same reason: a watch can begin mid-session.
+    if (session.agentSocket.readyState !== WebSocket.OPEN) {
+      this.sendTo(ws, { type: 'session:agent-away', sessionId: session.id })
+      return
+    }
+    if (session.chromeData) this.sendTo(ws, { type: 'session:chrome', sessionId: session.id, payload: session.chromeData })
+    if (session.deviceInfo) this.sendTo(ws, { type: 'session:deviceInfo', sessionId: session.id, payload: session.deviceInfo })
+    if (session.postures) this.sendTo(ws, { type: 'device:postures', sessionId: session.id, payload: session.postures })
+    if (session.readySent) {
+      this.sendTo(ws, { type: 'device:ready', payload: { deviceId: session.deviceId } })
+      // Through the session's throttled requester, as the re-join does: a watcher arriving mid-GOP needs
+      // a keyframe, and a socket starting watches repeatedly must not turn into a stream of IDRs.
+      this.idrRequester(session.id)()
+    }
+  }
+
+  /** The keyframe-aware sender for one watcher of one session — see `watcherDroppers`. */
+  private watcherDropper(ws: WebSocket, sessionId: string): KeyframeAwareSender {
+    let bySession = this.watcherDroppers.get(ws)
+    if (!bySession) { bySession = new Map(); this.watcherDroppers.set(ws, bySession) }
+    let dropper = bySession.get(sessionId)
+    if (!dropper) { dropper = createKeyframeAwareSender(); bySession.set(sessionId, dropper) }
+    return dropper
+  }
+
+  private forgetWatcherDropper(ws: WebSocket, sessionId: string): void {
+    const bySession = this.watcherDroppers.get(ws)
+    bySession?.delete(sessionId)
+    if (bySession?.size === 0) this.watcherDroppers.delete(ws)
+  }
+
+  /**
+   * Forward an agent's frame to the session's watchers. **Only the messages that describe the device**
+   * call this — chrome, device info, postures, booting, ready — never a reply to something the holder
+   * asked. An ack, a clipboard payload or a network state is the holder's, and a watcher shown one would
+   * learn what the agent is doing on a channel it was never admitted to.
+   */
+  private forwardToWatchers(sessionId: string, raw: Readonly<Record<string, unknown>>): void {
+    const watchers = this.sessions.watchersOf(sessionId)
+    if (watchers.length === 0) return
+    const frame = JSON.stringify(raw)
+    for (const w of watchers) if (w.readyState === WebSocket.OPEN) w.send(frame)
+  }
+
+  /**
+   * What the holder just did, as its watchers are told it (A2): only for an input the relay passed on to the agent,
+   * so a refused one is never shown. **Built, never forwarded**: the raw `input:type` carries the text typed, and a
+   * watcher gets a count.
+   */
+  private tellWatchersInput(session: Session, msg: Acked): void {
+    let action: WatchActionKind | null = null
+    switch (msg.type) {
+      case 'input:touch:end': {
+        const g = session.gesture
+        session.gesture = null
+        action = gestureAction(g?.start ?? null, msg.payload ?? g?.last ?? null)
+        break
+      }
+      case 'input:pinch:end': action = { kind: 'pinch' }; break
+      case 'input:key': action = { kind: 'key', key: keyForWatchers(msg.payload.code) }; break
+      // One press is a down and an up from a client that sends both; told once, on the up.
+      case 'input:button': action = msg.payload.phase === 'down' ? null : { kind: 'button', button: msg.payload.name }; break
+      case 'input:type': action = { kind: 'type', chars: [...msg.payload.text].length }; break
+    }
+    if (action) this.tellWatchersAction(session.id, action)
+  }
+
+  private tellWatchersAction(sessionId: string, action: WatchActionKind): void {
+    const watchers = this.sessions.watchersOf(sessionId)
+    if (watchers.length === 0) return
+    for (const w of watchers) this.sendTo(w, { type: 'watch:action', sessionId, at: Date.now(), action })
+  }
+
+  /** The relay-originated half of what watchers hear: holder left, agent away, agent rebound. */
+  private tellWatchers(sessionId: string, msg: RelayOutbound): void {
+    for (const w of this.sessions.watchersOf(sessionId)) this.sendTo(w, msg)
+  }
+
+  /** Who to show behind a holder: the signed-in user's email, or `local` for a loopback client with no
+   *  credential. A label for people only — nothing reads it back. */
+  private holderLabel(ws: WebSocket): string {
+    const user = this.userOf(ws)
+    const id = Number(user)
+    if (!Number.isInteger(id)) return 'local'
+    try {
+      const row = getDb().prepare('SELECT email FROM users WHERE id = ?').get(id) as { email: string } | undefined
+      return row?.email ?? 'unknown'
+    } catch {
+      return 'unknown'
+    }
+  }
+
+  /**
+   * The dashboard page that watches a session — **only at an address a teammate's browser can open**, the
+   * gate invite links take (`forTeammates`). With no tunnel and no `relay.url` the only base this relay has
+   * is localhost, which is wrong for a client on another machine; the field is left out and the client
+   * builds the link from the address it dialled, which the person running it can always open.
+   */
+  private watchUrlField(sessionId: string): { watchUrl?: string } {
+    const base = forTeammates(resolvePublicBaseUrl(config, this.options.tunnel))
+    return base === null ? {} : { watchUrl: `${base}/automation/sessions/${encodeURIComponent(sessionId)}` }
+  }
+
+  /** Shut the device down because nobody is watching it any more. The idle timer's payload, hoisted out
+   *  of the close handler so the release loop there reads as one line per session. */
+  private idleShutdown(sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (session?.agentSocket.readyState !== WebSocket.OPEN) return
+    this.sendTo(session.agentSocket, {
+      type: 'device:shutdown',
+      sessionId: session.id,
+      payload: { deviceId: session.deviceId },
+    })
+  }
+
+  /** Where a browser-role command can be dispatched, or what its sender needs to be told instead.
+   *
+   *  Three refusals used to be spread across seven `case` bodies as two conditions each, and the ownership
+   *  one was in none of them. Collapsed here so the set is decided once: a command reaches an agent only if
+   *  the session exists, **this socket holds it**, and the agent is connected. Anything else has prose the
+   *  caller can act on, and each case wraps that prose in the reply type its own waiter reads.
+   *
+   *  The two ownership strings are one reason with different prose, the treatment `#492` settled: telling a
+   *  caller the session is in use when it is idle steers it off a device it could have had.
+   */
+  private dispatchTarget(
+    ws: WebSocket,
+    sessionId: string,
+  ): { ok: true; session: Session } | { ok: false; message: string } {
+    // Ownership first and liveness second, which is the order the refusals were written in and worth
+    // keeping: a non-owner is told it does not hold the session rather than being handed the agent's
+    // state. Composed rather than inlined so `device:shutdown` can take the other two checks alone.
+    const session = this.sessions.get(sessionId)
+    if (session && !this.ownsSession(ws, session)) return { ok: false, message: ownershipRefusal(session) }
+    return this.reachableTargetWithoutOwnership(sessionId)
+  }
+
+  /** `dispatchTarget` without the ownership clause: is there a session here, and is its agent listening?
+   *
+   *  **The name carries the omission because a doc block does not reach an autocomplete.** This is the
+   *  resolver a future handler must not pick by accident — it is the general-looking one and the unsafe
+   *  one at the same time, which is the pairing worth spelling out.
+   *
+   *  **Still here after #527, and this paragraph used to say it would not be.** It predicted that
+   *  answering "who may shut a device down" would move `device:shutdown` up to `dispatchTarget`. The
+   *  answer turned out to be a *different* gate rather than that one: `mayShutDown` refuses a session
+   *  another client holds and permits an unheld one, because the dashboard's unmount teardown races its
+   *  own viewer socket's close and an owns-it gate refuses the teardown whenever the close lands first —
+   *  leaving the device booted until the idle timer, which is the cost #527 was filed to avoid.
+   *
+   *  So the two are ordered rather than merged: `mayShutDown` decides *who*, this decides *whether it can
+   *  be delivered at all*, and without the second a shutdown addressed to a missing session or a closed
+   *  agent socket is dropped in silence and `mcp-server`'s caller burns a 30s deadline (#542).
+   *
+   *  The disclosure it was written to record stands: a caller that is not the holder still learns whether
+   *  a session id exists and whether its agent is up.
+   */
+  private reachableTargetWithoutOwnership(
+    sessionId: string,
+  ): { ok: true; session: Session } | { ok: false; message: string } {
+    const session = this.sessions.get(sessionId)
+    if (!session) return { ok: false, message: 'Session not found' }
+    if (session.agentSocket.readyState !== WebSocket.OPEN) return { ok: false, message: 'agent offline' }
+    return { ok: true, session }
+  }
+
+  /** Is `ws` the socket this session is bound to?
+   *
+   *  Until L5c the input path resolved the session and forwarded without asking. `clipboard:data` asks the
+   *  mirror-image question one branch up (`session?.agentSocket !== ws`) with the reason written beside it —
+   *  a second agent on the same relay must not address someone else's session — and the browser direction
+   *  had no equivalent. So any authenticated client that knew a session id could drive a device another
+   *  tester was looking at, and the agent's ack went to the session holder rather than to whoever asked.
+   *
+   *  An **unheld** session (no `browserSocket`, or one that has gone) is also not owned by the sender. That
+   *  is deliberate rather than incidental: it makes an input arriving inside the reconnect grace fail fast
+   *  instead of being applied to a device with nobody watching the result. */
+  private ownsSession(ws: WebSocket, session: Session | undefined): boolean {
+    return session?.owner !== null && session?.owner === this.ownerOf(ws)
+  }
+
+  /** Which owner this socket speaks for. Every connection has one — supplied or minted — so this never
+   *  answers `undefined` and two anonymous sockets can never match by both lacking an identity. */
+  private ownerOf(ws: WebSocket): string {
+    return this.ownerRecord(ws).key
+  }
+
+  /** The principal behind a socket — a user id, or `anon` for a connection carrying no cookie and no PAT. */
+  private userOf(ws: WebSocket): string {
+    return this.ownerRecord(ws).user
+  }
+
+  /** Everything the bind needs to record about who is joining.
+   *
+   *  **A socket with no record gets one of its own rather than a shared sentinel.** `handleConnection`
+   *  seeds every accepted connection before a message can arrive, so the fallback is unreachable today —
+   *  but a literal would make any two unseeded sockets *equal*, and equal keys pass `ownsSession` while
+   *  equal users pass `mayShutDown`'s same-principal exemption. That rests the whole ownership invariant
+   *  on one call site staying total, which is the shape of dependency the sentinel is supposed to remove.
+   *  Minting keeps the answer "this socket and no other"; storing it keeps repeat calls consistent, since
+   *  a fresh value each time would fail to recognise the very socket that bound the session. `minted` is
+   *  `false` deliberately — the legacy exemption exists for a client that identified itself with nothing,
+   *  not for one the relay failed to record. */
+  private ownerRecord(ws: WebSocket): { key: string; user: string; minted: boolean } {
+    const known = this.ownerKey.get(ws)
+    if (known) return known
+    const unseeded = `unidentified:${randomUUID()}`
+    const record = { key: unseeded, user: unseeded, minted: false }
+    this.ownerKey.set(ws, record)
+    return record
+  }
+
+  /**
+   * May this socket shut the session's device down?
+   *
+   * **"Not someone else's" rather than "mine", and the difference is the reason #527 stayed open.** The
+   * dashboard's unmount teardown sends `device:shutdown` from one socket while another socket's `close`
+   * races it to the relay — two connections, no ordering — and if the close lands first the session is
+   * unheld. An owns-it gate refuses the teardown there, and the device stays booted until the five-minute
+   * idle timer: the path #527 named as the reason a gate could not be added at all.
+   *
+   * An unheld session therefore stays shutdownable by anyone authenticated, which is unchanged from today
+   * — this command has never had a gate — and is written down rather than implied. What changes is the
+   * case the issue is about: a device another tester is *holding* can no longer be powered off.
+   */
+  private mayShutDown(ws: WebSocket, session: Session | undefined): boolean {
+    if (session?.owner == null) return true
+    if (session.owner === this.ownerOf(ws)) return true
+    // **A holder that never identified itself is not gated**, because it cannot pass a gate: every one of
+    // its sockets was minted a separate identity, so its own teardown socket is a stranger to the socket
+    // holding the session — deterministically, not as a race. An older dashboard bundle re-attaching to an
+    // upgraded relay is exactly that, and refusing it would leave a device booted until the idle timer on
+    // every Back press: the cost #527 was filed to avoid, reintroduced by #527's fix.
+    //
+    // **Scoped to the same principal, though.** The exemption exists so a legacy client's own teardown
+    // works, and its own teardown is by definition the same signed-in user — so extending it across users
+    // buys nothing and would leave one tester able to power off another's device for as long as anyone is
+    // running an older build. That is unchanged from before this gate existed, but "unchanged" is not a
+    // reason to carry it forward when the narrower rule costs one comparison.
+    return session.ownerMinted && session.ownerUser === this.userOf(ws)
+  }
+
+  /** Input that no ack answers: opening and move frames, rotation, the keyboard-forwarding toggle.
+   *
+   *  Dropped rather than refused when unowned, and that asymmetry with `handleAckedInput` is the whole
+   *  reason these have their own clause: refusing means answering, and there is no waiter here to answer.
+   *  `clipboard:data`'s silent `break` is the precedent that fits — a frame nobody is waiting on. */
+  private forwardUnacked(ws: WebSocket, msg: Unacked): void {
+    const session = this.sessions.get(msg.sessionId)
+    if (session && !this.ownsSession(ws, session)) {
+      // **Deliberately silent.** A first draft logged here, which is one line per `input:touch:move` — the
+      // dashboard sends those per `pointermove`, so ~60/s for as long as a finger is down, unbounded and
+      // outside `logger`. It says nothing new either: a gesture's terminal frame goes through
+      // `handleAckedInput`, which answers, so a non-owner attempting real input is already visible there.
+      return
+    }
+    if (session?.agentSocket.readyState === WebSocket.OPEN) {
+      session.agentSocket.send(JSON.stringify(msg))
+      // Where a touch began and last was, for its end to be told to watchers (A2). Moves are not sent on: one
+      // action per gesture, at its end.
+      if (msg.type === 'input:touch:start') session.gesture = { start: msg.payload, last: msg.payload }
+      else if (msg.type === 'input:touch:move' && session.gesture) session.gesture.last = msg.payload
+    }
+  }
+
+  /** The five inputs an ack answers, so the five that carry a required correlator.
+   *
+   *  Every exit answers the sender. That is the rule this method exists to hold: a request with a waiter on
+   *  a 2s deadline must not be dropped silently, because the caller's fallback reports silence from a
+   *  session that has never acked as **success** (#457) — so a silent drop here would report an input that
+   *  never left the relay as landed, which is worse than the misrouting it replaced. */
+  private handleAckedInput(ws: WebSocket, msg: Acked): void {
+    // No `!`: the parameter is narrowed by the door, which is the parse now rather than a predicate.
+    const session = this.sessions.get(msg.sessionId)
+
+    if (session && !this.ownsSession(ws, session)) {
+      // `not-session-owner` rather than `channel-unavailable`, on that set's own rule — a reason exists per
+      // thing a consumer must do differently. That one means reconnect or re-join *this* session; this one
+      // means the caller does not hold it, so the move is to join first. It is also the only reason that can
+      // promise nothing reached the device, because the refusal happens here, before any agent saw the frame.
+      //
+      // **Two situations, one reason, different prose** — the treatment `#492` settled for the pair below.
+      // Someone else holding the session and nobody holding it want the same *action* (join, and if that is
+      // refused pick another device), so splitting the reason would grow the vocabulary for nothing. But one
+      // string cannot be true of both: telling a caller the session is in use when it is idle steers it off
+      // a device it could have had.
+      this.refuseInput(ws, msg, ownershipRefusal(session), 'not-session-owner')
+      return
+    }
+
+    if (session?.agentSocket.readyState === WebSocket.OPEN) {
+      session.agentSocket.send(JSON.stringify(msg))
+      this.tellWatchersInput(session, msg)
+      return
+    }
+
+    // A request that cannot be dispatched. Two situations reach here and only one is the agent's fault:
+    // the session may be held with a socket that is no longer open, or there may be no such session —
+    // evicted after the reconnect grace, or never valid. In the second the agent can be perfectly healthy,
+    // so `agent offline` is a wrong diagnosis, and it is the same pair `device:boot` tells apart above for
+    // the same reason. Same two strings as there.
+    //
+    // The reason is `channel-unavailable` either way, and that is the point rather than an approximation:
+    // the set is derived from what a consumer must do differently, and both of these want a reconnect or a
+    // re-join. The machine field was right for both while the prose was wrong for one (#492).
+    this.refuseInput(ws, msg, session ? 'agent offline' : 'Session not found', 'channel-unavailable')
+  }
+
+  /**
+   * Tells the sender its payload was refused, in the shape that request's own waiter reads.
+   *
+   * **This is what keeps the door from turning an answered failure into silence.** Before it, a
+   * malformed `open-url` reached the agent and the agent's own guard answered `open-url:error`;
+   * `IOSAgent.ts` says so beside that guard, and names this validation as what would take it over.
+   * Taking the responsibility without taking the answer would have been a regression — worst on the
+   * inputs, and not obviously: `awaitInputAck` reports silence from a session that has never acked as
+   * **success** (#457), so a dropped `input:key` reads to an MCP caller as an input that landed.
+   *
+   * The address and the correlator come from the envelope, which `parseInbound` judges separately from
+   * the payload for exactly this reason — a frame with a good envelope carries everything a reply
+   * needs. `reason: 'malformed'` is not a new member; the input vocabulary already had it, and until
+   * now only agents produced it.
+   *
+   * No ownership check, deliberately: the reply goes to the socket that sent the frame and says only
+   * that its own message was malformed, so it discloses nothing about the session. Every other refusal
+   * in this file answers a question about the session's state and is gated for that reason.
+   */
+  private refuseMalformed(ws: WebSocket, f: Extract<ParseFailure, { reason: 'bad-payload' }>): void {
+    if (ws.readyState !== WebSocket.OPEN) return
+    const { sessionId, requestId } = f
+    const message = `malformed ${f.type} payload`
+    switch (f.type) {
+      case 'device:boot':     this.sendTo(ws, { type: 'device:boot-error', sessionId, requestId, message }); break
+      case 'app:install':     this.sendTo(ws, { type: 'app:install-error', sessionId, requestId, message }); break
+      case 'app:launch':      this.sendTo(ws, { type: 'app:launch-error', sessionId, requestId, message }); break
+      case 'app:clear-state': this.sendTo(ws, { type: 'app:clear-state-error', sessionId, requestId, message }); break
+      case 'open-url':        this.sendTo(ws, { type: 'open-url:error', sessionId, requestId, message }); break
+      // Its waiters key on the `input:type-*` pair and ignore an `input:error` entirely — the same
+      // reason `refuseInput` below splits these two.
+      case 'input:type':
+        this.sendTo(ws, { type: 'input:type-error', sessionId, requestId, message, reason: 'malformed' }); break
+      case 'clipboard:read':
+      case 'clipboard:write': this.sendTo(ws, { type: 'clipboard:error', sessionId, requestId, message }); break
+      case 'network:set':     this.sendTo(ws, { type: 'network:error', sessionId, requestId, message }); break
+      // The four remaining acked inputs. A `default` rather than four labels because the union is
+      // closed and exhaustive: adding a fourteenth answerable request without a case here would land
+      // it on `input:error`, which `answerableRequestsAnswered` is what stops.
+      default:
+        this.sendTo(ws, { type: 'input:error', sessionId, requestId, message, reason: 'malformed' })
+    }
+  }
+
+  /** Answers the sender in the shape its waiter is keyed on.
+   *
+   *  `input:type` needs `input:type-error`, not `input:error` — its waiters in `mcp-server` and
+   *  `flow-runner` match on the `input:type-*` pair and ignore an `input:error` entirely. That is why
+   *  adding `input:type` to the terminal set was never the fix for it, and answering it properly here is
+   *  closes the gap `relay/AGENTS.md` recorded: before L5c an `input:type` on an offline agent got nothing
+   *  and burned its caller's full deadline. */
+  private refuseInput(
+    ws: WebSocket,
+    msg: Acked,
+    message: string,
+    reason: InputErrorReason,
+  ): void {
+    if (ws.readyState !== WebSocket.OPEN) return
+    const { sessionId, requestId } = { sessionId: msg.sessionId, requestId: msg.requestId }
+    this.sendTo(ws, msg.type === 'input:type'
+      ? { type: 'input:type-error', sessionId, requestId, message, reason }
+      : { type: 'input:error', sessionId, requestId, message, reason })
+  }
+
+  /** Relay looks up file_path from DB and enriches it for the agent.
+   *
+   *  Every exit carries the request's `sessionId`, including the failures. A dashboard viewer holds
+   *  one session per socket, so an uncorrelated error still lands somewhere sensible — but an MCP
+   *  caller waits for the reply matching its own sessionId, so anything else is indistinguishable
+   *  from silence and it waits out the deadline (#445). `Session not found` is app-specific for the
+   *  same reason: a generic `error` cannot be correlated by construction. */
+  private handleBrowserAppInstall(ws: WebSocket, msg: Inbound<'app:install'>): void {
+    const sessionId = msg.sessionId
+    const { requestId } = msg
+    // Closing over the narrowed correlator covers all four failure exits at once. It does **not** cover a
+    // fifth: a throw out of `getDb().prepare(…).get(…)` — SQLITE_BUSY, a closed db, I/O — unwinds to the
+    // message-loop catch and answers nothing at all. Pre-existing and unchanged here, but "every exit
+    // carries the request's id" would be false.
+    const fail = (message: string) => this.sendTo(ws, { type: 'app:install-error', sessionId, requestId, message })
+
+    const session = this.sessions.get(sessionId)
+    if (!session) return fail('Session not found')
+    // Ownership only, and **not** `dispatchTarget`: that resolver also decides agent liveness, and using it
+    // here would move the `agent offline` check ahead of the build lookup below — changing which of two
+    // simultaneous problems the caller is told about. Until L5c this branch asked whether the session
+    // existed and not who was asking, so a socket that never joined could install a build onto a device
+    // someone else was testing, with the reply going to that session's browser rather than to it.
+    if (!this.ownsSession(ws, session)) return fail(ownershipRefusal(session))
+
+    // The schema already refused a non-integer `buildId`, so this is now belt-and-braces rather than
+    // the only guard. Kept because it is also the *answer*: the parser drops a bad frame silently and
+    // No `Number.isInteger` guard here any more: `buildId` is `z.number().int()` at the door, and a bad
+    // one is answered there by `refuseMalformed` with a diagnosis this branch could not give — "not
+    // found" describes a lookup, and for a malformed id no lookup ran. The guard existed because
+    // better-sqlite3 binds a missing value as NULL but **throws** on an object or array, and that
+    // exception was swallowed by the message-loop catch; the door makes both unreachable.
+    const build = getDb()
+      .prepare('SELECT file_path, bundle_id FROM builds WHERE id = ?')
+      .get(msg.buildId) as { file_path: string; bundle_id: string | null } | undefined
+    if (!build) return fail('Build not found')
+
+    // Answer now rather than letting the caller time out — the same shape as `open-url` above.
+    if (session.agentSocket.readyState !== WebSocket.OPEN) return fail('agent offline')
+
+    // The correlator rides across the rebuild. `open-url` got this for free — the relay re-serialises
+    // that message whole — but this is a *different* message from the one the browser sent, and the
+    // agent's reply is forwarded back generically without the relay looking at it. So if the id does not
+    // reach the agent, nothing downstream can attribute the reply. Nothing type-checks that the value is
+    // the *request's*: a brand cannot express provenance, so a test carries it.
+    // **`statSync`, and this handler stays synchronous.** Its caller does not await it
+    // (`case 'app:install'` above), and the message loop's `catch` is synchronous — so making this
+    // `async` would turn the `getDb()` throw named in the comment at the top of this function
+    // (SQLITE_BUSY, a closed db, I/O) from "logged, one request hangs" into an unhandled rejection,
+    // and the CLI exits the process on those. The relay would die with every session on it.
+    //
+    // A missing file is answered rather than thrown for the same reason the lookup above is: the
+    // build row outlives its file whenever a bind mount goes away or a purge half-ran, and an
+    // unanswered install is a spinner that never stops and a caller that times out with no cause.
+    //
+    // Resolved rather than read verbatim: the stored path names wherever the data directory was at
+    // upload time, and a migrated, moved or restored install keeps the file under a different one.
+    const filePath = resolveBuildFile(build.file_path, this.uploadsDir)
+    let bytes: number
+    try {
+      if (filePath === null) throw new Error('not found')
+      bytes = fs.statSync(filePath).size
+    } catch {
+      return fail('The relay cannot read this build file. It may have been deleted — re-upload the build.')
+    }
+
+    this.sendTo(session.agentSocket, {
+      type: 'app:install',
+      sessionId,
+      requestId,
+      payload: {
+        // Still sent, and sent first: an agent that predates `build-download` reads only this.
+        filePath,
+        bundleId: build.bundle_id,
+        buildTicket: this.buildTickets.mint(msg.buildId, filePath),
+        buildName: path.basename(filePath),
+        buildBytes: bytes,
+      },
+    })
+    this.tellWatchersAction(sessionId, { kind: 'install' })
+  }
+
+  /**
+   * Says once, per agent, that this agent cannot fetch builds over HTTP.
+   *
+   * **The wording is conditional on purpose.** Such an agent installs perfectly well when it shares
+   * the relay's filesystem, which is every `tapflow start`, so "installs will fail" would be false
+   * for most of the people who see it. What it cannot do is install from a relay that is somewhere
+   * else — and the relay cannot tell which case this is: the dashboard hands agents a **LAN**
+   * address even for the same machine (`pickLanAddress`), so the socket's own address answers a
+   * different question than the one that matters.
+   *
+   * Once per identity, because `agent:register` runs again on every reconnect — a Wi-Fi blip or a
+   * laptop waking up would otherwise repeat this indefinitely. Same shape as `warnedProxyMisconfig`.
+   */
+  private warnLegacyInstaller(identity: string, capabilities: string[]): void {
+    if (hasCapability(capabilities, 'build-download') || this.warnedLegacyInstaller.has(identity)) return
+    this.warnedLegacyInstaller.add(identity)
+    logger.warn(
+      `[relay] agent ${identity} predates build downloading. If it is not on the same machine as ` +
+      'this relay, installing a build will fail — update the agent to match the relay.',
+    )
+  }
+
+  /** Relay looks up bundle_id from DB. Same correlation rules as `handleBrowserAppInstall`. */
+  private handleBrowserAppLaunch(ws: WebSocket, msg: Inbound<'app:launch'>): void {
+    const sessionId = msg.sessionId
+    const { requestId } = msg
+    // Closing over the narrowed correlator covers all four failure exits at once. It does **not** cover a
+    // fifth: a throw out of `getDb().prepare(…).get(…)` — SQLITE_BUSY, a closed db, I/O — unwinds to the
+    // message-loop catch and answers nothing at all. Pre-existing and unchanged here, but "every exit
+    // carries the request's id" would be false.
+    const fail = (message: string) => this.sendTo(ws, { type: 'app:launch-error', sessionId, requestId, message })
+
+    const session = this.sessions.get(sessionId)
+    if (!session) return fail('Session not found')
+    // Ownership only, and **not** `dispatchTarget`: that resolver also decides agent liveness, and using it
+    // here would move the `agent offline` check ahead of the build lookup below — changing which of two
+    // simultaneous problems the caller is told about. Until L5c this branch asked whether the session
+    // existed and not who was asking, so a socket that never joined could install a build onto a device
+    // someone else was testing, with the reply going to that session's browser rather than to it.
+    if (!this.ownsSession(ws, session)) return fail(ownershipRefusal(session))
+
+    // See `handleBrowserAppInstall` — the door refuses a malformed id and answers it.
+    const build = getDb()
+      .prepare('SELECT bundle_id FROM builds WHERE id = ?')
+      .get(msg.buildId) as { bundle_id: string | null } | undefined
+    if (!build?.bundle_id) return fail('Bundle ID not available for this build')
+
+    if (session.agentSocket.readyState !== WebSocket.OPEN) return fail('agent offline')
+
+    // See `handleBrowserAppInstall` — the correlator rides across the rebuild, and only a test says the
+    // value is the request's.
+    this.sendTo(session.agentSocket, {
+      type: 'app:launch',
+      sessionId,
+      requestId,
+      payload: { bundleId: build.bundle_id },
+    })
+    this.tellWatchersAction(sessionId, { kind: 'launch' })
+  }
+
+  private async handleGetScreenshot(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    params: Record<string, string>,
+  ): Promise<void> {
+    if (!requireViewAuth(req, res)) return
+
+    const { sessionId } = params
+    const session = this.sessions.get(sessionId)
+    if (!session) {
+      json(res, 404, { error: 'Session not found' })
+      return
+    }
+    if (session.deviceStatus === 'shutdown') {
+      json(res, 409, { error: 'Device is not booted' })
+      return
+    }
+    if (session.agentSocket.readyState !== WebSocket.OPEN) {
+      json(res, 502, { error: 'Agent offline' })
+      return
+    }
+
+    const urlObj = new URL(req.url ?? '/', 'http://x')
+    const format: 'png' | 'jpeg' = urlObj.searchParams.get('format') === 'jpeg' ? 'jpeg' : 'png'
+    const requestId = randomUUID()
+
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingScreenshots.delete(requestId)
+        json(res, 504, { error: 'Screenshot timed out' })
+        resolve()
+      }, this.screenshotTimeoutMs)
+
+      this.pendingScreenshots.set(requestId, {
+        sessionId,
+        resolve: (buf, fmt) => {
+          clearTimeout(timer)
+          this.pendingScreenshots.delete(requestId)
+          const contentType = fmt === 'jpeg' ? 'image/jpeg' : 'image/png'
+          res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': String(buf.length) })
+          res.end(buf)
+          resolve()
+        },
+        reject: (err) => {
+          clearTimeout(timer)
+          this.pendingScreenshots.delete(requestId)
+          json(res, 502, { error: err.message })
+          resolve()
+        },
+        timer,
+      })
+
+      this.sendTo(session.agentSocket, { type: 'screenshot:request', sessionId, requestId, format })
+    })
+  }
+
+  private async handleGetUITree(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    params: Record<string, string>,
+  ): Promise<void> {
+    if (!requireViewAuth(req, res)) return
+
+    const { sessionId } = params
+    const session = this.sessions.get(sessionId)
+    if (!session) {
+      json(res, 404, { error: 'Session not found' })
+      return
+    }
+    if (session.deviceStatus === 'shutdown') {
+      json(res, 409, { error: 'Device is not booted' })
+      return
+    }
+    if (session.agentSocket.readyState !== WebSocket.OPEN) {
+      json(res, 502, { error: 'Agent offline' })
+      return
+    }
+
+    const requestId = randomUUID()
+
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingUITrees.delete(requestId)
+        json(res, 504, { error: 'UI tree query timed out — the agent may not support ui:tree:request (update the agent), or the screen never went idle' })
+        resolve()
+      }, this.uiTreeTimeoutMs)
+
+      this.pendingUITrees.set(requestId, {
+        sessionId,
+        resolve: (elements) => {
+          clearTimeout(timer)
+          this.pendingUITrees.delete(requestId)
+          json(res, 200, { elements })
+          resolve()
+        },
+        reject: (err) => {
+          clearTimeout(timer)
+          this.pendingUITrees.delete(requestId)
+          json(res, 502, { error: err.message })
+          resolve()
+        },
+        timer,
+      })
+
+      this.sendTo(session.agentSocket, { type: 'ui:tree:request', sessionId, requestId })
+    })
+  }
+
+  private handleUITreeResponse(msg: Inbound<'ui:tree:response'>): void {
+    const pending = this.pendingUITrees.get(msg.requestId)
+    if (!pending) return
+    pending.resolve(msg.elements)
+  }
+
+  private handleUITreeError(msg: Inbound<'ui:tree:error'>): void {
+    const pending = this.pendingUITrees.get(msg.requestId)
+    if (!pending) return
+    // `||`, not `??`: the schema defaults an absent message to `''` rather than leaving it undefined,
+    // so the fallback has to treat empty as absent or an older agent's error would read as blank.
+    pending.reject(new Error(msg.message || 'UI tree query failed'))
+  }
+
+  private handleScreenshotDone(msg: Inbound<'screenshot:done'>): void {
+    const pending = this.pendingScreenshots.get(msg.requestId)
+    if (!pending) return
+    // The `?? ''` / `?? 'png'` these two used to carry are now `.default()`s in the schema, where a
+    // reader can see that the tolerance is for an older agent rather than for any absent field.
+    const buf = Buffer.from(msg.data, 'base64')
+    const claimed = msg.format
+    // Logged, **not** overwritten. The field means what the agent says it produced, and correcting it
+    // here would make the relay the authority on something only the agent can know — a contract
+    // change, where this is a drift detector. It costs four bytes of an already-decoded buffer.
+    //
+    // Worth having because the consumer-side fix for #508 sniffs the bytes and would otherwise hide a
+    // lying agent forever: #508 was found by a person noticing, and nothing would have reported it.
+    const actual = sniffImageFormat(buf)
+    if (actual !== null && actual !== claimed) {
+      logger.warn(
+        `[relay] screenshot from session ${msg.sessionId ?? '?'} is ${actual} but the agent called it ` +
+        `${claimed} — the Content-Type will be wrong. Upgrade the agent (#508).`,
+      )
+    }
+    pending.resolve(buf, claimed)
+  }
+
+  private handleScreenshotError(msg: Inbound<'screenshot:error'>): void {
+    const pending = this.pendingScreenshots.get(msg.requestId)
+    if (!pending) return
+    // `||` for the reason `handleUITreeError` gives.
+    pending.reject(new Error(msg.message || 'Screenshot failed'))
+  }
+
+  private flushResourceBuffers(): void {
+    if (this.resourceBuffers.size === 0) return
+    const db = getDb()
+    const insert = db.prepare('INSERT INTO agent_resources (agent_name, cpu_percent, mem_percent) VALUES (?, ?, ?)')
+    db.transaction(() => {
+      for (const [agentName, buf] of this.resourceBuffers.entries()) {
+        if (buf.cpu.length === 0) continue
+        const avgCpu = buf.cpu.reduce((a, b) => a + b, 0) / buf.cpu.length
+        const avgMem = buf.mem.reduce((a, b) => a + b, 0) / buf.mem.length
+        insert.run(agentName, avgCpu, avgMem)
+      }
+    })()
+    this.resourceBuffers.clear()
+  }
+
+  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    this.warnTrustedProxyWithoutXffOnce(req)
+    const corsHeaders = resolveCorsHeaders(req.headers.origin, this.corsAllowed)
+    if (corsHeaders) {
+      for (const [k, v] of Object.entries(corsHeaders)) res.setHeader(k, v)
+    }
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+
+    // uploads — serve uploaded files
+    const url = req.url ?? '/'
+
+    if (url.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store')
+      if (isCsrfBlocked(req.method, req.headers, this.corsAllowed)) {
+        json(res, 403, { error: 'Cross-origin state-changing request blocked (CSRF protection)' })
+        return
+      }
+    }
+    if (url.startsWith('/uploads/')) {
+      // Outside the router, so outside its catch: the auth check reads the database, and a throw here
+      // would be an unhandled rejection that ends the process.
+      try {
+        if (!requireViewAuth(req, res)) return
+      } catch (err) {
+        logger.error('upload auth failed:', err)
+        if (!res.headersSent) json(res, 500, { error: 'Internal server error' })
+        return
+      }
+      this.serveUpload(req, res)
+      return
+    }
+
+    // API routes
+    const handled = await this.router.handle(req, res)
+    if (handled) return
+
+    // SPA static fallback
+    this.serveStatic(req, res)
+  }
+
+  /**
+   * Serves one build to the agent that was just told to install it.
+   *
+   * **The ticket is the whole credential, and it travels in a header.** No PAT is asked for —
+   * requiring one would break `tapflow start`, whose agent connects on loopback with no token at
+   * all. In a URL the ticket would reach the request log the first time this handler threw
+   * (`router.ts` logs `${method} ${url}`, and its redaction only knows PAT and JWT shapes) and every
+   * reverse proxy's access log besides.
+   *
+   * The three failures are answered separately because a user does something different about each:
+   * a ticket nobody minted, a ticket that sat too long, and a file that went away between the mint
+   * and the fetch. Collapsing them is the defect this change exists to stop repeating.
+   */
+  private handleBuildDownload(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const ticket = req.headers['x-tapflow-build-ticket']
+    if (typeof ticket !== 'string' || ticket === '') {
+      return json(res, 401, { error: 'Missing X-Tapflow-Build-Ticket' })
+    }
+    const found = this.buildTickets.redeem(ticket)
+    if (found === 'unknown') {
+      return json(res, 404, { error: 'This build ticket is not valid. It may already have been used.' })
+    }
+    if (found === 'expired') {
+      return json(res, 410, { error: 'This build ticket expired before it was used.' })
+    }
+
+    let size: number
+    try {
+      size = fs.statSync(found.filePath).size
+    } catch {
+      return json(res, 404, { error: 'The build file is no longer on the relay.' })
+    }
+
+    // Set even though the agent compares against `buildBytes` instead: a correct header costs
+    // nothing and helps anything else that looks. It is not the check — a proxy may drop it.
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': size })
+    // **`pipe` does not destroy its source when the destination goes away** — it only unpipes — so an
+    // aborted download leaves the read stream and its file descriptor open for the life of the
+    // process. Measured: after a client abort, `rs.destroyed` is still false and the fd still stats.
+    // On this route an abort is the *ordinary* failure, not an edge case: the agent's own idle
+    // timeout destroys the request, and so does an agent that exits or a link that drops. Enough of
+    // them and the relay hits its descriptor limit and stops accepting connections at all.
+    const rs = fs.createReadStream(found.filePath)
+    res.on('close', () => { rs.destroy() })
+    rs.on('error', () => { res.destroy() })
+    rs.pipe(res)
+  }
+
+  private serveUpload(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const urlPath = (req.url ?? '/').split('?')[0]
+    const filePath = path.join(this.uploadsDir, urlPath.replace('/uploads/', ''))
+    const resolved = path.resolve(filePath)
+    if (!resolved.startsWith(path.resolve(this.uploadsDir) + path.sep)) {
+      res.writeHead(403); res.end('Forbidden'); return
+    }
+    if (!fs.existsSync(filePath)) {
+      res.writeHead(404); res.end('Not found'); return
+    }
+    const contentType = MIME_TYPES[path.extname(filePath)] ?? 'application/octet-stream'
+    res.writeHead(200, { 'Content-Type': contentType })
+    // Same leak as `handleBuildDownload` above, and the same one line closes it.
+    const rs = fs.createReadStream(filePath)
+    res.on('close', () => { rs.destroy() })
+    rs.on('error', () => { res.destroy() })
+    rs.pipe(res)
+  }
+
+  private serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const urlPath = (req.url ?? '/').split('?')[0]
+    let filePath = path.join(this.publicDir, urlPath === '/' ? '/index.html' : urlPath)
+
+    // **Contained before anything is read or probed.** `req.url` is the raw request target and Node does
+    // not normalise it, so `/../../etc/passwd` reached `path.join` intact and the join walked out of
+    // `publicDir` — unauthenticated, and the relay's environment and database were one request away.
+    // `serveUpload` has had this check since #173. Checked on the joined path because the index lookup and
+    // the `.br`/`.gz` siblings below are all derived from it; the separator keeps a sibling directory
+    // whose name starts with `publicDir`'s outside.
+    if (!path.resolve(filePath).startsWith(path.resolve(this.publicDir) + path.sep)) {
+      res.writeHead(404); res.end('Not found'); return
+    }
+
+    // Next.js static export: try exact path, then path/index.html (trailingSlash)
+    if (!fs.existsSync(filePath)) {
+      const withIndex = path.join(filePath, 'index.html')
+      if (fs.existsSync(withIndex)) {
+        filePath = withIndex
+      } else {
+        // SPA fallback → index.html
+        filePath = path.join(this.publicDir, 'index.html')
+      }
+    }
+
+    if (!fs.existsSync(filePath)) {
+      res.writeHead(404); res.end('Not found'); return
+    }
+
+    const contentType = MIME_TYPES[path.extname(filePath)] ?? 'text/html'
+    const headers: Record<string, string> = { 'Content-Type': contentType }
+
+    // Content-hashed build assets never change → cache them forever.
+    // HTML entry points must revalidate on every load so updates are picked up immediately.
+    if (urlPath.startsWith('/assets/')) {
+      headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    } else if (filePath.endsWith('index.html')) {
+      headers['Cache-Control'] = 'no-cache'
+    }
+
+    // Serve precompressed siblings (.br or .gz) when accepted (precompressed → no runtime CPU on the stream path).
+    const acceptHeader = req.headers['accept-encoding']
+    const accept = Array.isArray(acceptHeader) ? acceptHeader.join(',') : acceptHeader ?? ''
+
+    // **An explicit coding outranks `*`, rather than being maxed with it.** RFC 9110 §12.5.3 gives
+    // the more specific match precedence, and taking the maximum across both meant
+    // `Accept-Encoding: br;q=0, *` answered 1 for `br` — serving brotli to a client that named it
+    // and refused it. The two are tracked apart and the wildcard is consulted only when the coding
+    // was never named.
+    const parseQuality = (codingName: string): number => {
+      let named = -1
+      let wildcard = -1
+      for (const token of accept.split(',')) {
+        const [name, ...params] = token.trim().split(';')
+        const coding = name.trim().toLowerCase()
+        if (coding !== codingName && coding !== '*') continue
+        // Lowercased because RFC 9110 §5.6.6 makes parameter names case-insensitive: `br;Q=0` was
+        // missed, fell through to the default weight of 1, and served brotli to a client that had
+        // refused it. The qvalue itself is numeric, so folding the whole token is safe.
+        const qParam = params.map((p) => p.trim().toLowerCase()).find((p) => p.startsWith('q='))
+        const q = qParam ? Number(qParam.slice(2)) : 1
+        if (Number.isNaN(q)) continue
+        if (coding === '*') wildcard = Math.max(wildcard, q)
+        else named = Math.max(named, q)
+      }
+      return named >= 0 ? named : wildcard
+    }
+
+    const brQ = parseQuality('br')
+    const gzQ = Math.max(parseQuality('gzip'), parseQuality('x-gzip'))
+
+    // **`Vary` unconditionally, and that is what lets the probes below be skipped.** It declares a
+    // cache key rather than describing this response: a shared cache that stored the uncompressed
+    // body without it would hand that body to the next client, which may accept brotli. Deriving it
+    // from "does a sibling exist" is what forced a `stat` on every static request even when the
+    // client asked for no encoding at all — a syscall per asset per request, on the path this exists
+    // to make cheaper. Set it always, and ask the filesystem only about codings that could be served.
+    headers['Vary'] = 'Accept-Encoding'
+
+    const hasBr = brQ > 0 && fs.existsSync(filePath + '.br')
+    const hasGz = gzQ > 0 && fs.existsSync(filePath + '.gz')
+
+    let servePath = filePath
+    if (brQ > 0 && hasBr && (gzQ <= 0 || !hasGz || brQ >= gzQ)) {
+      servePath = filePath + '.br'
+      headers['Content-Encoding'] = 'br'
+    } else if (gzQ > 0 && hasGz) {
+      servePath = filePath + '.gz'
+      headers['Content-Encoding'] = 'gzip'
+    }
+
+    res.writeHead(200, headers)
+    // Same leak as `handleBuildDownload` above, and the same one line closes it.
+    const rs = fs.createReadStream(servePath)
+    res.on('close', () => { rs.destroy() })
+    rs.on('error', () => { res.destroy() })
+    rs.pipe(res)
+  }
+}

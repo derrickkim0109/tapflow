@@ -1,0 +1,62 @@
+import { lazy, Suspense, type ReactNode } from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { Toaster, type ToasterProps } from 'sonner'
+import { useTheme } from 'next-themes'
+import { DashboardLayout } from './layouts/DashboardLayout'
+import { Login } from './pages/Login'
+import { makeQueryClient } from '@/lib/queryClient'
+
+// Lazy-load routes (Login + shell stay eager); QASession's chunk loads before its viewer, off the stream frame path.
+const Setup = lazy(() => import('./pages/Setup').then((m) => ({ default: m.Setup })))
+const Invite = lazy(() => import('./pages/Invite').then((m) => ({ default: m.Invite })))
+const ResetPassword = lazy(() => import('./pages/ResetPassword').then((m) => ({ default: m.ResetPassword })))
+const AppCenter = lazy(() => import('./pages/AppCenter').then((m) => ({ default: m.AppCenter })))
+const QASession = lazy(() => import('./pages/QASession').then((m) => ({ default: m.QASession })))
+const Runs = lazy(() => import('./pages/Runs').then((m) => ({ default: m.Runs })))
+const RunDetail = lazy(() => import('./pages/RunDetail').then((m) => ({ default: m.RunDetail })))
+const AISessionWatch = lazy(() => import('./pages/AISessionWatch').then((m) => ({ default: m.AISessionWatch })))
+const MacResources = lazy(() => import('./pages/MacResources').then((m) => ({ default: m.MacResources })))
+const DefaultSettings = lazy(() => import('./pages/settings/Default').then((m) => ({ default: m.DefaultSettings })))
+const TeamSettings = lazy(() => import('./pages/settings/Team').then((m) => ({ default: m.TeamSettings })))
+const TokenSettings = lazy(() => import('./pages/settings/Tokens').then((m) => ({ default: m.TokenSettings })))
+const NotFound = lazy(() => import('./pages/NotFound').then((m) => ({ default: m.NotFound })))
+
+const pageFallback = <div className="flex h-screen w-full items-center justify-center text-sm text-muted-foreground">Loading…</div>
+// Shell-less public routes wrap their own Suspense; authed routes lean on the
+// layout's Outlet boundary so the sidebar/header stay mounted while loading.
+const suspended = (el: ReactNode) => <Suspense fallback={pageFallback}>{el}</Suspense>
+
+// One client for the app's lifetime. Built outside the component so a re-render never swaps the
+// cache out from under the pages reading it.
+const queryClient = makeQueryClient()
+
+export function App() {
+  const { resolvedTheme } = useTheme()
+  return (
+    <QueryClientProvider client={queryClient}>
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/setup" element={suspended(<Setup />)} />
+        <Route path="/invite" element={suspended(<Invite />)} />
+        <Route path="/reset-password" element={suspended(<ResetPassword />)} />
+        <Route element={<DashboardLayout />}>
+          <Route index element={<Navigate to="/app-center" replace />} />
+          <Route path="/app-center" element={<AppCenter />} />
+          <Route path="/app-center/build" element={<QASession />} />
+          <Route path="/automation/runs" element={<Runs />} />
+          <Route path="/automation/runs/:runId" element={<RunDetail />} />
+          <Route path="/automation/sessions/:sessionId" element={<AISessionWatch />} />
+          <Route path="/mac-resources" element={<MacResources />} />
+          <Route path="/settings/default" element={<DefaultSettings />} />
+          <Route path="/settings/team" element={<TeamSettings />} />
+          <Route path="/settings/tokens" element={<TokenSettings />} />
+        </Route>
+        <Route path="*" element={suspended(<NotFound />)} />
+      </Routes>
+      <Toaster position="bottom-right" richColors theme={resolvedTheme as ToasterProps['theme']} />
+    </BrowserRouter>
+    </QueryClientProvider>
+  )
+}

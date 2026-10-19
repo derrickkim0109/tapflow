@@ -1,0 +1,21 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: lint
+      run: pnpm lint
+
+    - name: typecheck
+      run: pnpm typecheck
+
+    - name: a11y-lens
+      run: pnpm exec a11y-lens check --staged
+
+pre-push:
+  jobs:
+    - name: no-direct-main-push
+      run: |
+        branch=$(git symbolic-ref HEAD 2>/dev/null | sed 's|refs/heads/||')
+        if [ "$branch" = "main" ]; then
+          echo "Direct push to main is not allowed. Please open a PR."
+          exit 1
+        fi

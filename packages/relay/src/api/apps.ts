@@ -1,0 +1,96 @@
+import http from 'http'
+import { getDb } from '../db.js'
+import { requireRole, requireViewAuth } from '../middleware/auth.js'
+import { json, readJson } from '../router.js'
+import { deleteBuildsWithDependents, type BuildFileDirs } from '../lib/buildDeletion.js'
+
+// Viewer is the one read-only role; QA manages apps like Developer does.
+const APP_MANAGERS = ['Admin', 'Developer', 'QA']
+
+export function handleListApps(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const auth = requireViewAuth(req, res)
+  if (!auth) return
+
+  const items = getDb().prepare(`
+    SELECT
+      a.id, a.name, a.bundle_id_key, a.platform, a.created_at,
+      b.id         AS latest_build_id,
+      b.version_name,
+      b.build_number,
+      b.status_label,
+      b.uploaded_at AS latest_uploaded_at
+    FROM apps a
+    LEFT JOIN builds b ON b.id = (
+      SELECT id FROM builds WHERE app_id = a.id ORDER BY uploaded_at DESC LIMIT 1
+    )
+    ORDER BY a.created_at DESC
+  `).all()
+
+  json(res, 200, { items })
+}
+
+export async function handleCreateApp(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (!requireRole(req, res, APP_MANAGERS)) return
+
+  const body = await readJson<{ name?: string; bundle_id_key?: string; platform?: string }>(req)
+  if (!body.name?.trim()) return json(res, 400, { error: 'name is required' })
+  if (!body.bundle_id_key?.trim()) return json(res, 400, { error: 'bundle_id_key is required' })
+  const platform = body.platform?.trim()
+  if (!platform) {
+    return json(res, 400, { error: 'platform is required' })
+  }
+
+  // One app per bundle ID, whatever the platform. Migration 007 dropped UNIQUE(bundle_id_key, platform)
+  // to be enforced in code, and since then `upsertApp` finds an upload's app by the key alone and promotes
+  // it to 'both'. So a second row with the same key on another platform would never receive a build
+  // uploaded without app_id — the old per-platform constraint is the wrong one to restore. Checking only
+  // here is enough: no other write path inserts a row for a key that already has one.
+  // better-sqlite3 is synchronous, so no request can insert between this check and the INSERT.
+  const db = getDb()
+  const bundleIdKey = body.bundle_id_key.trim()
+  if (db.prepare('SELECT 1 FROM apps WHERE bundle_id_key = ?').get(bundleIdKey)) {
+    return json(res, 409, { error: 'App with this bundle ID already exists' })
+  }
+  const result = db
+    .prepare('INSERT INTO apps (name, bundle_id_key, platform) VALUES (?, ?, ?)')
+    .run(body.name.trim(), bundleIdKey, platform)
+  json(res, 201, { id: result.lastInsertRowid, ok: true })
+}
+
+export function handleDeleteApp(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: Record<string, string>,
+  dirs: BuildFileDirs,
+): void {
+  if (!requireRole(req, res, APP_MANAGERS)) return
+
+  const db = getDb()
+  if (!db.prepare('SELECT 1 FROM apps WHERE id = ?').get(params.id)) return json(res, 404, { error: 'App not found' })
+  const buildIds = (db.prepare('SELECT id FROM builds WHERE app_id = ?').all(params.id) as { id: number }[]).map((b) => b.id)
+  deleteBuildsWithDependents(buildIds, dirs, () => {
+    db.prepare('DELETE FROM apps WHERE id = ?').run(params.id)
+  })
+  json(res, 200, { ok: true })
+}
+
+export async function handleUpdateApp(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: Record<string, string>
+): Promise<void> {
+  if (!requireRole(req, res, APP_MANAGERS)) return
+
+  const body = await readJson<{ name?: string }>(req)
+  if (!body.name?.trim()) return json(res, 400, { error: 'name is required' })
+
+  const result = getDb()
+    .prepare('UPDATE apps SET name = ? WHERE id = ?')
+    .run(body.name.trim(), params.id)
+
+  if (result.changes === 0) return json(res, 404, { error: 'App not found' })
+  json(res, 200, { ok: true })
+}
