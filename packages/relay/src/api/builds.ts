@@ -338,7 +338,8 @@ export function handleListBuilds(req: http.IncomingMessage, res: http.ServerResp
   const conds: string[] = []
   const params: unknown[] = []
 
-  if (q)        { conds.push('b.version_name LIKE ?'); params.push(`%${q}%`) }
+  // A substring search: `%`, `_` and the escape character itself are text to find, not wildcards.
+  if (q)        { conds.push(`b.version_name LIKE ? ESCAPE '\\'`); params.push(`%${q.replace(/[\\%_]/g, '\\$&')}%`) }
   if (platform) { conds.push('ap.platform = ?'); params.push(platform) }
   if (status)   { conds.push('b.status_label = ?'); params.push(status) }
   if (appId)    { conds.push('b.app_id = ?'); params.push(Number(appId)) }

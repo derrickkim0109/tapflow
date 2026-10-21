@@ -214,6 +214,8 @@ describe('useAgentSession', () => {
     expect(result.current.selectedAgent).toBeNull()
   })
 
+  // Only that the hook calls `send` on unmount: `useRelay` is mocked here, so this passed while the shutdown never
+  // reached the socket. Whether it does is useAgentSession.unmount.test.tsx.
   it('sends device:shutdown on unmount when a session is active', async () => {
     const { result, unmount } = renderHook(() => useAgentSession('android'))
     const device = makeDevice({ id: 'avd:Pixel_7', sessionId: 'sess-1' })

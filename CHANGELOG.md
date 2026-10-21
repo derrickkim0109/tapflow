@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-10-21
+
+### Added
+
+- **A dashboard link shows a preview image.** Pasting a dashboard link into a chat app now shows the tapflow banner, with a title and description, when the app's crawler can reach your relay. The image is served by the relay itself, so nothing is fetched from outside.
+
+### Changed
+
+- **Dashboard notifications are set in the dashboard's font (Inter)** on every system, instead of each operating system's own interface font.
+- **Dashboard notifications use the dashboard's own toast styling** (shadcn's current Toaster). Their icons match the rest of the dashboard, and the "uploading" toast takes the dashboard's popover colors. Success, error, warning and info keep their colored backgrounds.
+
+### Fixed
+
+- **The account button in the collapsed dashboard sidebar is named after you.** Collapsed to icons it shows only your avatar, and without a picture a screen reader announced just your initial, and voice control could not reach it by your name. Your name and email stay hidden on screen but are now part of the button's name.
+- **A nickname or team name of only spaces is no longer saved.** Settings refuses it, and the relay trims both names: a blank nickname falls back to your email's local part in the sidebar and on comments, a blank team name keeps the current one. It used to show as a blank name and an empty avatar circle. A name already saved as spaces stays blank until it is saved again.
+- **Leaving a QA session now shuts its device down.** Going to another page with a device running left it running, unused, until the relay's idle timeout (5 minutes by default).
+- **The comment box in a QA session recovers from a failed post.** If the relay could not be reached, Post stayed greyed out; if it refused the comment, nothing was said. Either way it now says the comment was not posted and keeps your text. A rejected image no longer leaves the earlier one attached, and the same image can be picked again after posting.
+- **Flow Runs no longer jumps when its runs finish loading.** The placeholder rows shown while waiting were 6px taller than a run, so the table shrank as the runs arrived.
+- **The App Center's version search matches `%` and `_` as typed.** They were read as wildcards, so searching for `%` listed every build and `1_0` also found `1.0.5`.
+- **The dashboard sidebar closes on a phone once you pick a page or go back.** Below 768px the sidebar opens as a sheet, and following a link in it used to leave the sheet covering the page it had just opened.
+
+### Security
+
+- **Update Node.js to 22.23.4 or 24.22.1, or later.** Node.js's [October 2026 security release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases) fixes ten vulnerabilities in Node.js itself, four rated High, among them an out-of-bounds write in its Brotli decoder and ways around TLS certificate hostname checks. tapflow runs on the Node.js you installed, so upgrading tapflow does not update it; `node -v` shows which one you have. The Docker image for this release is built on Node.js 24.22.1.
+
 ## [0.28.0] - 2026-10-20
 
 ### Added
@@ -1034,7 +1059,8 @@ found out by waiting.
 
 - Automatic `tapflow.config.json` creation as a side effect of `tapflow start` / `tapflow relay start`.
 
-[Unreleased]: https://github.com/jo-duchan/tapflow/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/jo-duchan/tapflow/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/jo-duchan/tapflow/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/jo-duchan/tapflow/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/jo-duchan/tapflow/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/jo-duchan/tapflow/compare/v0.26.1...v0.27.0

@@ -1,17 +1,20 @@
 "use client"
 
 import {
-  CircleCheck,
-  Info,
-  LoaderCircle,
-  OctagonX,
-  TriangleAlert,
+  CircleCheckIcon,
+  InfoIcon,
+  Loader2Icon,
+  OctagonXIcon,
+  TriangleAlertIcon,
 } from "lucide-react"
 import { useTheme } from "next-themes"
-import { Toaster as Sonner } from "sonner"
+import { Toaster as Sonner, type ToasterProps } from "sonner"
 
-type ToasterProps = React.ComponentProps<typeof Sonner>
-
+// shadcn's current (new-york-v4) Toaster, with its CSS variables wrapped in `hsl()` because this package's
+// tokens are bare HSL triplets (Tailwind 3). Variables rather than the older `toastOptions.classNames`: those
+// classes tie with sonner's `richColors` rules on specificity, so which one won depended on stylesheet order,
+// and the dev server and the build disagreed. `fontFamily: inherit` for the same reason: sonner sets its own
+// system font stack on the toaster, and an inline value is the one that wins regardless of stylesheet order.
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme = "system" } = useTheme()
 
@@ -20,23 +23,21 @@ const Toaster = ({ ...props }: ToasterProps) => {
       theme={theme as ToasterProps["theme"]}
       className="toaster group"
       icons={{
-        success: <CircleCheck className="h-4 w-4" />,
-        info: <Info className="h-4 w-4" />,
-        warning: <TriangleAlert className="h-4 w-4" />,
-        error: <OctagonX className="h-4 w-4" />,
-        loading: <LoaderCircle className="h-4 w-4 animate-spin" />,
+        success: <CircleCheckIcon className="size-4" />,
+        info: <InfoIcon className="size-4" />,
+        warning: <TriangleAlertIcon className="size-4" />,
+        error: <OctagonXIcon className="size-4" />,
+        loading: <Loader2Icon className="size-4 animate-spin" />,
       }}
-      toastOptions={{
-        classNames: {
-          toast:
-            "group toast group-[.toaster]:bg-background group-[.toaster]:text-foreground group-[.toaster]:border-border group-[.toaster]:shadow-lg",
-          description: "group-[.toast]:text-muted-foreground",
-          actionButton:
-            "group-[.toast]:bg-primary group-[.toast]:text-primary-foreground",
-          cancelButton:
-            "group-[.toast]:bg-muted group-[.toast]:text-muted-foreground",
-        },
-      }}
+      style={
+        {
+          "--normal-bg": "hsl(var(--popover))",
+          "--normal-text": "hsl(var(--popover-foreground))",
+          "--normal-border": "hsl(var(--border))",
+          "--border-radius": "var(--radius)",
+          fontFamily: "inherit",
+        } as React.CSSProperties
+      }
       {...props}
     />
   )

@@ -77,11 +77,10 @@ The one call site that switches between axes is the app platform in Settings →
 | Where | Override | Why |
 |-------|----------|-----|
 | Most `tone` badges | `text-xs` | Already in the base class; changes nothing |
-| Platform badges (build row, Settings → Apps) | `capitalize` | The value is lowercase from the API (`ios`, `android`, `both`) |
 | Runs, build filter chip | `variant="outline"` + `gap-1 pr-1 font-normal`, and a 20px ghost ✕ button inside | A removable filter: build name, then a button that clears it. 26px high, regular weight |
 
-**The platform label reads "Ios" today.** `capitalize` turns `ios` into `Ios`, not `iOS`. Draw `iOS`, `Android`
-and `Both`; the code is the one that is wrong.
+**Platform labels are `iOS`, `Android` and `Both`** (`PLATFORM_LABEL` in `lib/build-format.ts`, #992). Before #992
+the badge showed the API's lowercase value through CSS `capitalize`, which read "Ios".
 
 The Runs filter chip is the only Badge holding a control. The ✕ is a real `Button` (`ghost`) with its own name
 ("Show runs of every build, not only …"): a 20px square, `rounded-md` (6px), `--accent` fill on hover, the shared

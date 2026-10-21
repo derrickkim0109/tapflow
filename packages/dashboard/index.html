@@ -5,6 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <title>tapflow</title>
+    <!-- Link previews, the same banner as tapflow.dev. Relative on purpose: each team serves this from its own relay,
+         at an address no build knows, and it should not depend on an outside site. A preview needs a relay the
+         chat app's crawler can reach, and a crawler that only takes absolute URLs shows none. -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="tapflow" />
+    <meta property="og:description" content="Test your team's iOS and Android builds in the browser." />
+    <meta property="og:image" content="/og-image.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="The tapflow logo on a blue gradient" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="/og-image.jpg" />
     <script>
       // Applies the theme before first paint, so a dark-mode reader does not see a light flash while the bundle loads.
       // next-themes renders its own script for this, but React never runs a script it renders on the client, and this

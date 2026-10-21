@@ -232,7 +232,7 @@ export function useNetworkControl({ sessionId, send, supported, deviceReady, han
         if (msg.requestId === requestId.current) {
           requestId.current = null
           setPending(false)
-          // Announced rather than swallowed. `toast.error` renders with `role="alert"`, so this is
+          // Announced rather than swallowed. A toast lands in sonner's polite live region, so this is
           // also the only thing that tells a screen-reader user the click went nowhere.
           onErrorRef.current?.(msg.message)
         }

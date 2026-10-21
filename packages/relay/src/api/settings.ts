@@ -107,7 +107,9 @@ export function handleUpdateSettings(
     const updates: string[] = ['updated_at = datetime(\'now\')']
     const params: unknown[] = []
 
-    if (fields.team_name) { updates.push('team_name = ?'); params.push(fields.team_name) }
+    // Trimmed, and a blank one is skipped like an empty one: a name of only spaces showed blank in the sidebar.
+    const teamName = fields.team_name?.trim()
+    if (teamName) { updates.push('team_name = ?'); params.push(teamName) }
     for (const [field, n] of videoFields) { updates.push(`${field} = ?`); params.push(n) }
     if (logoPath) { updates.push('logo_path = ?'); params.push(logoPath) }
 

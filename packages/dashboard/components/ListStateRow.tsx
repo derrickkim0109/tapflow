@@ -11,6 +11,9 @@ interface Props {
   noun: string
   emptyText: string
   onRetry: () => void
+  /** One real row's height in px, which the skeleton rows take so the table does not jump when the rows
+   *  arrive. The default is a row of 28px controls (Tokens, Team); a table whose rows are another height passes its own. */
+  rowHeight?: number
 }
 
 /**
@@ -21,10 +24,10 @@ interface Props {
  * row the skeleton in the same commit. Focus the retry took is put back by `useFocusAfterSwap` on
  * the table body.
  */
-export function ListStateRow({ view, colSpan, noun, emptyText, onRetry }: Props) {
+export function ListStateRow({ view, colSpan, noun, emptyText, onRetry, rowHeight = 60 }: Props) {
   const showSkeleton = useShownAfter(view === 'loading', SKELETON_DELAY_MS)
   if (view === 'list') return null
-  if (view === 'loading') return <SkeletonRows colSpan={colSpan} shown={showSkeleton} />
+  if (view === 'loading') return <SkeletonRows colSpan={colSpan} shown={showSkeleton} rowHeight={rowHeight} />
   return (
     <TableRow className="hover:bg-transparent">
       <TableCell colSpan={colSpan} className="h-20 text-center text-muted-foreground">
@@ -41,6 +44,8 @@ export function ListStateRow({ view, colSpan, noun, emptyText, onRetry }: Props)
 
 const SKELETON_ROWS = 3
 const BAR_WIDTHS = ['w-28', 'w-40', 'w-16', 'w-20']
+/** `TableCell`'s `p-4`, top and bottom. */
+const CELL_PADDING = 32
 
 /**
  * Rows shaped like the ones on their way, in place of a "Loading…" line. **The words stay, for a
@@ -48,11 +53,12 @@ const BAR_WIDTHS = ['w-28', 'w-40', 'w-16', 'w-20']
  *
  * Nothing visible for the first `SKELETON_DELAY_MS` — a relay on the LAN usually answers sooner, and
  * bars that appear and vanish within a frame read as a flicker. Until then the one row keeps the
- * height the loading line had, so an answer of "none" does not grow the table. The last column holds
- * row actions in every table using this (an icon button in Tokens, two text buttons in Team), all
- * `h-7`, so its bar is that height and a skeleton row is as tall as a real one.
+ * height the loading line had, so an answer of "none" does not grow the table. Once shown, a row is as
+ * tall as a real one because the table says how tall that is (`rowHeight`), not because a bar is shaped
+ * like whatever its last column holds: that held in Tokens and Team, whose last column is 28px actions,
+ * and made Flow Runs' skeleton rows 6px taller than its runs, whose last column is the duration.
  */
-function SkeletonRows({ colSpan, shown }: { colSpan: number; shown: boolean }) {
+function SkeletonRows({ colSpan, shown, rowHeight }: { colSpan: number; shown: boolean; rowHeight: number }) {
   return (
     <>
       {Array.from({ length: shown ? SKELETON_ROWS : 1 }, (_, row) => (
@@ -61,10 +67,11 @@ function SkeletonRows({ colSpan, shown }: { colSpan: number; shown: boolean }) {
             <TableCell key={col} className={shown ? undefined : 'h-20'}>
               {row === 0 && col === 0 && <span className="sr-only">Loading…</span>}
               {shown && (
-                <Skeleton
-                  aria-hidden
-                  className={col === colSpan - 1 ? 'h-7 w-7' : `h-4 ${BAR_WIDTHS[col % BAR_WIDTHS.length]}`}
-                />
+                // The height goes inside the cell, not on it: a cell's own `height` counts the row border
+                // differently, and measured in Chromium that made a Tokens skeleton row 1px short of a real one.
+                <div className="flex items-center" style={{ height: rowHeight - CELL_PADDING }}>
+                  <Skeleton aria-hidden className={`h-4 ${BAR_WIDTHS[col % BAR_WIDTHS.length]}`} />
+                </div>
               )}
             </TableCell>
           ))}

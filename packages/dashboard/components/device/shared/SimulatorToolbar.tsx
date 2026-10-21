@@ -182,10 +182,9 @@ function reasonCaveat(reason: NetworkUnavailableReason | undefined): string {
     case 'filter-unavailable':
       return ' This Mac is not set up to take devices off the network — see the network control guide.';
     case 'enforcement-lost':
-      // **Short, because the toast carries this one.** `onError` renders `role="alert"`, which
-      // interrupts the polite `role="status"` region beside it in the same commit — so saying the
-      // whole thing twice drops the position half for anyone who hears the alert first, and repeats
-      // the sentence for anyone who hears both.
+      // **Short, because the toast carries this one.** `onError` puts it in sonner's polite live
+      // region, beside the polite `role="status"` region here in the same commit — so saying the
+      // whole thing in both would read it out twice.
       return ' It went back on the network on its own.';
     case 'hooks-not-installed':
       return ' tapflow cannot tell this app it is off the network.';

@@ -1,8 +1,7 @@
 import { lazy, Suspense, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
-import { Toaster, type ToasterProps } from 'sonner'
-import { useTheme } from 'next-themes'
+import { Toaster } from '@/components/ui/sonner'
 import { DashboardLayout } from './layouts/DashboardLayout'
 import { Login } from './pages/Login'
 import { makeQueryClient } from '@/lib/queryClient'
@@ -32,7 +31,6 @@ const suspended = (el: ReactNode) => <Suspense fallback={pageFallback}>{el}</Sus
 const queryClient = makeQueryClient()
 
 export function App() {
-  const { resolvedTheme } = useTheme()
   return (
     <QueryClientProvider client={queryClient}>
     <BrowserRouter>
@@ -55,7 +53,8 @@ export function App() {
         </Route>
         <Route path="*" element={suspended(<NotFound />)} />
       </Routes>
-      <Toaster position="bottom-right" richColors theme={resolvedTheme as ToasterProps['theme']} />
+      {/* No theme prop: the wrapper reads next-themes itself. */}
+      <Toaster position="bottom-right" richColors />
     </BrowserRouter>
     </QueryClientProvider>
   )

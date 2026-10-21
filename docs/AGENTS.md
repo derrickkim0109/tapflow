@@ -32,9 +32,6 @@ tapflow.dev는 `main`이 아니라 `docs-production` 브랜치에서 배포되�
 그래서 여기서 머지한 문서는 다음 릴리스 때 사이트에 나오고, 그 전에는 `main`의 Vercel Preview에서만 보인다.
 미발행 기능을 미리 문서에 적어도 되는 건 이 때문이다.
 
-단, 이 전환 후 첫 릴리스 전까지는 production이 아직 `main`이다(`/release` §11). 그 사이에 머지한 문서는
-바로 공개된다.
-
 이미 발행된 기능의 문서 오류는 릴리스를 기다리지 않고 내보낼 수 있다. 절차(체리픽)는 CONTRIBUTING.md의
 "Docs follow releases"에 있다.
 

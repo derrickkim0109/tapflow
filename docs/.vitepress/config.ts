@@ -369,7 +369,12 @@ export default withMermaid(defineConfig({
           'Open-source, self-hosted alternative to Appetize and BrowserStack App Live. Run iOS & Android simulators in the browser — no data leaving your network.',
       },
     ],
-    ['meta', { property: 'og:image', content: `${SITE}/demo-thumbnail.png` }],
+    // A 1200×630 banner made for link previews. Not demo-thumbnail.png: that one is 1920×1080, the video's
+    // poster and the npm README's image, and a crawler crops it.
+    ['meta', { property: 'og:image', content: `${SITE}/og-image.jpg` }],
+    ['meta', { property: 'og:image:width', content: '1200' }],
+    ['meta', { property: 'og:image:height', content: '630' }],
+    ['meta', { property: 'og:image:alt', content: 'The tapflow logo on a blue gradient' }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:title', content: 'tapflow — Self-hosted simulator streaming for your whole team' }],
     [
@@ -380,7 +385,7 @@ export default withMermaid(defineConfig({
           'Open-source, self-hosted alternative to Appetize and BrowserStack App Live. Run iOS & Android simulators in the browser — no data leaving your network.',
       },
     ],
-    ['meta', { name: 'twitter:image', content: `${SITE}/demo-thumbnail.png` }],
+    ['meta', { name: 'twitter:image', content: `${SITE}/og-image.jpg` }],
   ],
 
   markdown: {

@@ -116,8 +116,8 @@ export function AppCenter() {
   const [retrying, setRetrying] = useState(false)
 
   // **Announced once by the toast, and stated for as long as it is true by the line below it.**
-  // The toast is the announcement: sonner renders each one as its own `role="status"`, so saying
-  // the same sentence in the page's status region as well read it out twice.
+  // The toast is the announcement: sonner's toast list is a polite live region (it sets no `role` on a
+  // toast), so saying the same sentence in the page's status region as well read it out twice.
   //
   // **It fires once, not once per attempt** — while `isRefetchError` stays true these deps do not
   // change, so a relay that stays down raises nothing further. An earlier comment here claimed the

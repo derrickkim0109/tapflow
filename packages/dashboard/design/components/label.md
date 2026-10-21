@@ -28,7 +28,7 @@ text      hint (optional)
 
 A standing instruction *under* the control is not part of Label. It is `FieldHint`
 (`components/ui/field-hint.tsx`, `text-sm --muted-foreground`, 6 call sites) and belongs to the Field assembly —
-see the Field row in DESIGN.md.
+see [field.md](./field.md).
 
 Label is not interactive. It has no `hover`, `focus` or `disabled` look of its own; clicking it moves focus to
 the control it names (`htmlFor`).
@@ -64,7 +64,7 @@ renders. Do not draw a disabled Label; a disabled field is shown by its control 
   when the control has no other name: `UploadBuildDialog`'s File and Status labels name nothing today.
 - Above a control the label sits in the field assembly: `Label` + control + `FieldHint` or error, `gap-2` (28 of
   33). The outliers are `AddAppDialog` (`gap-1.5`, 3) and `VideoStorageCard` (`gap-3`, 2, where the label shares
-  a row with the slider's value). See the Field row in DESIGN.md.
+  a row with the slider's value). See [field.md](./field.md).
 - Do not restyle the text per screen. The one override in code (`text-sm cursor-pointer whitespace-nowrap`
   on Full reset) keeps the same size and only stops the toolbar label wrapping.
 

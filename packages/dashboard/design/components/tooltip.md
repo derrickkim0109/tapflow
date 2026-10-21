@@ -98,7 +98,6 @@ tooltip with no delay. Moving the pointer onto the tooltip keeps it open.
   `aria-disabled` and stays enabled, as the toolbar's posture, restart, recording, network and software keyboard
   buttons do. An overloaded Mac card instead wraps its disabled button in a focusable `span`: the tooltip opens, but
   that stop has no role and no name, and the reason exists only in the tooltip (tracked in #979).
-- No tooltip on touch: Radix does not open one from a tap.
 
 ## Figma
 

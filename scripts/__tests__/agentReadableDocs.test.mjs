@@ -498,7 +498,7 @@ describe('the site has one origin', () => {
     // The five sites that used to spell the origin: sitemap, JSON-LD, og:url, og:image, twitter:image.
     expect(config).toContain('hostname: SITE')
     expect(config).toContain("{ property: 'og:url', content: SITE }")
-    expect(config.match(/\$\{SITE\}\/demo-thumbnail\.png/g)).toHaveLength(2)
+    expect(config.match(/\$\{SITE\}\/og-image\.jpg/g)).toHaveLength(2)
   })
 })
 

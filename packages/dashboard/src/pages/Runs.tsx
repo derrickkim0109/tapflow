@@ -167,6 +167,8 @@ export function Runs() {
             <ListStateRow
               view={view}
               colSpan={6}
+              // A run's row is its 22px status badge plus the cell padding.
+              rowHeight={54}
               noun="flow runs"
               emptyText={onAPage ? 'No runs on this page any more. Newer goes back to the newest runs.' : emptyText(source, Boolean(status || flow || build !== undefined))}
               onRetry={() => void runsQuery.refetch()}

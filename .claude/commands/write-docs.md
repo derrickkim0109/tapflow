@@ -159,7 +159,7 @@ URL 접두사가 곧 섹션이다. slug는 UI 위치가 아니라 대상 이름�
 ## 6. 미디어
 
 - 정적인 상태(설정 패널, 토글 위치)는 스크린샷으로, 움직임이나 순서가 핵심인 것은 영상으로 보여 준다. 터미널 출력은 이미지 대신 텍스트로 쓴다.
-- **위치(필수): 영상(mp4/webm/mov)은 `docs/public/media/`에 두고** 본문에서는 `/media/{파일}`로 가리킨다. `scripts/__tests__/docsMedia.test.mjs`가 강제한다. 이미지는 대상이 아니다. 특히 `docs/public/demo-thumbnail.png`는 옮기지 않는다. npm에 배포된 `packages/cli/README.md`가 raw.githubusercontent.com 주소로 불러오고 `config.ts`의 `og:image`로도 쓰여서, 리다이렉트로 살릴 수 없기 때문이다.
+- **위치(필수): 영상(mp4/webm/mov)은 `docs/public/media/`에 두고** 본문에서는 `/media/{파일}`로 가리킨다. `scripts/__tests__/docsMedia.test.mjs`가 강제한다. 이미지는 대상이 아니다. 특히 `docs/public/demo-thumbnail.png`는 옮기지 않는다. npm에 배포된 `packages/cli/README.md`가 raw.githubusercontent.com 주소로 불러와서 리다이렉트로 살릴 수 없기 때문이다. 링크 미리보기용 `docs/public/og-image.jpg`(1200×630, `config.ts`의 `og:image`)는 사정이 다르다. 공유된 미리보기가 tapflow.dev 주소를 저장해 두므로 옮기려면 `moves.json`의 `files`에 리다이렉트를 넣어야 한다.
 - 권고(검사하지 않음): GIF보다 **짧은 무음 루프 영상 + poster 이미지**를 쓴다. 대략 5~15초, 한 클립에 동작 하나, 깜빡임 없이 만든다. 크기는 클립당 약 2MB 이하를 목표로 한다. 소개·설정 영상(`tapflow-demo.mp4`, `tapflow-setup.mp4`)처럼 성격상 긴 영상은 예외다. 현재 `docs/.vitepress/theme/VideoPlayer.vue`는 `src`/`poster`와 `controls`만 지원한다(muted/loop/autoplay 없음).
 - **본문만 읽어도 이해되어야 한다.** 영상이 보여 주는 내용을 옆 문장이 말하고, 단계는 영상 없이도 따라갈 수 있어야 한다.
 - 영상을 옮기면 옛 경로를 `docs/.vitepress/moves.json`의 `files`에 추가한다.

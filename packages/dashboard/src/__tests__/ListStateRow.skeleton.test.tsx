@@ -9,11 +9,11 @@ import type { ListView } from '@/lib/list-view'
 
 const bars = () => document.querySelectorAll('.animate-pulse')
 
-function renderRow(view: ListView) {
+function renderRow(view: ListView, rowHeight?: number) {
   return render(
     <Table>
       <TableBody>
-        <ListStateRow view={view} colSpan={5} noun="tokens" emptyText="No tokens yet." onRetry={() => {}} />
+        <ListStateRow view={view} colSpan={5} noun="tokens" emptyText="No tokens yet." onRetry={() => {}} rowHeight={rowHeight} />
       </TableBody>
     </Table>,
   )
@@ -36,6 +36,25 @@ describe('ListStateRow loading view', () => {
     expect(screen.getAllByRole('row')).toHaveLength(3)
     expect(bars()).toHaveLength(3 * 5)
     expect(screen.getByText('Loading…')).toBeInTheDocument()
+  })
+
+  // jsdom lays nothing out, so these hold what decides the height: the box each bar sits in is the row's height less
+  // the cell's 32px of padding, and no bar is taller than that. Measured in Chromium with the dashboard's CSS, a box
+  // of 28px gives a 61px row, as a Tokens row is, and 22px gives 55px against a run's 54.5px.
+  const boxHeights = () => [...bars()].map((b) => (b.parentElement as HTMLElement).style.height)
+
+  it('makes each skeleton row as tall as a row of 28px controls by default', () => {
+    renderRow('loading')
+    act(() => { vi.advanceTimersByTime(SKELETON_DELAY_MS) })
+    expect(new Set(boxHeights())).toEqual(new Set(['28px']))
+    for (const b of bars()) expect(b).toHaveClass('h-4')
+  })
+
+  it('takes the height a table gives it, with no bar taller than that', () => {
+    renderRow('loading', 54)
+    act(() => { vi.advanceTimersByTime(SKELETON_DELAY_MS) })
+    expect(new Set(boxHeights())).toEqual(new Set(['22px']))
+    for (const b of bars()) expect(b).not.toHaveClass('h-7')
   })
 
   it('drops the skeleton when the answer arrives', () => {

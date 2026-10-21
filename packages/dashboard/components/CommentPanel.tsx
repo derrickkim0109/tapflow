@@ -58,6 +58,8 @@ export function CommentPanel({ buildId }: Props) {
   const [submitting, setSubmitting] = useState(false)
   const [fileError, setFileError] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
+  const bodyRef = useRef<HTMLTextAreaElement>(null)
+  const formRef = useRef<HTMLFormElement>(null)
   const commentRefs = useRef<Record<number, HTMLDivElement | null>>({})
 
   // Read through Query like every other list here (#845); a failure is its own line, not "No comments yet".
@@ -98,22 +100,36 @@ export function CommentPanel({ buildId }: Props) {
 
   function handleFileChange(f: File) {
     setFileError('')
-    if (!ALLOWED_TYPES.includes(f.type)) { setFileError('Only png, jpg, webp allowed'); return }
-    if (f.size > MAX_SIZE_BYTES) { setFileError('Max 5MB'); return }
+    // A rejected pick replaces the earlier one rather than leaving it to be posted under the error.
+    if (!ALLOWED_TYPES.includes(f.type)) { setFile(null); setFileError('Only png, jpg, webp allowed'); return }
+    if (f.size > MAX_SIZE_BYTES) { setFile(null); setFileError('Max 5MB'); return }
     setFile(f)
   }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    if (!body.trim() && !file) return
+    if (submitting || (!body.trim() && !file)) return
     setSubmitting(true)
     const form = new FormData()
     form.append('build_id', String(buildId))
     form.append('body', body)
     if (file) form.append('attachment', file)
-    const res = await fetch('/api/v1/comments', { method: 'POST', credentials: 'include', body: form })
-    if (res.ok) { setBody(''); setFile(null); load() }
-    setSubmitting(false)
+    // `finally`, because a fetch that throws (the relay restarting, the network gone) would otherwise leave Post
+    // disabled until the panel remounts. What was written stays in the field either way, to try again.
+    try {
+      const res = await fetch('/api/v1/comments', { method: 'POST', credentials: 'include', body: form })
+      if (!res.ok) throw new Error(String(res.status))
+      setBody(''); setFile(null); setFileError(''); load()
+      // The field is empty now, so Post becomes disabled and would drop a keyboard user's focus on <body>; the
+      // field is where the next comment starts. Only from the composer, though: someone who clicked into the
+      // device while an image uploaded keeps typing there.
+      const active = document.activeElement
+      if (active === document.body || formRef.current?.contains(active)) bodyRef.current?.focus()
+    } catch {
+      toast.error('Could not post the comment. Try again.')
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const groups = groupByDate(comments)
@@ -202,11 +218,12 @@ export function CommentPanel({ buildId }: Props) {
       </ScrollArea>
 
       <div className="pb-1">
-      <form onSubmit={handleSubmit}>
+      <form ref={formRef} onSubmit={handleSubmit}>
         {/* `rounded-md` (6px), the same as the list above it — `rounded-xl` is 12px and is not on this
           scale at all, so the two boxes in one column disagreed by 6px. DESIGN.md's md is the form radius. */}
       <div className="rounded-md border border-input bg-background ring-offset-background transition-shadow focus-within:outline-none focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
           <Textarea
+            ref={bodyRef}
             // The placeholder is a hint, not a name: it is gone the moment anyone types, leaving an edit
             // box a screen reader can only call "text area".
             aria-label="Comment"
@@ -242,15 +259,19 @@ export function CommentPanel({ buildId }: Props) {
               type="file"
               accept="image/png,image/jpeg,image/webp"
               className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileChange(f) }}
+              // Cleared after each pick, or picking the same image again fires no change.
+              onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) handleFileChange(f) }}
             />
             <div className="flex-1" />
             <Button
               type="submit"
               size="icon"
-              className="h-7 w-7 rounded-full"
+              // Busy is `aria-disabled`, not `disabled`: a focused button that becomes disabled drops focus on
+              // <body>, so a failed post would leave a keyboard user nowhere to try again from.
+              className="h-7 w-7 rounded-full aria-disabled:cursor-not-allowed aria-disabled:opacity-50"
               aria-label="Post comment"
-              disabled={submitting || (!body.trim() && !file)}
+              aria-disabled={submitting}
+              disabled={!submitting && !body.trim() && !file}
             >
               <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
             </Button>

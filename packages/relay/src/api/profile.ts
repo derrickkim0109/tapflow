@@ -62,7 +62,9 @@ export function handleUpdateProfile(
     const updates: string[] = []
     const params: unknown[] = []
 
-    if (fields.display_name !== undefined) { updates.push('display_name = ?'); params.push(fields.display_name || null) }
+    // Trimmed, as invitations.ts does: a name of only spaces is stored as NULL, which `/me`, comments, builds and
+    // runs turn into the email's local part, rather than as a blank name and a blank avatar.
+    if (fields.display_name !== undefined) { updates.push('display_name = ?'); params.push(fields.display_name.trim() || null) }
     if (avatarPath) { updates.push('avatar_url = ?'); params.push(`/uploads/avatars/${path.basename(avatarPath)}`) }
 
     if (updates.length === 0) return json(res, 400, { error: 'Nothing to update' })

@@ -104,6 +104,25 @@ export default tseslint.config(
             },
           ])),
       ],
+      // **Toasts mount through the shadcn wrapper** (`components/ui/sonner.tsx`), so the toast's look lives in the
+      // design system's one place. App.tsx imported sonner's `Toaster` directly for months, and the wrapper's icons,
+      // colors and shadow never reached the screen while the spec and the Figma file were drawn from them.
+      // `toast()` itself still comes from 'sonner', as shadcn's docs do it.
+      'no-restricted-imports': ['error', {
+        paths: [{
+          name: 'sonner',
+          importNames: ['Toaster'],
+          message: "Mount the shadcn wrapper: import { Toaster } from '@/components/ui/sonner'.",
+        }],
+      }],
+    },
+  },
+
+  // The wrapper is the one file that mounts sonner's own Toaster.
+  {
+    files: ['packages/dashboard/components/ui/sonner.tsx'],
+    rules: {
+      'no-restricted-imports': 'off',
     },
   },
 

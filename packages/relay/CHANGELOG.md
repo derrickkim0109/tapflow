@@ -1,5 +1,22 @@
 # @tapflowio/relay
 
+## 0.28.1
+
+### Patch Changes
+
+- 5f7c3c8: With the dashboard sidebar collapsed to icons, the account button at its foot is named after you. It shows only your avatar there, and with no picture it was announced by its initial alone; your name and email are now kept for assistive technology while staying hidden on screen.
+- 03376b0: The comment box in a QA session recovers from a failed post. If the relay could not be reached, Post stayed greyed out; if it refused the comment, nothing was said. Either way it now says the comment was not posted and keeps the text to try again. Picking an image also behaves: a rejected pick no longer leaves the earlier image attached, and the same image can be picked again after posting.
+- ded265b: The dashboard's sidebar closes on a phone once you choose a page in it or go back. Below 768px it opens as a sheet, and following a link left the sheet covering the page it had just opened.
+- 841397a: Dashboard: a link to the dashboard shows the tapflow banner as its preview image (`og:image`, 1200×630, served by the relay itself), with a title and description, in chat apps whose crawler can reach the relay.
+- 41c45c4: Leaving a QA session now shuts its device down. Going to another page with a device running was meant to stop it, but the message was dropped as the page's connection closed, so the device kept running, unused, until the relay's idle timeout (5 minutes by default).
+- 9548211: Flow Runs no longer jumps when its runs finish loading. The placeholder rows it shows while waiting were 6px taller than a run, so the table shrank as the runs arrived.
+- d3c30f7: Dashboard notifications are set in the dashboard's font (Inter) on every system, instead of each operating system's own interface font.
+- 97f50f0: Dashboard notifications now use the dashboard's own toast styling: shadcn's current Toaster. Their icons are the same outline icons as the rest of the dashboard, and the "uploading" toast takes the dashboard's popover colors and corner radius. Success, error, warning and info keep their colored backgrounds.
+- 3b5c4df: The App Center's version search matches `%` and `_` as typed. They were read as wildcards, so searching for `%` listed every build and `1_0` also found `1.0.5`.
+- a38fe51: A nickname or team name of only spaces is no longer saved. Settings refuses it with the message an empty one gets, and the relay trims both: a blank nickname now shows as the part of your email before the `@` in the sidebar and on comments, and a blank team name leaves the current one. Before, the name showed blank in the sidebar and on comments, and the avatar was an empty colored circle. A name already saved as spaces stays blank until it is saved again.
+  - @tapflowio/protocol@0.28.1
+  - @tapflowio/agent-core@0.28.1
+
 ## 0.28.0
 
 ### Minor Changes

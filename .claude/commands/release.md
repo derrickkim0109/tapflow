@@ -95,8 +95,10 @@ model: claude-opus-5
   ver=$(node -p "require('./packages/cli/package.json').version")
   prev=$(git describe --tags --abbrev=0 --match 'v*' | sed 's/^v//')
   found=0
+  # `$(0)`, not the usual spelling: this file is a command, and a dollar followed by a digit is
+  # replaced with that argument before anyone reads it. `/release 0.28.1` turned it into `0.28.1`.
   for f in CHANGELOG.md packages/*/CHANGELOG.md; do
-    sec=$(awk -v v="$ver" -v p="$prev" '$0 ~ "^#+ \\[?" v {s=1; next} $0 ~ "^#+ \\[?" p {s=0} s' "$f") \
+    sec=$(awk -v v="$ver" -v p="$prev" '$(0) ~ "^#+ \\[?" v {s=1; next} $(0) ~ "^#+ \\[?" p {s=0} s' "$f") \
       || { echo "could not read $f"; exit 1; }
     [ -n "$sec" ] || continue
     found=$((found + 1))
@@ -168,10 +170,10 @@ model: claude-opus-5
 - 워크플로우가 처리하는 것: `pnpm build` → `changeset publish`(공개 패키지 전부, 단일 경로) → GitHub Release 생성. changesets publish는 위상 정렬 없이 동시 발행하므로, 신규 패키지가 있으면 위 7번의 seed publish 전제를 반드시 지킨다.
 - 같은 워크플로의 마지막 단계가 최신 stable 태그의 트리(워크플로 파일 제외)를 `docs-production`에 fast-forward로 push한다. 로그에 `move`가 찍혔는지,
   tapflow.dev가 새 버전 문서로 바뀌었는지 확인한다(Vercel production 배포는 1~2분). `skip:`이면 이유가 같이 찍힌다.
-  - **최초 1회:** 이 단계가 처음 돌면 `docs-production` 브랜치가 생긴다. 그 Preview 배포를 확인한 뒤 사용자가
-    Vercel 프로젝트의 Production Branch를 `main` → `docs-production`으로 바꾸고 Redeploy한다. 이어서 브랜치에
-    삭제 금지 ruleset(bypass 없음)을 만든다. 끝나면 이 하위 항목과, CONTRIBUTING "Docs follow releases"·
-    `docs/AGENTS.md`의 "첫 릴리스 전까지" 단서를 지운다.
+  - 배포가 안 바뀌면 Vercel 쪽 두 설정을 본다. Production Branch는 Settings → Environments → Production →
+    Branch Tracking에서 `docs-production`이어야 한다(Git 메뉴에는 없다). Ignored Build Step은
+    `git rev-parse -q --verify HEAD^ >/dev/null && git diff HEAD^ HEAD --quiet -- ':(top)docs'` — docs 변경이 없는
+    릴리스는 건너뛰는 게 정상이다. v0.28.0에서 처음 전환했다.
 - npm 인증은 **GitHub OIDC(trusted publishing)** 로 동작한다 — NPM_TOKEN 등 별도 토큰이 필요 없다.
 - **발행 확인은 폴링이고, 레지스트리를 직접 읽는다.** v0.20.0에서 예전 확인 셋이 **전부 참이면서 릴리즈는
   설치 불가**였다. 워크플로우 로그는 9개 전부 `published successfully`라고 말했고, 그 시점에 둘은 13분 뒤에야

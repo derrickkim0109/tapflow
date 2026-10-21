@@ -8,7 +8,9 @@
 //
 // Images are not covered. `docs/public/demo-thumbnail.png` stays at the root on purpose:
 // `packages/cli/README.md` (published to npm) loads it through raw.githubusercontent.com, which no
-// Vercel redirect can reach, and `config.ts` uses it as the `og:image`.
+// Vercel redirect can reach, and the introduction page uses it as the demo video's poster.
+// `docs/public/og-image.jpg`, the link-preview banner, is a different case: crawlers fetch it from
+// tapflow.dev, which a redirect can reach, so moving it means adding a `files` entry to `moves.json`.
 //
 // The absence assertion is paired (`contributing/test-and-guard-coverage.md` rule 2): the fixture
 // plants a video outside the folder, in upper case and nested, and it must be reported. The real

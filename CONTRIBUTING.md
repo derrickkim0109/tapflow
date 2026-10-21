@@ -88,13 +88,12 @@ tapflow is built with coding agents, and AI-assisted contributions are welcome. 
 
 ### Docs follow releases
 
-tapflow.dev deploys from the `docs-production` branch, not from `main`. This takes effect from the
-first release after the change, when the branch is created and Vercel's production branch is
-switched to it (`/release` §11). A self-hosted user runs what npm published, and main's docs
+tapflow.dev deploys from the `docs-production` branch, not from `main`, since v0.28.0. A self-hosted user runs what npm published, and main's docs
 describe features that have not been published yet. The last step of `.github/workflows/release.yml`
 moves `docs-production` to each new stable release. Prereleases and backports leave it where it is
-(`scripts/docs-production.mjs`). Every push to `main` still builds a Vercel Preview, so unreleased
-docs can be checked there.
+(`scripts/docs-production.mjs`). The branch cannot be deleted, by anyone: the `protect-docs-production`
+ruleset has no bypass. A push to `main` that changes `docs/` still builds a Vercel Preview, so
+unreleased docs can be checked there; a push that does not is skipped by the Ignored Build Step.
 
 **A docs fix for something already released can go out before the next release.** Merge it to `main`
 first, then cherry-pick that commit onto `docs-production` and push. Read the diff before pushing:

@@ -36,13 +36,13 @@ import { VideoStorageCard } from '@/components/settings/VideoStorageCard'
 
 
 const workspaceSchema = z.object({
-  teamName: z.string().min(1, 'Team name is required'),
+  teamName: z.string().trim().min(1, 'Team name is required'),
   logo: z.instanceof(File).nullable().optional(),
 })
 type WorkspaceData = z.infer<typeof workspaceSchema>
 
 const profileSchema = z.object({
-  displayName: z.string().min(1, 'Display name is required'),
+  displayName: z.string().trim().min(1, 'Display name is required'),
   avatar: z.instanceof(File).nullable().optional(),
 })
 type ProfileData = z.infer<typeof profileSchema>
@@ -85,6 +85,9 @@ export function DefaultSettings() {
   })
 
   async function onWorkspaceSave(data: WorkspaceData) {
+    // The schema trims what is sent, not the field. Put the trimmed value in the field now, before the request,
+    // so nothing writes to it after an await and an edit made while the save is in flight is never overwritten.
+    workspaceForm.setValue('teamName', data.teamName)
     const form = new FormData()
     form.append('team_name', data.teamName)
     if (data.logo) form.append('logo', data.logo)
@@ -113,6 +116,7 @@ export function DefaultSettings() {
   })
 
   async function onProfileSave(data: ProfileData) {
+    profileForm.setValue('displayName', data.displayName)
     const form = new FormData()
     form.append('display_name', data.displayName)
     if (data.avatar) form.append('avatar', data.avatar)

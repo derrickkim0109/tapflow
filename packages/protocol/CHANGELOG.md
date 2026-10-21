@@ -1,5 +1,7 @@
 # @tapflowio/protocol
 
+## 0.28.1
+
 ## 0.28.0
 
 ### Minor Changes

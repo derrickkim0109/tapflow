@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useRelay } from '@/hooks/useRelay'
 import type { DeviceSummary, BrowserInbound, SessionInfo } from '@/lib/types'
 import type { FormFactor } from '@tapflowio/protocol'
@@ -49,8 +49,12 @@ export function useAgentSession(os: string) {
   // optional by contract and can never be gated at the door. A consumer that later wants to correlate a
   // shutdown adds the id at the sender it cares about. See 「Lifecycle correlation」 in protocol/AGENTS.md.
   //
-  // unmount cleanup — runs before useRelay's ws.close
-  useEffect(() => {
+  // Unmount teardown. **A layout effect, so it runs before `useRelay` closes the socket.** React runs passive
+  // cleanups in declaration order and `useRelay`'s comes first, so as a `useEffect` this send found the socket
+  // already CLOSING and was dropped: leaving the page left the device running until the relay's idle timeout.
+  // Layout cleanups run during the commit, before any passive one. They also run when React hides the page
+  // (Suspense, Activity), which would shut the device down under a page still shown; nothing hides it today.
+  useLayoutEffect(() => {
     return () => {
       const { sessionId, deviceId: dId } = activeSessionRef.current
       if (sessionId && dId) {

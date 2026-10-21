@@ -42,7 +42,7 @@ All color values are defined as CSS variables in `src/index.css`. Tailwind refer
 | `--primary` | `#171717` | `#fafafa` | Primary CTA button, active link |
 | `--primary-foreground` | `#ffffff` | `#171717` | Text on primary surfaces |
 | `--ring` | `#171717` | `#fafafa` | Focus ring |
-| `--sidebar-ring` | `#0070f3` | `#0070f3` | Sidebar focus ring (link blue) |
+| `--sidebar-ring` | `#0076f5` | `#0076f5` | Sidebar focus ring (link blue) |
 
 ### Semantic
 
@@ -138,7 +138,7 @@ Default card padding: `p-6` (24px). Dense contexts: `p-4` (16px). Sidebar areas:
 | Tailwind class | Value | Use |
 |----------------|-------|-----|
 | `z-sidebar` | 10 | Sidebar |
-| `z-tooltip` | 100 | Tooltips |
+| `z-tooltip` | 100 | Tooltips — **defined, used nowhere**; Tooltip uses `z-[50]` |
 | `z-overlay` | 200 | Modal dim background — **defined, used nowhere**; Dialog and AlertDialog use `z-50` |
 | `z-modal` | 300 | Modal / dialog content — **defined, used nowhere**; Dialog and AlertDialog use `z-50` |
 
@@ -153,7 +153,7 @@ Card hierarchy is expressed only through `shadow-card-{n}` tokens. All shadows f
 | 2 | `shadow-card-2` | soft drop + inset | **Default** — settings sections, the release list |
 | 3 | `shadow-card-3` | stacked drop + inset | Not used yet |
 | 4 | `shadow-card-4` | float stack + inset | The single card of an entry screen (Login, Setup, Invite, Reset password) |
-| modal | `shadow-modal` | 3-layer + inset | **Defined, used nowhere.** Overlays use Tailwind shadows instead: `shadow-lg` for Dialog, AlertDialog, Sheet, toasts and the DropdownMenu submenu; `shadow-md` for DropdownMenu and Select content and the MacResources chart tooltip |
+| modal | `shadow-modal` | 3-layer + inset | **Defined, used nowhere.** Overlays use Tailwind shadows instead: `shadow-lg` for Dialog, AlertDialog, Sheet and the DropdownMenu submenu; sonner's own `0 4px 12px` black at 10% for toasts; `shadow-md` for DropdownMenu and Select content and the MacResources chart tooltip |
 
 Apply via the `level` prop on the `Card` component:
 
@@ -188,7 +188,8 @@ Every interactive component uses the same state names. A component spec lists on
 
 - **Pressed is motion, not a state.** Every `<button>` and `[role="button"]` that is not `disabled` shifts down 1px
   while pressed (`translateY(1px)`, 120ms) and keeps its colors, so a pressed variant is drawn only where a
-  component adds one — `SidebarMenuButton` does (`active:bg-sidebar-accent`). The rule is global in `src/index.css`:
+  component adds one. `SidebarMenuButton` adds `active:bg-sidebar-accent`, the same fill as its hover, so it needs no
+  separate pressed drawing; as a link it does not shift. The rule is global in `src/index.css`:
 
   ```css
   button:not([aria-haspopup]):not(:disabled),
@@ -242,17 +243,17 @@ their count live in the spec, which the check holds to code. A component without
 | Tooltip | `components/ui/tooltip.tsx` | — | [tooltip.md](./design/components/tooltip.md) |
 | TechLabel | `components/ui/tech-label.tsx` | tone 2 | [tech-label.md](./design/components/tech-label.md) |
 | TabsTrigger | `components/ui/tabs.tsx` | state 4 | [tabs-trigger.md](./design/components/tabs-trigger.md) |
-| SidebarMenuButton | `components/ui/sidebar.tsx` | variant 2 × size 3 × state 5 | pending |
-| DropdownMenuItem | `components/ui/dropdown-menu.tsx` | state 3 | pending |
-| Kbd | `components/ui/kbd.tsx` | — | pending |
-| SearchInput | `components/ui/search-input.tsx` | state 3 × content 2 | pending |
-| TableRow | `components/ui/table.tsx` | type 2 × state 3 | pending |
-| Textarea | `components/ui/textarea.tsx` | state 3 × content 2 | pending |
-| Breadcrumb | `components/ui/breadcrumb.tsx` | hover 2 | pending |
-| Switch | `components/ui/switch.tsx` | checked 2 × state 3 | pending |
-| Toast | `components/ui/sonner.tsx` (`toast.*()`) | type 4 | pending |
-| Field | assembly pattern — `Label` + control + error | control 3 × hint 2 × message 2 | pending |
-| UserAvatar | `components/UserAvatar.tsx` | content 7 | pending |
+| SidebarMenuButton | `components/ui/sidebar.tsx` | variant × size × state | [sidebar-menu-button.md](./design/components/sidebar-menu-button.md) |
+| DropdownMenuItem | `components/ui/dropdown-menu.tsx` | state | [dropdown-menu-item.md](./design/components/dropdown-menu-item.md) |
+| Kbd | `components/ui/kbd.tsx` | context 2 | [kbd.md](./design/components/kbd.md) |
+| SearchInput | `components/ui/search-input.tsx` | state 3 × content 2 | [search-input.md](./design/components/search-input.md) |
+| TableRow | `components/ui/table.tsx` | type 2 × state 3 | [table-row.md](./design/components/table-row.md) |
+| Textarea | `components/ui/textarea.tsx` | state 3 × content 2 | [textarea.md](./design/components/textarea.md) |
+| Breadcrumb | `components/ui/breadcrumb.tsx` | item 3; state 3 (link only) | [breadcrumb.md](./design/components/breadcrumb.md) |
+| Switch | `components/ui/switch.tsx` | checked 2 × state 3 | [switch.md](./design/components/switch.md) |
+| Toast (sonner) | `components/ui/sonner.tsx` (`toast.*()`) | type 5 (4 + loading) | [toast.md](./design/components/toast.md) |
+| Field | assembly pattern — `Label` + control + `FieldHint` / `FieldError` | control 5 × hint 3 × message 3 | [field.md](./design/components/field.md) |
+| UserAvatar | `components/UserAvatar.tsx` | content 7 (image + 6 colors) | [user-avatar.md](./design/components/user-avatar.md) |
 
 Not in this list on purpose: components with no call site, or reachable by no device today (`form.tsx`,
 `avatar.tsx`, `CardFooter`, `Sheet`, `DropdownMenuRadioItem`, and others). Code kept for later is not
@@ -280,16 +281,6 @@ Footer: `UserAvatar` + name/email dropdown (Settings, Log out).
 ```tsx
 <TechLabel>{build.buildNumber}</TechLabel>
 ```
-
-#### UserAvatar
-
-`components/UserAvatar.tsx` — renders the `avatarUrl` image if present, otherwise the first letter of the name with a hash-based color.
-
-```tsx
-<UserAvatar name={user.displayName} avatarUrl={user.avatarUrl} size={28} />
-```
-
-The placeholder color is determined by `avatarColors(name)`.
 
 #### Theme Toggle
 
