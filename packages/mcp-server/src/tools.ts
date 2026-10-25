@@ -3,8 +3,9 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { EnvironmentStepError, parseFlow, runFlow, type FlowDriver } from '@tapflowio/flow-runner'
+import { EnvironmentStepError, isEligible, parseFlow, runFlow, type FlowDriver } from '@tapflowio/flow-runner'
 import { SessionEndedError, SessionLeftError, type TapflowClient } from './client.js'
+import { TESTING_GUIDE } from './guide.js'
 
 // Input refusal reasons that name the environment rather than the product,
 // mirroring flow-runner's ENVIRONMENTAL_INPUT_REASONS. `unsupported`,
@@ -168,6 +169,14 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
       return cb(...args)
     }) as never)) as McpServer['registerTool']
 
+  // The methodology is a tool rather than server instructions so that it costs nothing until it is asked for:
+  // instructions ride along in every session, testing or not. See guide.ts.
+  register(
+    'get_testing_guide',
+    { description: 'How to test a mobile feature with these tools: cases to cover, what cannot be tested here, how to avoid false bugs, how to save a verified flow, and the report format. Call once before testing.' },
+    async () => ok(TESTING_GUIDE),
+  )
+
   register(
     'list_builds',
     { description: 'List all apps and their builds available on the relay. Use this to find buildId before calling install_app or launch_app.' },
@@ -290,7 +299,8 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
     {
       description: 'Join a device session so you can control it. Required before boot_device, install_app, and launch_app. ' +
         'The result carries watchUrl, a dashboard page where the person you are working for can watch the device ' +
-        'live while you drive it — give them that link when you start testing.',
+        'live while you drive it — give them that link when you start testing. Before testing a feature, call ' +
+        'get_testing_guide; when done, call disconnect_device so the device is free for others.',
       inputSchema: {
         sessionId: z.string().describe('Session ID from list_devices'),
       },
@@ -326,7 +336,7 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
   register(
     'boot_device',
     {
-      description: 'Boot a simulator/emulator. Requires connect_device first. Waits up to 30 seconds for the device to be ready.',
+      description: 'Boot a simulator/emulator. Requires connect_device first. Waits up to 3 minutes for the device to be ready.',
       inputSchema: {
         sessionId: z.string().describe('Session ID from list_devices'),
         deviceId: z.string().describe('Device ID from list_devices'),
@@ -368,8 +378,9 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
     'query_ui_tree',
     {
       description:
-        'Query the accessibility tree of the current screen: interactive and text-bearing elements as ' +
-        '{ role, label, identifier, frame, enabled, rawRole }. Frames are normalized 0-1 relative to the screen. ' +
+        'Query the accessibility tree of the current screen: interactive, text-bearing or identified elements as ' +
+        '{ role, label, identifier, placeholder, frame, enabled, rawRole }. placeholder is a text field\'s hint, present only ' +
+        'when it has one; a bare-text selector falls back to it after label. Frames are normalized 0-1 relative to the screen. ' +
         'Prefer this over guessing coordinates from a screenshot: to tap an element, multiply the frame center by the ' +
         'screenshot pixel size — x = (frame.x + frame.width / 2) * screenshotWidth, y = (frame.y + frame.height / 2) * screenshotHeight — ' +
         'and pass those pixel coordinates to the tap tool.',
@@ -396,7 +407,8 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
         'file path via "path" (resolved from the MCP server process cwd). Steps: clearState / launchApp / tapOn / ' +
         'inputText / pressKey / swipe / scroll / openUrl / assertVisible / assertNotVisible. launchApp launches the ' +
         'buildId argument. When buildId is set, the build is installed before replaying (like `tapflow flow run --build`) ' +
-        'so clearState/launchApp have the app present — pass install:false to skip. Returns per-step results; on failure ' +
+        'so clearState/launchApp have the app present — pass install:false to skip. A flow whose appId differs from ' +
+        "the build's bundle id is not run and returns an error naming both. Returns per-step results; on failure " +
         'a screenshot is saved to a temp file.',
       inputSchema: {
         sessionId: z.string().describe('Session ID from list_devices (connect_device first)'),
@@ -424,6 +436,19 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
           yamlText = fs.readFileSync(resolved, 'utf-8')
         }
         const parsed = parseFlow(yamlText, flowPath ?? 'inline-flow.yaml')
+        // The same check as `flow run --build`, before the device is touched. With one flow, "skipped" leaves nothing
+        // run, which `flow run` also treats as an error rather than a pass.
+        let appCheckSkipped: string | undefined
+        if (buildId !== undefined) {
+          const build = await client.lookupBuild(buildId)
+          if (build.kind === 'not-found') return err(`run_flow: build ${buildId} not found (see list_builds)`)
+          if (build.kind === 'found') {
+            const verdict = isEligible(parsed, { build: { id: buildId, bundleId: build.bundleId } })
+            if (!verdict.ok) return err(`run_flow did not run the flow: ${verdict.message} — set the flow's appId to the build's, remove it, or pick another build`)
+          } else if (parsed.appId !== undefined) {
+            appCheckSkipped = build.reason
+          }
+        }
         // Install the build before replaying (mirrors `flow run --build`) so clearState/launchApp find the app present; skip with install:false.
         if (buildId !== undefined && install !== false) {
           await client.installApp(sessionId, buildId)
@@ -447,6 +472,8 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
           ...(result.failureMessage ? { failureMessage: result.failureMessage } : {}),
           ...(result.failureKind ? { failureKind: result.failureKind } : {}),
           ...(screenshotPath ? { failureScreenshotPath: screenshotPath } : {}),
+          // The flow ran without its appId being compared with the build's, and why.
+          ...(appCheckSkipped ? { appCheckSkipped } : {}),
         }, null, 2))
       } catch (e) {
         return err(`run_flow failed: ${(e as Error).message}`)
@@ -623,7 +650,7 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
   register(
     'install_app',
     {
-      description: 'Install an app on the device. Requires connect_device first. Waits up to 60 seconds.',
+      description: 'Install an app on the device. Requires connect_device first. Waits up to 2 minutes.',
       inputSchema: {
         sessionId: z.string().describe('Session ID from list_devices'),
         buildId: z.number().int().describe('Build ID from the tapflow relay builds API'),

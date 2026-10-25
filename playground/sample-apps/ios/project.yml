@@ -1,0 +1,43 @@
+# Sample apps for measuring the UI tree (`.work` e2e-followups A1). Same model as
+# `packages/ios-agent/netprobe`: source is committed, xcodegen makes the project, and the built app is
+# not committed — `../build.sh` builds both targets into `playground/test-builds/`.
+#
+# Two targets with the same screens, one per UI framework, because the tree backend reports UIKit and
+# SwiftUI controls differently and the measurement has to see both. The element ids and the status label
+# are shared with the Android sample and with `../expected/`, so one measurement script reads all three.
+name: TapflowSample
+options:
+  bundleIdPrefix: dev.tapflow.sample
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  SampleUIKit:
+    type: application
+    platform: iOS
+    sources:
+      - UIKit
+      - path: Shared/web
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_CFBundleDisplayName: Sample UIKit
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tapflow.sample.uikit
+        SWIFT_VERSION: "5"
+  SampleSwiftUI:
+    type: application
+    platform: iOS
+    sources:
+      - SwiftUI
+      - path: Shared/web
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_CFBundleDisplayName: Sample SwiftUI
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tapflow.sample.swiftui
+        SWIFT_VERSION: "5"

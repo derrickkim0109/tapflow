@@ -1,6 +1,6 @@
 'use client';
 
-import type { BrowserToRelay, FormFactor } from '@tapflowio/protocol'
+import type { BootRefusalReason, BrowserToRelay, FormFactor } from '@tapflowio/protocol'
 import { newRequestId } from '@/lib/requestId';
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useClientRecording } from '@/hooks/useClientRecording';
@@ -46,6 +46,10 @@ interface IOSViewerProps {
   installed: boolean;
   installError: string | null;
   bootError: string | null;
+  /** The relay holds this viewer's boot behind another on the same Mac (a restart reaches it with chrome still up). */
+  bootWaiting: BootRefusalReason | null;
+  /** See `SimulatorInfoCard.servicesOff`. */
+  servicesOff: boolean;
   launching: boolean;
   chrome: ChromeData;
   /** What the agent reported the device to be. Decides whether a volume button's tooltip follows
@@ -73,7 +77,7 @@ interface IOSViewerProps {
 
 export function IOSViewer({
   sessionId, buildId, send, openUrl, launchApp, connected, joined,
-  deviceReady, installing, installed, installError, bootError,
+  deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
   launching, chrome, formFactor,
   binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, onRecordingUploaded,
   swKeyboardVisible, swKeyboardPending, onKbdToggle,
@@ -673,7 +677,7 @@ export function IOSViewer({
 
         <SimulatorInfoCard
           joined={joined} fps={fps} connected={connected}
-          deviceReady={deviceReady} bootError={bootError}
+          deviceReady={deviceReady} bootError={bootError} bootWaiting={bootWaiting} servicesOff={servicesOff}
           installing={installing} installError={installError}
           decoderUnsupported={decoderUnsupported}
           keyboardActive={keyboardActive}

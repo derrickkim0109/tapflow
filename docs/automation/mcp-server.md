@@ -6,7 +6,7 @@ description: "Install @tapflowio/mcp-server and connect a coding agent to it. Th
 # MCP Server
 
 ::: warning Experimental
-tapflow's **AI Automation axis** — the MCP server and the flow runner — is experimental. The manual QA dashboard is the mature, production path; this axis is additive and still maturing. Expect rough edges, especially in selector matching and in timing right after an app launches.
+tapflow's **AI agents** (the MCP server) and **Automation** (the flow runner) are experimental. The manual QA dashboard is the most mature part of tapflow; these two are still maturing. Expect rough edges, especially in selector matching and in timing right after an app launches.
 :::
 
 `@tapflowio/mcp-server` exposes tapflow as a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server. Claude Code, Codex, and any other MCP-compatible LLM agent can control iOS simulators and Android emulators as native tools — no scripting, no hardcoded selectors.
@@ -142,21 +142,24 @@ Connected straight to the relay's port on the Mac it runs on, the MCP server sta
 | `run_flow` | Replay a YAML flow deterministically (no further LLM calls) |
 | `list_runs` | List the run records `tapflow flow run` left on the relay (filter by status, build, flow name, CI or local) |
 | `get_run` | Read one run record: each failed flow's steps (a passed flow's step count), failure message and file path, and screenshots of up to four failed flows |
+| `get_testing_guide` | How to test a mobile feature with these tools: cases to cover, what cannot be tested here, how to avoid false bugs, how to save a verified flow, and the report format |
 
 ## Typical workflow
 
 An LLM agent typically calls tools in this order:
 
 ```text
+get_testing_guide  → read what to cover and how to report (once, before testing)
 list_devices       → get available devices and sessionIds
 connect_device     → join a session, hand the person the watch link
 boot_device        → wait for the device to be ready (skip if already booted)
 install_app        → install the build
 launch_app         → launch the app
-screenshot         → capture screen → LLM analyzes
+query_ui_tree      → read the screen (screenshot only for something visual)
 tap / swipe / ...  → interact
-screenshot         → verify result → repeat
-disconnect_device  → end the session
+query_ui_tree      → check the result → repeat
+run_flow           → replay the verified scenario as a flow
+disconnect_device  → end the session, freeing the device for others
 ```
 
 ::: info Device already booted
@@ -164,6 +167,15 @@ If `list_devices` returns `"status": "booted"` for a device, you can skip `boot_
 :::
 
 For running this in a CI pipeline, see [MCP in CI/CD](/automation/mcp-ci).
+
+## What the agent is told {#agent-guidance}
+
+The server gives the coding agent two pieces of guidance, so a request as short as "test the login screen" gets a thorough run without you listing every case.
+
+- **Server instructions**, sent once when the agent connects: the order of the tools, reading the screen with `query_ui_tree` rather than screenshots, releasing the device when done, and what a refused boot or an unconfirmed input means. Clients that support MCP server instructions add them to the agent's context: Claude Code and VS Code do, Gemini CLI does in trusted folders, and Codex shows them as the description of tapflow's tools. `connect_device`'s description repeats the two rules that matter most, for clients that do not.
+- **`get_testing_guide`**, a tool the agent calls before it tests: which cases to cover, what these tools cannot test, how to check a finding before calling it a bug, how to save the verified path as a flow, and the report format.
+
+The instructions are about 400 tokens in every session. The testing guide is about 1,200 tokens, spent only when the agent calls it.
 
 ## Watch the device a coding agent drives {#watch-the-device}
 

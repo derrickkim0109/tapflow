@@ -368,6 +368,200 @@ describe('AndroidAgent', () => {
       browser.close()
     })
 
+    // The relay's boot gate charges a boot by this (L2 admission plan, S2): an emulator this boot
+    // launched costs the host 30-90 s of memory pressure, one adb already sees costs nothing. Full
+    // reset is covered with its own suite below, since it launches whatever adb said.
+    it.each([
+      { booted: false, cold: true },
+      { booted: true, cold: false },
+    ])('reports cold=$cold on device:ready when the emulator was booted=$booted', async ({ booted, cold }) => {
+      const agent = new AndroidAgent({}, mockAdb(booted))
+      await agent.connect(`ws://localhost:${port}`)
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+
+      const readyPromise = waitForType(browser, 'device:ready')
+      browser.send(JSON.stringify({
+        type: 'device:boot',
+        requestId: 'rq-cold',
+        sessionId: agent.sessionId,
+        payload: { deviceId: 'avd:Pixel_8_API_34' },
+      }))
+      const ready = await readyPromise
+      expect((ready['payload'] as { cold?: boolean }).cold).toBe(cold)
+
+      agent.disconnect()
+      browser.close()
+    })
+
+    describe('run reset (flow run)', () => {
+      /** A booted emulator where `installed` are the packages `pm path` finds. Returns the `pm` calls made. */
+      async function bootWithReset(runReset: unknown, installed: string[], pathFails?: Error) {
+        const adb = mockAdb(true)
+        const pm: string[] = []
+        const runner = (adb as unknown as { runner: AdbRunner }).runner
+        vi.mocked(runner.exec).mockImplementation(async (...args: string[]) => {
+          const at = args.indexOf('pm')
+          if (at < 0) return ''
+          const [verb, pkg] = [args[at + 1]!, args[at + 2]!]
+          // The boot reads `pm list packages` for itself (Lean mode); only the reset's two verbs are recorded.
+          if (verb !== 'path' && verb !== 'clear') return ''
+          pm.push(`${verb} ${pkg}`)
+          if (verb === 'path') {
+            if (pathFails) throw pathFails
+            // What `pm path` does for a package that is not installed: exit 1, no output.
+            if (!installed.includes(pkg)) throw Object.assign(new Error('Command failed'), { code: 1, stdout: '', stderr: '' })
+            return `package:/data/app/${pkg}/base.apk`
+          }
+          if (verb === 'clear') return 'Success'
+          return ''
+        })
+        const agent = new AndroidAgent({}, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        const browser = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(browser)
+        browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+        await waitForType(browser, 'session:joined')
+        const readyPromise = waitForType(browser, 'device:ready')
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-reset', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34', runReset } }))
+        const payload = (await readyPromise)['payload'] as Record<string, unknown>
+        agent.disconnect(); browser.close()
+        return { pm, payload }
+      }
+
+      it('clears every app it was named, installed ones only, and reports app-data', async () => {
+        const { pm, payload } = await bootWithReset({ uninstall: ['com.example.app'], clear: ['com.example.helper'] }, ['com.example.app'])
+        expect(pm).toEqual(['path com.example.app', 'clear com.example.app', 'path com.example.helper'])
+        // The scrcpy backend has no gRPC client, so the clipboard is not reset and not claimed.
+        expect(payload['runReset']).toEqual({ done: ['app-data'], failed: [] })
+      })
+
+      // Only "not installed" is nothing to clear: a device that cannot answer has cleared nothing.
+      it('fails app-data when the package manager cannot answer, rather than calling the app clean', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const offline = Object.assign(new Error('Command failed'), { code: 1, stdout: '', stderr: 'error: device offline' })
+        const { payload } = await bootWithReset({ uninstall: ['com.example.app'], clear: [] }, ['com.example.app'], offline)
+        expect(payload['runReset']).toEqual({ done: [], failed: ['app-data'] })
+      })
+
+      // Failing the step does not stop a clear still running on the device, and the run installs right after the ready.
+      it('fails the boot instead of announcing it while a pm clear is still running', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {})
+        vi.spyOn(console, 'error').mockImplementation(() => {})
+        const adb = mockAdb(true)
+        const runner = (adb as unknown as { runner: AdbRunner }).runner
+        vi.mocked(runner.exec).mockImplementation(async (...args: string[]) => {
+          const at = args.indexOf('pm')
+          if (at < 0) return ''
+          if (args[at + 1] === 'path') return 'package:/data/app/com.example.app/base.apk'
+          if (args[at + 1] === 'clear') return new Promise<string>(() => {})
+          return ''
+        })
+        const agent = new AndroidAgent({ runResetCmdTimeoutMs: 50 }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        const browser = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(browser)
+        browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+        await waitForType(browser, 'session:joined')
+        const seen: string[] = []
+        browser.on('message', (d) => { const m = JSON.parse(String(d)) as { type: string }; if (m.type === 'device:ready' || m.type === 'device:boot-error') seen.push(m.type) })
+        const failed = waitForType(browser, 'device:boot-error')
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-late-clear', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34', runReset: { uninstall: ['com.example.app'], clear: [] } } }))
+        const e = await failed
+        expect(e['requestId']).toBe('rq-late-clear')
+        expect(String(e['message'])).toContain('pm clear from a run reset is still running')
+        expect(seen).toEqual(['device:boot-error'])
+        agent.disconnect(); browser.close()
+      })
+
+      // The clear outlives the boot that started it; a newer boot, which asked for no reset, must not announce over it.
+      it('holds a newer boot\'s ready for a pm clear an older boot left running', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {})
+        vi.spyOn(console, 'error').mockImplementation(() => {})
+        const adb = mockAdb(true)
+        const runner = (adb as unknown as { runner: AdbRunner }).runner
+        let releaseClear!: (out: string) => void
+        let clearStarted!: () => void
+        const started = new Promise<void>((r) => { clearStarted = r })
+        vi.mocked(runner.exec).mockImplementation(async (...args: string[]) => {
+          const at = args.indexOf('pm')
+          if (at < 0) return ''
+          if (args[at + 1] === 'path') return 'package:/data/app/com.example.app/base.apk'
+          if (args[at + 1] === 'clear') { clearStarted(); return new Promise<string>((r) => { releaseClear = r }) }
+          return ''
+        })
+        const agent = new AndroidAgent({ runResetCmdTimeoutMs: 2_000 }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        const browser = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(browser)
+        browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+        await waitForType(browser, 'session:joined')
+        const order: string[] = []
+        browser.on('message', (d) => { const m = JSON.parse(String(d)) as { type: string; requestId?: string }; if (m.type === 'device:ready') order.push(`ready:${m.requestId}`) })
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-old', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34', runReset: { uninstall: ['com.example.app'], clear: [] } } }))
+        await started
+        const ready = waitForType(browser, 'device:ready')
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-new', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34' } }))
+        await new Promise((r) => setTimeout(r, 200))
+        order.push('clear-settled')
+        releaseClear('Success')
+        expect((await ready)['requestId']).toBe('rq-new')
+        expect(order).toEqual(['clear-settled', 'ready:rq-new'])
+        agent.disconnect(); browser.close()
+      })
+
+      // A client that joins without booting (MCP's connect_device) reaches the app commands without the boot's wait.
+      it('holds an app command for a pm clear a failed reset left running', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {})
+        vi.spyOn(console, 'error').mockImplementation(() => {})
+        const adb = mockAdb(true)
+        const runner = (adb as unknown as { runner: AdbRunner }).runner
+        let releaseClear!: (out: string) => void
+        vi.mocked(runner.exec).mockImplementation(async (...args: string[]) => {
+          const at = args.indexOf('pm')
+          if (at < 0) return ''
+          if (args[at + 1] === 'path') return 'package:/data/app/com.example.app/base.apk'
+          if (args[at + 1] === 'clear') return new Promise<string>((r) => { releaseClear = r })
+          return ''
+        })
+        const order: string[] = []
+        vi.spyOn(adb, 'openUrl').mockImplementation(async () => { order.push('open-url') })
+        const agent = new AndroidAgent({ runResetCmdTimeoutMs: 500 }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        const browser = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(browser)
+        browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+        await waitForType(browser, 'session:joined')
+        const failed = waitForType(browser, 'device:boot-error')
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-stuck', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34', runReset: { uninstall: ['com.example.app'], clear: [] } } }))
+        await failed
+        const done = waitForType(browser, 'open-url:done')
+        browser.send(JSON.stringify({ type: 'open-url', requestId: 'rq-url', sessionId: agent.sessionId, payload: { url: 'myapp://home' } }))
+        await new Promise((r) => setTimeout(r, 30))
+        order.push('clear-settled')
+        releaseClear('Success')
+        await done
+        expect(order).toEqual(['clear-settled', 'open-url'])
+        agent.disconnect(); browser.close()
+      })
+
+      it('never hands an id that is not an app id to the device shell', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const { pm, payload } = await bootWithReset({ uninstall: [], clear: ['x;reboot'] }, [])
+        expect(pm).toEqual([])
+        expect(payload['runReset']).toEqual({ done: [], failed: ['app-data'] })
+      })
+
+      it('resets nothing for a boot that did not ask', async () => {
+        const { pm, payload } = await bootWithReset(undefined, ['com.example.app'])
+        expect(pm).toEqual([])
+        expect(payload).not.toHaveProperty('runReset')
+      })
+    })
+
   })
 
   // ── Lean mode: bundled apps kept disabled, reconciled after every boot ──────────────────────
@@ -1186,10 +1380,12 @@ describe('AndroidAgent', () => {
         const agent = new AndroidAgent({}, adb)
         await agent.connect(`ws://localhost:${port}`)
         const browser = await boot(agent, 'full-erase')
-        await waitForType(browser, 'device:ready')
+        const ready = await waitForType(browser, 'device:ready')
 
         expect(shutdown).toHaveBeenCalledWith('emulator-5554')
         expect(wipedOnFirstLaunch(agent)).toBe(true)
+        // adb saw it running, and the boot still brought it up from off: the gate must charge it.
+        expect((ready['payload'] as { cold?: boolean }).cold).toBe(true)
 
         agent.disconnect(); browser.close()
       })
@@ -3600,6 +3796,26 @@ describe('AndroidAgent', () => {
     describe('clipboard bridge', () => {
       beforeEach(() => { grpcClipboardText = ''; grpcClipboardError = null; grpcClipboardApplyDelayMs = 0 })
       afterEach(() => { grpcClipboardError = null; grpcClipboardApplyDelayMs = 0 })
+
+      // `setClipboard` only schedules the change, so the step is done once the clipboard reads back empty — not before.
+      it('reports the clipboard reset only after the clipboard reads back empty', async () => {
+        grpcClipboardText = 'left by the last run'
+        grpcClipboardApplyDelayMs = 150
+        try {
+          browser = new WebSocket(`ws://localhost:${port}`)
+          await waitForOpen(browser)
+          browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+          await waitForType(browser, 'session:joined')
+          const readyPromise = waitForType(browser, 'device:ready')
+          browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-reset-clip', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34', runReset: { uninstall: [], clear: [] } } }))
+          const ready = await readyPromise
+          expect((ready['payload'] as { runReset?: unknown }).runReset).toEqual({ done: ['pasteboard'], failed: [] })
+          expect(grpcClipboardText).toBe('')
+        } finally {
+          grpcClipboardApplyDelayMs = 0
+          grpcClipboardText = ''
+        }
+      })
 
       // Same gate as iOS: the viewer only enables the bridge when this arrives.
       it('advertises the clipboard capability all the way to the viewer', async () => {

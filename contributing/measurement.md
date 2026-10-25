@@ -67,7 +67,7 @@ MSE **buffers** rather than dropping, so the submit↔present FIFO tracker is ac
 
 ## Host resource sampling — `agent:resources`
 
-`createResourceSampler` (`agent-core/src/utils/resources.ts`) samples host CPU and memory every 5 s and the agent sends an `agent:resources` WebSocket message (not a log line). It feeds the dashboard's agent cards and the relay's boot-time resource gate (a session is refused when CPU/RAM exceed `TAPFLOW_RESOURCE_THRESHOLD_PERCENT`, default 80). It is **always on** — no flag.
+`createResourceSampler` (`agent-core/src/utils/resources.ts`) samples host CPU and memory every 5 s and the agent sends an `agent:resources` WebSocket message (not a log line). It feeds the dashboard's agent cards and the relay's boot-time resource gate (a session is refused when CPU or RAM exceeds `TAPFLOW_RESOURCE_THRESHOLD_PERCENT`, default 80; a person rejoining a device the relay has up is not refused for RAM). It is **always on** — no flag.
 
 ---
 

@@ -206,6 +206,23 @@ export class AdbWrapper {
     }
   }
 
+  /** `clearAppData` for an app that may not be installed: nothing installed is nothing to clear. `pm path` prints
+   *  `package:<path>` for an installed package, and exits 1 with no output for one that is not. **Only that is "not
+   *  installed"**: an offline device or a PackageManager not yet serving fails too, and reading those as nothing to
+   *  clear would report a reset that never happened. */
+  async clearAppDataIfInstalled(serial: string, packageName: string): Promise<void> {
+    let path: string
+    try {
+      path = await this.runner.exec('-s', serial, 'shell', 'pm', 'path', packageName)
+    } catch (e) {
+      const { code, stdout, stderr } = e as { code?: unknown; stdout?: unknown; stderr?: unknown }
+      if (code === 1 && !String(stdout ?? '').trim() && !String(stderr ?? '').trim()) return
+      throw e
+    }
+    if (!path.includes('package:')) return
+    await this.clearAppData(serial, packageName)
+  }
+
   /**
    * Whether the device is in airplane mode — tapflow's network on/off (#607).
    *

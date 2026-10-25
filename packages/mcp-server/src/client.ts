@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type {
-  BrowserToRelay, DeviceSummary, InputErrorReason, SessionTerminatedReason, UIElement,
+  BootRefusalReason, BrowserToRelay, DeviceSummary, InputErrorReason, SessionTerminatedReason, UIElement,
 } from '@tapflowio/protocol'
-import { EnvironmentStepError, TransientQueryError, authHeader, fetchWithToken, fixedToken, tokenRefusal, type TokenSource } from '@tapflowio/flow-runner'
+import { AdmissionRefusedError, EnvironmentStepError, TransientQueryError, authHeader, fetchWithToken, fixedToken, lookupBuild, tokenRefusal, type BuildLookup, type TokenSource } from '@tapflowio/flow-runner'
 
 // Protocol owns the wire shape; this file used to declare an identical copy under a name the
 // relay uses for a *different* shape. Kept exported as `DeviceInfo` because that is this
@@ -46,7 +46,8 @@ export interface RunInfo {
   build: string | null
   buildId: number | null
   ci: { branch: string | null; commit: string | null; jobUrl: string | null } | null
-  flows: { passed: number; failed: number; total: number }
+  /** `skipped` is the flows the run chose not to replay (another app's, or filtered out by tag). */
+  flows: { passed: number; failed: number; skipped: number; total: number }
   createdAt: string
   finishedAt: string | null
   /** The run's dashboard page, for the person the agent works for. */
@@ -94,6 +95,7 @@ interface RawRun {
   flowsTotal: number
   flowsPassed?: number
   flowsFailed?: number
+  flowsSkipped?: number
   createdAt: string
   finishedAt: string | null
 }
@@ -117,6 +119,7 @@ function isUIElement(value: unknown): value is UIElement {
   if (typeof record.role !== 'string' || !UI_ROLES.has(record.role) || typeof record.label !== 'string' || typeof record.enabled !== 'boolean') return false
   if (record.identifier !== undefined && typeof record.identifier !== 'string') return false
   if (record.rawRole !== undefined && typeof record.rawRole !== 'string') return false
+  if (record.placeholder !== undefined && typeof record.placeholder !== 'string') return false
   const x = rect.x
   const y = rect.y
   const width = rect.width
@@ -176,6 +179,14 @@ interface Waiter {
   sessionId?: string
 }
 
+/** What a refused boot tells the calling agent, per `BootRefusalReason`: a reason added to the union is a compile
+ *  error here until it has words. */
+const BOOT_REFUSALS: Record<BootRefusalReason, string> = {
+  'host-booting': 'another device is still booting on this Mac. Call boot_device again in about 30 seconds.',
+  'host-memory-critical': 'this Mac is critically short of memory. Call boot_device again in about a minute, or stop a device you no longer need.',
+  'host-at-capacity': 'this Mac already runs as many automation devices as it allows, and all are in use. Call boot_device again once one is released, or use a device that is already up.',
+}
+
 /**
  * The caller left this session while a request was still in flight (#514).
  *
@@ -191,6 +202,7 @@ interface Waiter {
  * error instead would bury the cause. Both are needed, so the message states both — the same shape
  * `SessionEndedError` has, and the reason its guard is a bare rethrow.
  */
+
 export class SessionLeftError extends Error {}
 
 /**
@@ -885,6 +897,18 @@ export class TapflowClient {
     // tools guard reads it as environmental. Against an older relay nothing answers it and the
     // deadline runs, which is slow rather than wrong.
     if (msg['type'] === 'device:boot-error') {
+      // The relay's boot gate: the Mac is busy, not broken. Said so plainly, with what to do, because the caller
+      // is an agent that will otherwise read a failure and give up on the device.
+      const reason = msg['reason']
+      // Any reason, not only the ones this build knows: only the gate sets one, and a reason a newer relay added is
+      // still a busy Mac.
+      if (typeof reason === 'string') {
+        const known = Object.hasOwn(BOOT_REFUSALS, reason) ? reason as BootRefusalReason : null
+        throw new AdmissionRefusedError(
+          `boot refused (${reason}): ${known ? BOOT_REFUSALS[known] : 'this Mac is not taking boots right now. Call boot_device again in about a minute.'}`,
+          known ?? 'unrecognised-refusal',
+        )
+      }
       throw this.failed(sessionId, (msg['message'] as string) ?? 'Boot failed')
     }
     // The one thing that clears `needsReboot`, because it is the one thing that answers it: what a rebound
@@ -1286,7 +1310,7 @@ export class TapflowClient {
     // The cursor goes back out: without it an agent can reach only the newest page of what matches.
     const runs = (body.items ?? []).map((r) => ({
       ...this.runHead(r),
-      flows: { passed: r.flowsPassed ?? 0, failed: r.flowsFailed ?? 0, total: r.flowsTotal },
+      flows: { passed: r.flowsPassed ?? 0, failed: r.flowsFailed ?? 0, skipped: r.flowsSkipped ?? 0, total: r.flowsTotal },
       createdAt: r.createdAt,
       finishedAt: r.finishedAt,
     }))
@@ -1360,6 +1384,11 @@ export class TapflowClient {
       // that network opens. The docs say so.
       url: new URL(`/automation/runs/${encodeURIComponent(r.id)}`, this.httpBase()).toString(),
     }
+  }
+
+  /** The build's bundle id for `run_flow`'s app check. Only a 404 is an answer; see flow-runner's `lookupBuild`. */
+  lookupBuild(buildId: number): Promise<BuildLookup> {
+    return lookupBuild(this.relayUrl.replace(/^wss?/, (p) => (p === 'wss' ? 'https' : 'http')), this.tokens, buildId)
   }
 
   async listBuilds(): Promise<AppInfo[]> {

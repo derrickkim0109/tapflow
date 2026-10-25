@@ -130,7 +130,7 @@ const report = (over: Partial<AgentResources> = {}): AgentResources => ({
 })
 const listed = (sessions: SessionInfo[]) => act(async () => { deliver!({ type: 'agents:listed', sessions }) })
 const agent = (agentName: string, resources?: AgentResources): SessionInfo => ({
-  agentName, platform: 'ios', capabilities: [], devices: [], resources,
+  agentName, platform: 'ios', capabilities: [], admission: { booting: false, overloaded: false, memoryRefuses: [] }, devices: [], resources,
 })
 
 describe('the history refreshes without the chart going blank', () => {

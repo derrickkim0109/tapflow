@@ -1,6 +1,6 @@
 'use client';
 
-import type { BrowserToRelay } from '@tapflowio/protocol'
+import type { BootRefusalReason, BrowserToRelay } from '@tapflowio/protocol'
 import { newRequestId } from '@/lib/requestId';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useClientRecording } from '@/hooks/useClientRecording';
@@ -43,6 +43,10 @@ interface AndroidViewerProps {
   installed: boolean;
   installError: string | null;
   bootError: string | null;
+  /** The relay holds this viewer's boot behind another on the same Mac (a restart reaches it with chrome still up). */
+  bootWaiting: BootRefusalReason | null;
+  /** See `SimulatorInfoCard.servicesOff`. */
+  servicesOff: boolean;
   launching: boolean;
   androidButtons: AndroidButton[] | null;
   binaryFrameHandlerRef: React.RefObject<BinaryFrameHandler | undefined>;
@@ -71,7 +75,7 @@ interface AndroidViewerProps {
 
 export function AndroidViewer({
   sessionId, buildId, send, openUrl, launchApp, connected, joined,
-  deviceReady, installing, installed, installError, bootError,
+  deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
   launching, androidButtons,
   binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, onRecordingUploaded,
   rebootPending, onReboot, restartButtonRef,
@@ -668,7 +672,7 @@ export function AndroidViewer({
 
         <SimulatorInfoCard
           joined={joined} fps={fps} connected={connected}
-          deviceReady={deviceReady} bootError={bootError}
+          deviceReady={deviceReady} bootError={bootError} bootWaiting={bootWaiting} servicesOff={servicesOff}
           installing={installing} installError={installError}
           decoderUnsupported={decoderUnsupported}
           keyboardActive={keyboardActive}

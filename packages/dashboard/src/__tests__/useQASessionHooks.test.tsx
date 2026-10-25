@@ -24,6 +24,7 @@ const makeSession = (overrides: Partial<SessionInfo> = {}): SessionInfo => ({
   // An agent that advertises nothing. `capabilities` is required on the wire, so `[]` — not an
   // absent key — is how the relay reports one that predates a capability (#447).
   capabilities: [],
+  admission: { booting: false, overloaded: false, memoryRefuses: [] },
   devices: [],
   ...overrides,
 })
@@ -139,7 +140,7 @@ describe('useAgentSession', () => {
     const { result } = renderHook(() => useAgentSession('ios'))
     const d = makeDevice()
     act(() => result.current.startDevice(d))
-    act(() => capturedOnMessage({ type: 'agents:listed', sessions: [{ agentName: 'm', platform: 'ios', capabilities: [], devices: [{ ...d, formFactor: 'tablet' }] }] }))
+    act(() => capturedOnMessage({ type: 'agents:listed', sessions: [{ agentName: 'm', platform: 'ios', capabilities: [], admission: { booting: false, overloaded: false, memoryRefuses: [] }, devices: [{ ...d, formFactor: 'tablet' }] }] }))
     act(() => capturedOnMessage({ type: 'agents:listed', sessions: [] }))
     expect(result.current.activeFormFactor).toBe('tablet')
   })
@@ -242,7 +243,7 @@ describe('useDeviceSelector', () => {
     makeDevice({ id: 'd3', name: 'iPhone 15', osVersion: 'iOS 17', platform: 'ios' }),
   ]
   /** Advertises nothing, which is what an agent that predates a capability sends (#447). */
-  const session: SessionInfo = { agentName: 'mac', capabilities: [], devices }
+  const session: SessionInfo = { agentName: 'mac', capabilities: [], admission: { booting: false, overloaded: false, memoryRefuses: [] }, devices }
   const withCaps = (capabilities: string[]): SessionInfo => ({ ...session, capabilities })
 
   it('filters devices by osVersion when set', () => {
@@ -267,7 +268,7 @@ describe('useDeviceSelector', () => {
       makeDevice({ osVersion: 'Android 15', platform: 'android' }),
       makeDevice({ osVersion: 'Android 14', platform: 'android' }),
     ]
-    const sess: SessionInfo = { agentName: 'mac', capabilities: [], devices: mixedDevices }
+    const sess: SessionInfo = { agentName: 'mac', capabilities: [], admission: { booting: false, overloaded: false, memoryRefuses: [] }, devices: mixedDevices }
     const { result } = renderHook(() => useDeviceSelector(sess, 'android'))
 
     expect(result.current.osVersions).toEqual(['Android 15', 'Android 14', 'Android 13'])

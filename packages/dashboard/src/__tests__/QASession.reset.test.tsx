@@ -62,12 +62,14 @@ const AGENTS: SessionInfo[] = [{
   agentName: 'studio-mac',
   platform: 'ios',
   capabilities: ['clipboard', 'full-reset'],
+  admission: { booting: false, overloaded: false, memoryRefuses: [] },
   devices: [device('dev-a', 'iPhone 15'), device('dev-b', 'iPhone SE')],
 }]
 const ANDROID_AGENTS: SessionInfo[] = [{
   agentName: 'studio-mac',
   platform: 'android',
   capabilities: ['clipboard'],
+  admission: { booting: false, overloaded: false, memoryRefuses: [] },
   devices: [device('dev-a', 'Pixel 7', 'android')],
 }]
 const MIXED_CAPABILITY_AGENTS: SessionInfo[] = [
@@ -76,6 +78,7 @@ const MIXED_CAPABILITY_AGENTS: SessionInfo[] = [
     agentName: 'legacy-mac',
     platform: 'ios',
     capabilities: ['clipboard'],
+    admission: { booting: false, overloaded: false, memoryRefuses: [] },
     devices: [device('dev-c', 'iPhone 14')],
   },
 ]
@@ -233,3 +236,78 @@ describe('QASession — the viewer keeps the form factor while the agent is away
     expect(screen.getByTestId('device-viewer').dataset.formFactor).toBe('tablet')
   })
 })
+
+// L2 S2-c. The Mac card used to recompute an 80 % threshold and block on it, which disagreed with the relay once the
+// relay paused its CPU check during a boot. It now follows the relay's own reading.
+describe('QASession — the Mac card follows the relay\'s admission reading', () => {
+  beforeEach(() => { deliver = null })
+  const hot = { cpuPercent: 97, memUsedMB: 4000, memTotalMB: 16000, slotsAvailable: 1, slotsTotal: 2, reportedAt: Date.now() }
+  const listed = (admission: SessionInfo['admission']): SessionInfo[] => [{ ...AGENTS[0]!, resources: hot, admission }]
+
+  async function macCard(admission: SessionInfo['admission']) {
+    render(withQuery(
+      <MemoryRouter initialEntries={['/qa?id=7']}>
+        <BreadcrumbProvider><Harness /></BreadcrumbProvider>
+      </MemoryRouter>,
+    ))
+    await vi.waitFor(() => expect(deliver).not.toBeNull())
+    await act(async () => { deliver!({ type: 'agents:listed', sessions: listed(admission) }) })
+    return (await screen.findByText('studio-mac')).closest('button')!
+  }
+
+  it('lets a person pick a Mac at 97 % CPU while a device is starting there, and says so', async () => {
+    const card = await macCard({ booting: true, overloaded: false, memoryRefuses: [] })
+    expect(card.disabled).toBe(false)
+    expect(screen.getByText('Starting a device')).toBeTruthy()
+  })
+
+  it('on a Mac short of memory, offers the device the relay has up and marks the ones it would refuse', async () => {
+    const user = userEvent.setup()
+    render(withQuery(
+      <MemoryRouter initialEntries={['/qa?id=7']}>
+        <BreadcrumbProvider><Harness /></BreadcrumbProvider>
+      </MemoryRouter>,
+    ))
+    await vi.waitFor(() => expect(deliver).not.toBeNull())
+    const sessions: SessionInfo[] = [{
+      ...AGENTS[0]!,
+      // dev-c reads booted but the relay never brought it up (booted before the agent registered): refused too.
+      admission: { booting: false, overloaded: false, memoryRefuses: ['dev-b', 'dev-c'] },
+      devices: [{ ...device('dev-a', 'iPhone 15'), status: 'booted' }, device('dev-b', 'iPhone SE'), { ...device('dev-c', 'iPhone 13'), status: 'booted' }],
+    }]
+    await act(async () => { deliver!({ type: 'agents:listed', sessions }) })
+    await user.click(await screen.findByText('studio-mac'))
+    expect(screen.getByText('iPhone 15').closest('button')!.disabled).toBe(false)
+    const cold = screen.getByText('iPhone SE').closest('button')!
+    expect(cold.disabled).toBe(true)
+    expect(cold.textContent).toContain('Not enough memory to start')
+    expect(screen.getByText('iPhone 13').closest('button')!.disabled).toBe(true)
+  })
+
+  it('marks a running device a run left with most services off', async () => {
+    const user = userEvent.setup()
+    render(withQuery(
+      <MemoryRouter initialEntries={['/qa?id=7']}>
+        <BreadcrumbProvider><Harness /></BreadcrumbProvider>
+      </MemoryRouter>,
+    ))
+    await vi.waitFor(() => expect(deliver).not.toBeNull())
+    const sessions: SessionInfo[] = [{
+      ...AGENTS[0]!,
+      devices: [
+        { ...device('dev-a', 'iPhone 15'), status: 'booted', serviceTier: { name: 'slim', keep: [] } },
+        { ...device('dev-b', 'iPhone SE'), status: 'booted', serviceTier: { name: 'lean', keep: [] } },
+      ],
+    }]
+    await act(async () => { deliver!({ type: 'agents:listed', sessions }) })
+    await user.click(await screen.findByText('studio-mac'))
+    expect(screen.getByText('iPhone 15').closest('button')!.textContent).toContain('Most services off')
+    expect(screen.getByText('iPhone SE').closest('button')!.textContent).not.toContain('Most services off')
+  })
+
+  it('blocks the Mac the relay would refuse', async () => {
+    const card = await macCard({ booting: false, overloaded: true, memoryRefuses: ['dev-a', 'dev-b'] })
+    expect(card.disabled).toBe(true)
+  })
+})
+

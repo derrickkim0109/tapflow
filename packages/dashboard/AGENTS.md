@@ -19,7 +19,7 @@ Changing a `cva` axis of a component with a spec means updating that spec in the
 ## WHAT
 
 React SPA team dashboard: provides the simulator viewer, build comments, and team invite screens.
-The audience is the whole team (PO, PM, designers, backend, QA) — not just QA. See root [AGENTS.md](../../AGENTS.md) for the two testing modes (manual vs. AI Agent via MCP).
+The audience is the whole team (PO, PM, designers, backend, QA) — not just QA. See root [AGENTS.md](../../AGENTS.md) for the three ways to use tapflow (Manual QA, AI agents via MCP, Automation).
 **No standalone deployment** — bundled to `dist/` via `vite build`, then copied to the relay package's `public/` directory and served directly by the relay server.
 
 ### App Center Structure
@@ -76,7 +76,8 @@ links lead to it: the one an MCP client hands to the person who asked it to test
 belongs to that person), and the **Watch the device** button on a running flow run in Flow Runs
 (`/automation/runs/:id`), which anyone on the team may open — a CI run is a test the team handed to automation.
 That button appears only while the relay reports the session the runner holds **now** (`watchSessionId`); a
-stored session id would open whoever took the device next. Up to four people can watch one session, and a
+stored session id would open whoever took the device next. A run on several devices lists them instead, each with
+its own **Watch** link from `watchSessionIds`, under the same rule. Up to four people can watch one session, and a
 fifth is refused with the reason (`watchRefusalText`).
 **That page must never send `session:start`, `device:boot` or `device:shutdown`, and must not use
 `useAgentSession`** — it shuts the device down on unmount, and a watch page closing would end what the agent
@@ -257,7 +258,7 @@ Two limits, both written beside the rule:
 
 ### Every browser-inbound message has a declared disposition
 
-`lib/inboundDisposition.ts` says, for each of the 29 messages a browser socket can receive, either which
+`lib/inboundDisposition.ts` says, for each message a browser socket can receive, either which
 files handle it or why it is deliberately ignored. It is written with
 `satisfies Record<BrowserInbound['type'], Disposition>`, so **a message added to the wire breaks that file**
 until someone picks a category.

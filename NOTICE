@@ -7,7 +7,7 @@ licensed under the Apache License, Version 2.0.
 This product includes a list of launchd labels selected from simslim
 (https://github.com/MobAI-App/simslim),
 licensed under the MIT License. Copyright (c) 2026 Interlap.
-The full notice is in packages/ios-agent/src/leanLabels.ts.
+The full notice is in packages/ios-agent/src/leanLabels.ts and packages/ios-agent/src/serviceTiers.ts.
 
 This product bundles scrcpy-server
 (https://github.com/Genymobile/scrcpy),

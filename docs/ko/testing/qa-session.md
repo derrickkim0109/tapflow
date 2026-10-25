@@ -17,10 +17,12 @@ QA 세션은 Mac에서 실행 중인 iOS 시뮬레이터나 Android 에뮬레이
 |---|---|
 | 초록 | 여유 있음 |
 | 노랑 | CPU나 RAM 사용률이 70% 이상 80% 이하 |
-| 빨강 | CPU나 RAM 사용률이 80%를 넘음. 카드를 누를 수 없습니다 |
+| 빨강 | CPU나 RAM 사용률이 80%를 넘음. CPU가 넘으면 카드를 누를 수 없습니다. RAM만 넘으면 이미 켜진 기기가 있을 때만 누를 수 있습니다 |
 | 회색 | 사용률 보고가 없거나 30초 넘게 끊김. 카드에 **Stale**이 붙습니다 |
 
 빨간 카드에 마우스를 올리면 **This Mac is currently overloaded. Try again later.**가 표시됩니다. 다른 Mac을 고르거나 잠시 뒤에 다시 시도하세요.
+
+그 Mac에서 기기가 켜지는 중이면 카드에 **Starting a device**가 붙습니다. 이때는 CPU 사용률이 80%를 넘어도 카드를 누를 수 있습니다. 부팅이 CPU를 올리기 때문입니다. 한 Mac에서는 기기를 한 번에 하나씩 켭니다. 고른 기기를 켜야 하면 정보 카드에 **Another device is starting on this Mac. Yours starts next…**가 표시되고 최대 60초 기다린 뒤 켜집니다. Mac의 메모리가 심각하게 부족할 때는 **This Mac is low on memory. Yours starts when it frees up…**가 대신 표시되고 이때도 최대 60초 기다린 뒤 켜집니다.
 
 ### 기기 고르기 {#select-device}
 
@@ -29,6 +31,9 @@ QA 세션은 Mac에서 실행 중인 iOS 시뮬레이터나 Android 에뮬레이
 - **Booted**: 이미 켜져 있는 기기입니다.
 - **Available**: 꺼져 있고 바로 쓸 수 있는 기기입니다. 고르면 켜집니다.
 - **In use**: 다른 팀원이 쓰고 있어 고를 수 없습니다.
+- **Not enough memory to start**: Mac의 RAM 사용률이 80%를 넘어 이 기기를 켤 수 없습니다. tapflow가 이미 켜 둔 기기는 고를 수 있습니다.
+
+켜진 기기에 **Most services off**가 붙어 있으면 자동 실행이 백그라운드 서비스를 대부분 끈 채로 켠 기기입니다(`--service-tier slim`). 그 실행이 켜 두라고 지정한 서비스만 켜져 있습니다. 기기를 다시 켤 때까지 그대로입니다. 고른 뒤 툴바에서 재시작하면 서비스가 다시 켜집니다. 정보 카드에도 같은 안내가 표시됩니다.
 
 **Search device…** 검색창으로 기기 이름을 찾습니다. OS 버전 필터(기본값 **Any version**)로 목록을 좁힙니다.
 

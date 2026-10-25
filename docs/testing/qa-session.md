@@ -17,10 +17,12 @@ A QA Session is where you watch and drive an iOS simulator or Android emulator r
 |---|---|
 | Green | Plenty of headroom |
 | Yellow | CPU or RAM from 70% up to 80% |
-| Red | CPU or RAM over 80%. The card cannot be picked |
+| Red | CPU or RAM over 80%. Over on CPU, the card cannot be picked. Over on RAM only, it can be picked while one of its devices is already on |
 | Grey | No usage report, or none for over 30 seconds. The card shows **Stale** |
 
 Hovering a red card shows **This Mac is currently overloaded. Try again later.** Pick another Mac or try again shortly.
+
+While a device is starting on that Mac, the card shows **Starting a device**, and you can pick it even with CPU over 80%, because the starting device is what raised it. A Mac starts one device at a time, so if the device you pick needs starting, the info card shows **Another device is starting on this Mac. Yours starts next…** and it starts within 60 seconds. When the Mac is critically short of memory, the card shows **This Mac is low on memory. Yours starts when it frees up…** instead, with the same 60-second limit.
 
 ### Pick a device {#select-device}
 
@@ -29,6 +31,9 @@ Click a device under **Select device** to start the session. Each device shows i
 - **Booted**: already running.
 - **Available**: shut down and free. Picking it boots it.
 - **In use**: another teammate is using it, so it cannot be picked.
+- **Not enough memory to start**: the Mac's RAM is over 80%, so this device cannot be started. A device tapflow already has running can still be picked.
+
+A running device marked **Most services off** was started by an automated run with most background services turned off (`--service-tier slim`), apart from any it asked to keep. It stays that way until it restarts: pick it and restart it from the toolbar to turn them back on. The info card says so too.
 
 Find a device by name with **Search device…**. Narrow the list with the OS version filter (default **Any version**).
 

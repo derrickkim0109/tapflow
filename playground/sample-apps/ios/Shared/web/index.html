@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- The Web screen. Loaded from the app bundle, so it needs no network. Every control reports a tap to
+     the native status label through the `tapped` message handler, the same proof the native screens give. -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font: 17px -apple-system, sans-serif; padding: 16px; }
+    button, input { font: inherit; display: block; margin: 12px 0; padding: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Web</h1>
+  <button id="web.button" onclick="tapped('web.button')">Web button</button>
+  <input id="web.input" aria-label="Web input" placeholder="Type here" onfocus="tapped('web.input')">
+  <a id="web.link" href="#" onclick="tapped('web.link'); return false;">Web link</a>
+  <script>
+    // iOS posts through WKWebView's message handler, Android through the app's JavaScript interface.
+    function tapped(id) {
+      if (window.webkit && window.webkit.messageHandlers) window.webkit.messageHandlers.tapped.postMessage(id);
+      else if (window.TapflowAndroid) window.TapflowAndroid.tapped(id);
+    }
+  </script>
+</body>
+</html>

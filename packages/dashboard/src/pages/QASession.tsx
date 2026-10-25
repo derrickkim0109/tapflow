@@ -276,12 +276,16 @@ export function QASession() {
                   {versionedDevices.map((d: DeviceSummary) => {
                     const isBooted = d.status === 'booted'
                     const isBusy = d.busy
+                    // On a Mac short of memory the relay lets a person rejoin only a device it brought up itself; the
+                    // listing names the rest. Not `!isBooted`: a simulator running before its agent registered reads
+                    // booted and is still refused.
+                    const needsMemory = selectedSession?.admission.memoryRefuses.includes(d.id) ?? false
                     // **Says who is driving an AI-held device, and offers no way in.** Watching an AI session
                     // is for the person who started it, through the link their coding agent hands them; the
                     // device list only explains why the device is taken.
                     const statusLabel = isBusy
                       ? (d.holder ? `${holderKindLabel(d.holder.kind)} is driving it` : 'In use')
-                      : isBooted ? 'Booted' : 'Available'
+                      : needsMemory ? 'Not enough memory to start' : isBooted ? 'Booted' : 'Available'
                     const statusDot = isBusy
                       ? 'bg-amber-400'
                       : isBooted
@@ -290,7 +294,7 @@ export function QASession() {
                     return (
                       <button
                         key={d.id}
-                        disabled={isBusy || booting || !connected}
+                        disabled={isBusy || needsMemory || booting || !connected}
                         onClick={() => handleStartDevice(d)}
                         className={cn(
                           'flex flex-col gap-3 rounded-lg border p-3 text-left transition-colors min-h-[100px]',
@@ -305,6 +309,10 @@ export function QASession() {
                           <span className={cn('inline-block h-1.5 w-1.5 rounded-full', statusDot)} />
                           {statusLabel}
                         </span>
+                        {/* A run's `--service-tier slim` survives until the device restarts; say so before it is picked. */}
+                        {isBooted && typeof d.serviceTier === 'object' && d.serviceTier.name === 'slim' && (
+                          <span className="text-[10px] text-muted-foreground">Most services off</span>
+                        )}
                       </button>
                     )
                   })}
@@ -329,8 +337,11 @@ export function QASession() {
                     const deviceCount = s.devices.filter((d) => d.platform === os).length
                     const cpuPercent = res?.cpuPercent ?? 0
                     const memPercent = res ? (res.memUsedMB / res.memTotalMB) * 100 : 0
+                    // The dot and bars show the readings; whether the Mac takes a new session is the relay's call, which
+                    // pauses its CPU check while a device is booting there — a threshold recomputed here would block a
+                    // Mac the relay lets in.
                     const health = getResourceHealth(res, isStale)
-                    const isOverloaded = health === 'overloaded'
+                    const isOverloaded = s.admission.overloaded
                     return (
                       <TooltipProvider key={s.agentName}>
                         <Tooltip>
@@ -355,8 +366,10 @@ export function QASession() {
                                       {s.agentName ?? 'Unknown'}
                                     </span>
                                   </div>
-                                  {isStale && (
+                                  {isStale ? (
                                     <span className="shrink-0 text-[10px] font-medium text-amber-500">Stale</span>
+                                  ) : s.admission.booting && (
+                                    <span className="shrink-0 text-[10px] font-medium text-muted-foreground">Starting a device</span>
                                   )}
                                 </div>
                                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

@@ -128,4 +128,31 @@ describe('createResourceSampler', () => {
       expect(memUsedMB).toBe(3 * 1024) // 4GB - 1GB = 3 GB = 3072 MB
     })
   })
+
+  describe('getMemoryPressure', () => {
+    it.each([['1', 'normal'], ['2', 'warn'], ['4', 'critical']])('reads level %s as %s on macOS', (raw, level) => {
+      vi.spyOn(os, 'platform').mockReturnValue('darwin')
+      spawnSyncMock.mockReturnValue({ stdout: `${raw}\n`, status: 0 })
+      expect(createResourceSampler().getMemoryPressure()).toBe(level)
+      expect(spawnSyncMock).toHaveBeenLastCalledWith('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], { encoding: 'utf8', timeout: 1_000 })
+    })
+
+    it('gives no reading for a level it does not know, or when sysctl fails', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('darwin')
+      spawnSyncMock.mockReturnValue({ stdout: '8\n', status: 0 })
+      expect(createResourceSampler().getMemoryPressure()).toBeUndefined()
+      spawnSyncMock.mockReturnValue({ stdout: '', status: 1 })
+      expect(createResourceSampler().getMemoryPressure()).toBeUndefined()
+      // spawnSync reports a missing binary through `error`, with no stdout at all.
+      spawnSyncMock.mockReturnValue({ stdout: null, status: null, error: new Error('ENOENT') })
+      expect(createResourceSampler().getMemoryPressure()).toBeUndefined()
+    })
+
+    it('does not ask outside macOS, where the key does not exist', () => {
+      vi.spyOn(os, 'platform').mockReturnValue('linux')
+      spawnSyncMock.mockClear()
+      expect(createResourceSampler().getMemoryPressure()).toBeUndefined()
+      expect(spawnSyncMock).not.toHaveBeenCalled()
+    })
+  })
 })

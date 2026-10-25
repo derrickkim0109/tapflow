@@ -19,12 +19,18 @@ It uses the Mac you already own — no external cloud dependency.
 
 Remove friction. Anyone on the team can open a browser and test the app on a real simulator, without Xcode, without device setup, without accounts on external services.
 
-### Two testing modes
+### Three ways to use tapflow
 
-- **Manual testing** (primary): CI uploads a build → team reviews in the browser. This is tapflow's main use case.
-- **AI Agent via MCP** (experimental): An LLM agent controls the simulator automatically using `@tapflowio/mcp-server`. This is a separate, opt-in feature — it does not affect the manual testing path.
+**tapflow Core** is the layer everything shares: devices, sessions, UI trees, builds, run records,
+and resource management. It is a concept, not a package. A team can start from any of the three:
 
-When designing features or writing docs, default to the manual testing perspective. The AI Agent path is additive, not a replacement.
+- **Manual QA**: CI uploads a build → the team tests in the browser. The most mature path.
+- **AI agents via MCP** (experimental): an LLM agent drives a device through `@tapflowio/mcp-server`.
+- **Automation** (experimental): the flow runner replays YAML flows deterministically, mainly in CI.
+
+Don't design for a single entry point. Every change keeps the hard line in [VISION.md](./VISION.md):
+replay calls no model, tapflow saves agent or model output as a flow only after a deterministic replay passes, and
+Manual QA and the flow runner never depend on an agent or any model.
 
 ## WHY
 
@@ -32,7 +38,7 @@ When designing features or writing docs, default to the manual testing perspecti
 - Reuses infrastructure (Mac) the team already owns.
 - Fully open-source and customizable.
 
-For the product direction and philosophy behind these — Manual First, Flow Capture as the moat, AI as an additive harness — see [VISION.md](./VISION.md).
+For the product direction and philosophy behind these — start anywhere, replay without a model, Flow Capture as the moat — see [VISION.md](./VISION.md).
 
 ---
 

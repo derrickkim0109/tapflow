@@ -105,6 +105,11 @@ export const UNREPORTED_FLOW_LABEL: Record<Extract<RunFlow['status'], 'running' 
   'not-run': 'Not run',
 }
 
+export const SKIP_REASON_LABEL: Record<Extract<RunFlow, { status: 'skipped' }>['skipReason'], string> = {
+  'app-mismatch': 'Skipped: another app',
+  'tag-filter': 'Skipped: tags',
+}
+
 /** Seven characters, as every git UI shortens a commit. */
 export function shortCommit(sha: string): string {
   return sha.slice(0, 7)

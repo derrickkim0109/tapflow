@@ -31,6 +31,7 @@ export type Step =
 export interface Flow {
   name: string
   appId?: string
+  tags?: string[]
   steps: Step[]
   file?: string
 }
@@ -172,12 +173,16 @@ export function parseFlow(yamlText: string, file: string): Flow {
   }
   if (!isRecord(doc)) throw new ValidationError(`${file}: flow must be a YAML mapping with a "steps" list`)
 
-  const { name, appId, steps, ...rest } = doc as { name?: unknown; appId?: unknown; steps?: unknown }
+  const { name, appId, tags, steps, ...rest } = doc as { name?: unknown; appId?: unknown; tags?: unknown; steps?: unknown }
   const unknownKeys = Object.keys(rest)
   if (unknownKeys.length > 0) throw new ValidationError(`${file}: unknown top-level keys: ${unknownKeys.join(', ')}`)
   if (name !== undefined && typeof name !== 'string') throw new ValidationError(`${file}: "name" must be a string`)
   if (appId !== undefined && typeof appId !== 'string') throw new ValidationError(`${file}: "appId" must be a string`)
   if (!Array.isArray(steps) || steps.length === 0) throw new ValidationError(`${file}: "steps" must be a non-empty list`)
+  // `--include-tags` and `--exclude-tags` take a comma-separated list, so a tag with a comma in it could never be named.
+  if (tags !== undefined && (!Array.isArray(tags) || tags.some((t) => typeof t !== 'string' || t.trim().length === 0 || t.includes(',')))) {
+    throw new ValidationError(`${file}: "tags" must be a list of non-empty strings without commas`)
+  }
 
   const parsedSteps = steps.map((raw, i) => parseStep(raw, `${file}: steps[${i}]`))
 
@@ -190,6 +195,7 @@ export function parseFlow(yamlText: string, file: string): Flow {
   return {
     name: (name as string | undefined) ?? path.basename(file).replace(/\.ya?ml$/i, ''),
     ...(appId !== undefined ? { appId: appId as string } : {}),
+    ...(tags !== undefined ? { tags: (tags as string[]).map((t) => t.trim()) } : {}),
     steps: parsedSteps,
     file,
   }

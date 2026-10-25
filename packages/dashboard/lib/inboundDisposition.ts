@@ -28,7 +28,7 @@ import type { BrowserInbound } from '@tapflowio/protocol'
  *    relay, so a reply to its request lands on the dashboard once the dashboard joins. "We never send
  *    `input:type`, so its replies cannot arrive" is true per *session*, not per socket.
  *
- * Any browser socket can receive any of the 29. That is why every entry is present and `ignored` says
+ * Any browser socket can receive any of them. That is why every entry is present and `ignored` says
  * *why* rather than *cannot happen*.
  *
  * **Two siblings exist now** — `mcp-server/src/inboundDisposition.ts` and
@@ -63,6 +63,9 @@ export const INBOUND_DISPOSITION = {
   'network:state': { at: 'DeviceViewer, useNetworkControl' },
   'network:error': { at: 'DeviceViewer, useNetworkControl' },
   'device:boot-error': { at: 'DeviceViewer' },
+  'device:boot-waiting': { at: 'DeviceViewer' },
+  'device:leased': { ignored: 'Answers `device:lease`, which the dashboard never sends: a person picks the device.' },
+  'device:lease-refused': { ignored: 'Answers `device:lease`, which the dashboard never sends.' },
   'device:booting': { at: 'DeviceViewer, useWatchSession' },
   'device:ready': { at: 'DeviceViewer, useWatchSession' },
   // `DeviceViewer` joined this pair with #628: a reboot is a `device:shutdown` followed by a

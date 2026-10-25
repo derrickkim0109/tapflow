@@ -659,3 +659,43 @@ describe('SimctlWrapper', () => {
     })
   })
 })
+
+describe('SimctlWrapper run reset commands', () => {
+  it('bounds each device-wide reset and names the device explicitly', async () => {
+    const runner = mockRunner()
+    const sw = new SimctlWrapper(runner)
+    await sw.resetKeychain('dev-1')
+    await sw.resetPrivacy('dev-1')
+    await sw.clearLocation('dev-1')
+    await sw.waitForBootStatus('dev-1')
+    const calls = (runner.execWithOpts as ReturnType<typeof vi.fn>).mock.calls
+    expect(calls.map((c) => c.slice(1))).toEqual([
+      ['keychain', 'dev-1', 'reset'], ['privacy', 'dev-1', 'reset', 'all'], ['location', 'dev-1', 'clear'], ['bootstatus', 'dev-1'],
+    ])
+    for (const c of calls) expect((c[0] as SimctlExecOpts).timeoutMs).toBeGreaterThan(0)
+  })
+
+  it('treats an app that is not installed as nothing to clear, and anything else as a failure', async () => {
+    const missing = Object.assign(new Error('Command failed'), { stderr: 'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=2):\nNo such file or directory' })
+    const runner = mockRunner()
+    vi.mocked(runner.execWithOpts).mockImplementation(async (_o: SimctlExecOpts, ...args: string[]) => { if (args[0] === 'get_app_container') throw missing; return '' })
+    await expect(new SimctlWrapper(runner).clearAppDataIfInstalled('dev-1', 'com.example.app')).resolves.toBeUndefined()
+
+    vi.mocked(runner.execWithOpts).mockImplementation(async (_o: SimctlExecOpts, ...args: string[]) => { if (args[0] === 'get_app_container') throw new Error('CoreSimulatorService connection interrupted'); return '' })
+    await expect(new SimctlWrapper(runner).clearAppDataIfInstalled('dev-1', 'com.example.app')).rejects.toThrow('interrupted')
+  })
+
+  // These gate a boot's ready, so a wedged CoreSimulatorService must not hold it with nothing able to release it.
+  it('bounds the app commands a run reset uses, and only those', async () => {
+    const runner = mockRunner({ get_app_container: '/tmp/tapflow-no-such-container' })
+    const sw = new SimctlWrapper(runner)
+    await sw.uninstallAppForReset('dev-1', 'com.example.app')
+    await sw.clearAppDataIfInstalled('dev-1', 'com.example.app')
+    const bounded = vi.mocked(runner.execWithOpts).mock.calls
+    expect(bounded.map((c) => c[1])).toEqual(['uninstall', 'terminate', 'get_app_container'])
+    for (const c of bounded) expect(c[0].timeoutMs).toBeGreaterThan(0)
+    expect(runner.exec).not.toHaveBeenCalled()
+    await sw.uninstallApp('dev-1', 'com.example.app')
+    expect(runner.exec).toHaveBeenCalledWith('uninstall', 'dev-1', 'com.example.app')
+  })
+})

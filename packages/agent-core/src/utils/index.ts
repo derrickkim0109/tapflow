@@ -1,4 +1,7 @@
 export { createResourceSampler } from './resources.js'
+export { sameServiceTier } from './serviceTier.js'
+export { RESETTABLE_APP_ID, RUN_RESET_BUDGET_MS, resetApps, runResetSteps } from './runReset.js'
+export type { RunResetStep } from './runReset.js'
 export {
   registerStreamWs,
   disableNagle,

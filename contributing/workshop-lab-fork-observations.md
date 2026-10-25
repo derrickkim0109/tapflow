@@ -73,7 +73,7 @@ ephemeral sessions ever move onto the roadmap, they would today require touching
 `RelayServer` and `SessionManager` directly, the same way this fork did. That is a
 seam we have not designed. Worth noting *where* it hurts before deciding whether it
 is worth a seam at all. We do **not** take the seat-pool feature itself: pooled
-multi-tenant leasing is outside tapflow's manual-first, trusted-team scope, and
+multi-tenant leasing is outside tapflow's self-hosted, trusted-team scope, and
 adding unrequested features is against our roadmap discipline.
 
 ## What we deliberately do not take from the report

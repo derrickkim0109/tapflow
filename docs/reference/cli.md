@@ -382,15 +382,33 @@ tapflow flow run .tapflow/flows/login-smoke.yaml
 | `--junit <path>` | — | Where to write a JUnit XML report |
 | `--artifacts <dir>` | `.tapflow/artifacts` | Directory for failure screenshots |
 | `--timeout <seconds>` | `10` | Default wait per selector (seconds) |
+| `--service-tier <tier>` | the agent's setting | Background services the device boots with: `stock` (all on), `lean`, or `slim` (almost all off). iOS 18.5 and later. See below. |
+| `--keep <features>` | — | Features to keep on under `--service-tier` (comma-separated), such as `push,photos` |
+| `--admission-timeout <seconds>` | `600` | Longest wait while another device boots on the same Mac, the Mac is critically short of memory, every automation device the Mac allows is in use, or it is over its CPU or memory limit (seconds). Past it, the run stops with exit code `2`. |
 | `--no-record` | — | Do not record this run on the relay |
+| `--no-reset` | — | Keep what earlier runs left on the device. See below. |
+| `--include-tags <tags>` | — | Run only flows tagged with at least one of these (comma-separated) |
+| `--exclude-tags <tags>` | — | Skip flows tagged with any of these (comma-separated). Wins over `--include-tags`. |
+| `--parallel <n>` | — | Share the flows across up to `n` devices (1–16) the relay chooses. See below. |
+| `--platform <platform>` | — | The platform of a `--parallel` run without `--build`: `ios` or `android` |
 
 With neither `--session` nor `--device`, it uses the booted device when exactly one is booted. With none booted, or more than one, it stops with an environment error.
+
+`--service-tier slim` boots the device with almost every background service off, which makes its boot lighter on the other sessions of the same Mac: measured on an 8 GB Mac, the time the boot kept the CPU saturated fell from 20–49 s with `lean` to 7–14 s. It also turns off push, StoreKit, Wallet, photos, contacts, widgets, Spotlight and on-device models, so name what your app needs with `--keep`: `push`, `storekit`, `app-store`, `universal-links`, `spotlight`, `siri`, `icloud`, `keychain-sync`, `contacts`, `calendar`, `reminders`, `mail`, `photos`, `health`, `homekit`, `imessage`, `widgets`, `wallet`, `maps`, `weather`, `news`, `game-center`, `find-my`, `screen-time`. A device already running on another tier is restarted onto the one you ask for. Without the option, the device boots as the agent is set (`agent.lean`), the same as when a person picks it.
+
+Before the flows run, the device is reset so a run does not start from what an earlier one left. On iOS, the build the run installs is uninstalled first when the relay can say which app it is (a token with `builds:write`), which also removes its notification and privacy permissions. Other apps the flows name, or the build when the relay cannot say which app it is, have their data cleared. On iOS the keychain, the privacy permissions `simctl privacy` manages, the pasteboard and the simulated location are reset too, for every app on the device, so point a run at a device a person is using only if that is acceptable. Root certificates added with `simctl keychain add-root-cert` stay trusted. On Android the reset clears the data of the build and the apps the flows name, and the clipboard of an emulator streaming over gRPC (the default). The run prints what it reset, and warns when the agent or relay is too old to reset. Pass `--no-reset` to keep the device as it is.
+
+A Mac boots one device at a time, because a booting device slows the other sessions on that Mac. When another device is booting, the run lets go of its session, waits, and tries again, printing why it is waiting. A boot a person started goes ahead of a waiting run.
+
+With `--parallel 3`, the relay chooses three devices of the platform and gives them to the run: devices an earlier run left up first, then devices it boots. It never picks a device a person is using or may come back to. Each device is reset (unless `--no-reset`) and has the build installed, then takes flows one at a time until none are left, so a slow flow holds up only its own device. The platform comes from the `--build` build, or from `--platform` when there is none, and `--parallel` cannot be combined with `--device` or `--session`. A device that fails to boot or install, or whose flow fails for a reason outside the app, leaves the run and the others go on; that flow is not run again. Each device's lines are prefixed with its name, and the JUnit report has a `<testsuite>` per device. Flows no device ran are reported as errors and end the run with exit code `2`.
+
+With `--build`, a flow whose `appId` differs from that build's bundle ID is skipped rather than run. So is a flow the tag options filter out. A skipped flow does not count as a failure, but when no flow runs at all, the run stops with exit code `2` before choosing a device. See [Choosing flows](/automation/flows#choosing-flows).
 
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Every flow passed |
 | `1` | At least one flow failed on a product problem |
-| `2` | Environment or config error, or every failed flow failed on an environment problem |
+| `2` | Environment or config error, every failed flow failed on an environment problem, or a `--parallel` run left flows that no device ran |
 | `130` | Cancelled by `SIGINT` |
 | `143` | Cancelled by `SIGTERM` |
 

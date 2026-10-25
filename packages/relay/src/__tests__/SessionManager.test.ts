@@ -7,6 +7,8 @@ import type { WebSocket } from 'ws'
 const OPEN = 1
 const mockSocket = () => ({ readyState: OPEN } as WebSocket)
 const closedSocket = () => ({ readyState: 3 } as WebSocket)
+/** The relay's per-Mac admission reading, which these tests are not about. */
+const IDLE_MAC = () => ({ booting: false, overloaded: false, memoryRefuses: [] })
 
 /**
  * A distinct owner per socket, which is what an unidentified connection gets from the relay — so every
@@ -321,7 +323,7 @@ describe('SessionManager', () => {
     it('list() has undefined resources when none reported', () => {
       const sm = new SessionManager()
       sm.create(mockSocket(), [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }], 'Mac1')
-      expect(sm.list('asker', () => true)[0].resources).toBeUndefined()
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].resources).toBeUndefined()
     })
 
     it('setResources() is reflected in list()', () => {
@@ -330,7 +332,7 @@ describe('SessionManager', () => {
       sm.create(ws, [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }], 'Mac1')
       const resources = { cpuPercent: 42, memUsedMB: 8192, memTotalMB: 16384, slotsAvailable: 2, slotsTotal: 3, reportedAt: 1000 }
       sm.setResources(ws, resources)
-      expect(sm.list('asker', () => true)[0].resources).toEqual(resources)
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].resources).toEqual(resources)
     })
 
     it('removeResources() clears resources from list()', () => {
@@ -339,7 +341,7 @@ describe('SessionManager', () => {
       sm.create(ws, [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }], 'Mac1')
       sm.setResources(ws, { cpuPercent: 50, memUsedMB: 4096, memTotalMB: 16384, slotsAvailable: 3, slotsTotal: 3, reportedAt: 1000 })
       sm.removeResources(ws)
-      expect(sm.list('asker', () => true)[0].resources).toBeUndefined()
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].resources).toBeUndefined()
     })
 
     it('setResources() on unknown socket does not throw', () => {
@@ -354,7 +356,7 @@ describe('SessionManager', () => {
       sm.create(ws1, [{ id: 'd1', name: 'A', platform: 'ios', status: 'shutdown' }], 'Mac1')
       sm.create(ws2, [{ id: 'd2', name: 'B', platform: 'ios', status: 'shutdown' }], 'Mac2')
       sm.setResources(ws1, { cpuPercent: 10, memUsedMB: 1000, memTotalMB: 8000, slotsAvailable: 3, slotsTotal: 3, reportedAt: 1000 })
-      const listed = sm.list('asker', () => true)
+      const listed = sm.list('asker', () => true, IDLE_MAC)
       const mac1 = listed.find((g) => g.agentName === 'Mac1')!
       const mac2 = listed.find((g) => g.agentName === 'Mac2')!
       expect(mac1.resources?.cpuPercent).toBe(10)
@@ -411,7 +413,7 @@ describe('SessionManager', () => {
   describe('list()', () => {
     it('returns empty array when no sessions', () => {
       const sm = new SessionManager()
-      expect(sm.list('asker', () => true)).toEqual([])
+      expect(sm.list('asker', () => true, IDLE_MAC)).toEqual([])
     })
 
     it('groups devices by agent into one SessionInfo', () => {
@@ -421,7 +423,7 @@ describe('SessionManager', () => {
         { id: 'devA', name: 'iPhone A', platform: 'ios', status: 'shutdown' },
         { id: 'devB', name: 'iPhone B', platform: 'ios', status: 'shutdown' },
       ], 'MyMac')
-      const listed = sm.list('asker', () => true)
+      const listed = sm.list('asker', () => true, IDLE_MAC)
       expect(listed).toHaveLength(1)
       expect(listed[0].agentName).toBe('MyMac')
       expect(listed[0].devices).toHaveLength(2)
@@ -431,7 +433,7 @@ describe('SessionManager', () => {
       const sm = new SessionManager()
       const ws = mockSocket()
       const [idA] = sm.create(ws, [{ id: 'devA', name: 'A', platform: 'ios', status: 'shutdown' }])
-      const listed = sm.list('asker', () => true)
+      const listed = sm.list('asker', () => true, IDLE_MAC)
       expect(listed[0].devices[0]!.sessionId).toBe(idA)
     })
 
@@ -444,7 +446,7 @@ describe('SessionManager', () => {
         [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }],
         'MyMac', 'ios', undefined, ['clipboard', 'full-reset'],
       )
-      expect(sm.list('asker', () => true)[0].capabilities).toEqual(['clipboard', 'full-reset'])
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].capabilities).toEqual(['clipboard', 'full-reset'])
     })
 
     // An agent that predates the field registers without it. `[]` — "advertises nothing" — is the
@@ -453,7 +455,7 @@ describe('SessionManager', () => {
     it('reports an agent that advertised nothing as empty, not undefined', () => {
       const sm = new SessionManager()
       sm.create(mockSocket(), [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }], 'MyMac')
-      expect(sm.list('asker', () => true)[0].capabilities).toEqual([])
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].capabilities).toEqual([])
     })
 
     it('is busy for someone else, and not for the holder', () => {
@@ -465,8 +467,8 @@ describe('SessionManager', () => {
       const [id] = sm.create(mockSocket(), [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }])
       const holder = mockSocket()
       sm.join(id, holder, asClient('tab-a'), () => true)
-      expect(sm.list('tab-b', () => true)[0].devices[0]!.busy).toBe(true)
-      expect(sm.list('tab-a', () => true)[0].devices[0]!.busy).toBe(false)
+      expect(sm.list('tab-b', () => true, IDLE_MAC)[0].devices[0]!.busy).toBe(true)
+      expect(sm.list('tab-a', () => true, IDLE_MAC)[0].devices[0]!.busy).toBe(false)
     })
 
     it('is not busy when the holder has stopped answering', () => {
@@ -475,13 +477,13 @@ describe('SessionManager', () => {
       const sm = new SessionManager()
       const [id] = sm.create(mockSocket(), [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }])
       sm.join(id, mockSocket(), asClient('tab-a'), () => true)
-      expect(sm.list('tab-b', () => false)[0].devices[0]!.busy).toBe(false)
+      expect(sm.list('tab-b', () => false, IDLE_MAC)[0].devices[0]!.busy).toBe(false)
     })
 
     it('reflects busy=false when browserSocket is null', () => {
       const sm = new SessionManager()
       sm.create(mockSocket(), [{ id: 'd1', name: 'X', platform: 'ios', status: 'shutdown' }])
-      expect(sm.list('asker', () => true)[0].devices[0]!.busy).toBe(false)
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].devices[0]!.busy).toBe(false)
     })
 
   })
@@ -497,12 +499,12 @@ describe('SessionManager', () => {
     it('carries a device\'s form factor to the list, and takes the new one on rebind', () => {
       const sm = new SessionManager()
       const [id] = sm.create(mockSocket(), [{ ...DEV, formFactor: 'tablet' }])
-      expect(sm.list('asker', () => true)[0].devices[0].formFactor).toBe('tablet')
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].devices[0].formFactor).toBe('tablet')
 
       const ws = mockSocket()
       sm.rebind(id!, ws, { ...DEV, formFactor: 'phone' }, AGENT)
       expect(sm.get(id!)?.deviceFormFactor).toBe('phone')
-      expect(sm.list('asker', () => true).flatMap((g) => g.devices)[0].formFactor).toBe('phone')
+      expect(sm.list('asker', () => true, IDLE_MAC).flatMap((g) => g.devices)[0].formFactor).toBe('phone')
     })
 
     // An agent that cannot tell, or predates the field, rebinding over one that could: absent wins,
@@ -554,7 +556,7 @@ describe('SessionManager', () => {
     const sm = new SessionManager()
     sm.create(mockSocket(), [{ id: 'devA', name: 'A', platform: 'ios', status: 'shutdown' }], 'Mac1')
     sm.create(mockSocket(), [{ id: 'devB', name: 'B', platform: 'ios', status: 'shutdown' }], 'Mac2')
-    const listed = sm.list('asker', () => true)
+    const listed = sm.list('asker', () => true, IDLE_MAC)
     expect(listed).toHaveLength(2)
   })
 
@@ -566,7 +568,7 @@ describe('SessionManager', () => {
       const sm = new SessionManager()
       sm.create(closedSocket(), [{ id: 'devA', name: 'A', platform: 'ios', status: 'booted' }])
 
-      expect(sm.list('asker', () => true)).toEqual([])
+      expect(sm.list('asker', () => true, IDLE_MAC)).toEqual([])
     })
 
     it('lists it again once it is rebound to a live socket', () => {
@@ -578,8 +580,8 @@ describe('SessionManager', () => {
 
       sm.rebind(id!, live, dev, { agentId: 'mac-1' })
 
-      expect(sm.list('asker', () => true)).toHaveLength(1)
-      expect(sm.list('asker', () => true)[0]!.devices[0]!.sessionId).toBe(id)
+      expect(sm.list('asker', () => true, IDLE_MAC)).toHaveLength(1)
+      expect(sm.list('asker', () => true, IDLE_MAC)[0]!.devices[0]!.sessionId).toBe(id)
     })
   })
 })

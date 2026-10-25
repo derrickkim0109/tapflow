@@ -814,6 +814,8 @@ Body (JSON):
   flows    array   필수  실행할 플로우 [{ name, file? }], 최대 500개
   buildId  number  선택  테스트하는 빌드
   ci       object  선택  { provider?, branch?, commit?, jobUrl? }. jobUrl은 http(s) 주소만 저장합니다
+  serviceTier  object  선택  실행이 기기를 켤 때 요청한 서비스 범위 { name: "stock" | "lean" | "slim", keep: [기능] }. 기기를 켜기 전에 요청한 값 그대로 저장합니다. 형식이 맞지 않으면 저장하지 않습니다
+  resetRequested  boolean  선택  실행이 기기 초기화를 요청했는지. 초기화 결과를 보고받지 못한 실행과 초기화를 요청하지 않은 실행을 구분하는 데 씁니다
 ```
 
 **응답 `201`**
@@ -822,19 +824,50 @@ Body (JSON):
 { "id": "3f2b0c7e-8a41-4b5e-9d0f-1c2d3e4f5a6b" }
 ```
 
+### `POST /api/v1/runs/:id/device`
+
+기기를 켠 결과를 보고합니다. 이미 켜져 있었는지와 무엇을 초기화했는지를 담습니다. 러너는 부팅 응답을 받는 즉시 보내므로 설치에 실패하거나 취소된 실행에도 남습니다.
+
+```
+Body (JSON):
+  sessionId   string   선택  기기를 붙잡은 세션. 여러 기기에서 도는 실행은 세션마다 따로 저장합니다
+  deviceId, deviceName  string  선택
+  cold        boolean  선택  false면 이미 켜져 있던 기기입니다
+  runReset    object   선택  { done: [항목], failed: [항목] }. 형식이 맞지 않으면 저장하지 않습니다
+```
+
+같은 세션으로 다시 보고하면 그 기기의 기록만 덮어씁니다.
+
+**응답 `200`** `{ "ok": true }`
+
+### `POST /api/v1/runs/:id/flows/:idx/start`
+
+`idx`번째 플로우를 기기에서 시작했다고 알립니다. 대시보드는 이 보고를 받은 플로우를 그 기기에서 실행 중으로 표시합니다. 이미 결과를 보고한 플로우에는 영향이 없습니다.
+
+```
+Body (JSON):
+  sessionId   string  필수  플로우를 실행하는 기기의 세션
+  deviceId, deviceName  string  선택
+```
+
+**응답 `200`** `{ "ok": true }`. `sessionId`가 없으면 `400`을 받습니다.
+
 ### `POST /api/v1/runs/:id/flows/:idx`
 
 `idx`번째 플로우의 결과를 보고합니다. 같은 플로우를 다시 보고하면 덮어씁니다.
 
 ```
 Body (JSON):
-  status          "passed" | "failed"  필수
+  status          "passed" | "failed" | "skipped"  필수
+  skipReason      string               skipped일 때 필수, 아니면 보내지 않음  "app-mismatch" | "tag-filter"
   durationMs      number               필수
   steps           array                필수  [{ index, name, status: "passed"|"failed"|"skipped", durationMs, message? }], 최대 1000개
   failureKind     string               선택  "product" | "environment"
-  failureMessage  string               선택
+  failureMessage  string               선택  skipped 플로우에서는 건너뛴 이유를 사람이 읽는 문장으로
   deviceId, deviceName, platform  string  선택
 ```
+
+`skipped`는 러너가 실행하지 않은 플로우입니다. `app-mismatch`는 플로우의 `appId`가 빌드와 다른 경우, `tag-filter`는 태그 옵션에 걸러진 경우입니다. skipped 플로우에는 스크린샷을 올릴 수 없고 이미 `passed`나 `failed`로 보고한 플로우는 skipped로 다시 보고할 수 없습니다(`409`).
 
 **응답 `200`** `{ "ok": true }`
 
@@ -889,11 +922,13 @@ Query:
       "exitCode": 1,
       "isCi": true,
       "ci": { "provider": "github", "branch": "main", "commit": "abc1234", "jobUrl": "https://github.com/acme/app/actions/runs/1" },
+      "serviceTier": null,
       "build": { "id": 7, "appName": "Coffee", "versionName": "1.2.0", "buildNumber": "42", "platform": "ios" },
       "createdBy": "ci-bot",
       "flowsTotal": 2,
       "flowsPassed": 1,
       "flowsFailed": 1,
+      "flowsSkipped": 0,
       "createdAt": "2026-10-11 01:00:00",
       "finishedAt": "2026-10-11 01:01:05"
     }
@@ -909,8 +944,10 @@ Query:
 
 실행 하나와 플로우별 결과를 돌려줍니다. 목록 항목의 필드에 아래가 더해집니다.
 
-- `flows`: 계획된 플로우 순서대로입니다. 보고된 플로우는 `status`(`passed`·`failed`)와 `steps`, `device`, `durationMs`, `hasScreenshot`을 담습니다. 영상이 있는 플로우는 `video`에 `ended`, `endReason`, `evicted`, `notRecorded`, `bytes`를 담고 영상이 없으면 `null`입니다. `notRecorded`는 러너가 영상을 남길 수 없었던 이유(`jpeg`, `no-keyframe`)입니다. 아직 보고되지 않은 플로우는 진행 중인 실행에서 `running`(지금 실행 중)이나 `pending`, 끝난 실행에서 `not-run`입니다.
+- `deviceReset`: 실행이 기기를 초기화했는지입니다. 초기화 기능보다 오래된 러너의 실행은 `null`입니다. `requested`는 요청 여부이고 기기를 켠 결과를 보고받으면 `booted`, `cold`, `report`가 더해집니다. 러너가 세션을 알려 주면 `devices`에 기기마다 `sessionId`, `deviceId`, `deviceName`, `cold`, `report`가 담깁니다. 기기가 여럿이면 바깥 필드는 첫 기기의 결과입니다. 이 필드는 목록 항목에도 있습니다.
+- `flows`: 계획된 플로우 순서대로입니다. 보고된 플로우는 `status`(`passed`·`failed`)와 `steps`, `device`, `durationMs`, `hasScreenshot`을 담습니다. 건너뛴 플로우는 `status: "skipped"`와 `skipReason`, 이유를 담은 `failureMessage`를 담습니다. 영상이 있는 플로우는 `video`에 `ended`, `endReason`, `evicted`, `notRecorded`, `bytes`를 담고 영상이 없으면 `null`입니다. `notRecorded`는 러너가 영상을 남길 수 없었던 이유(`jpeg`, `no-keyframe`)입니다. 아직 보고되지 않은 플로우는 진행 중인 실행에서 `running`(지금 실행 중)이나 `pending`, 끝난 실행에서 `not-run`입니다. 러너가 시작을 알린 `running` 플로우에는 `device`(`id`, `name`, `sessionId`)가 있습니다. 시작을 알리지 않는 옛 러너의 실행에서는 보고되지 않은 첫 플로우를 `running`으로 표시합니다.
 - `watchSessionId`: 러너가 지금 붙잡고 있는 세션 ID입니다. 진행 중일 때만 값이 있고 [AI 세션 보기](/ko/automation/mcp-server#watch-the-device) 페이지 주소에 씁니다.
+- `watchSessionIds`: 러너가 지금 붙잡고 있는 세션 전부입니다. 여러 기기에서 도는 실행은 기기마다 하나씩이고 끝난 실행에서는 빈 배열입니다.
 
 존재하지 않는 실행이면 `404`를 받습니다.
 

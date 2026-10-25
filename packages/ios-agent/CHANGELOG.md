@@ -1,5 +1,37 @@
 # @tapflowio/ios-agent
 
+## 0.29.0
+
+### Minor Changes
+
+- 64a7bc0: The boot gate refuses new devices on a Mac whose kernel reports critical memory pressure. Agents report `kern.memorystatus_vm_pressure_level` as `agent:resources.resources.memoryPressure` (`normal`, `warn`, `critical`; macOS only, absent elsewhere). While an agent on a Mac reports `critical`, the relay refuses automated cold boots there with `device:boot-error` `reason: 'host-memory-critical'`, and holds a person's cold boot in the reservation as it does behind another boot; the reading lapses 15 s after the last report that said so. `device:boot-waiting` carries an optional `reason` and is sent again when the wait's reason changes. flow-runner and MCP treat any `reason` on a refused boot as a busy Mac, including one they do not know (`AdmissionReason`, `'unrecognised-refusal'`), so a newer relay's reason is waited out instead of failing the run.
+- d310508: `tapflow flow run` resets the device before its flows, and `--no-reset` turns that off. `device:boot` takes `runReset: { uninstall, clear }` (app ids), which a relay drops rather than refusing the boot when it is malformed; the agent carries it out after the device is up and before `device:ready`, and reports `runReset: { done, failed }` there as `RunResetItem`s. iOS uninstalls the apps the run will install, clears the files of the rest, waits for `simctl bootstatus` on a cold boot, then resets the keychain, `simctl privacy` grants, pasteboard and simulated location; Android `pm clear`s every named app and clears the clipboard over gRPC. `agent-core` adds `runResetSteps`, `resetApps` and `RESETTABLE_APP_ID`, which keeps an id that is not an app id away from `adb shell`. `RelayClient.bootDevice` now returns what the ready said (`BootOutcome`). Run records gain `device_reset_json` (migration 019), written as `requested` at creation and filled from `POST /api/v1/runs/:id/device` right after the boot; the run page shows it.
+- d4055b4: A run can choose which background services an iOS simulator boots with. `device:boot.payload.serviceTier` (`{ name: 'stock' | 'lean' | 'slim', keep }`) asks for a tier; the iOS agent writes exactly that tier's launchd overrides before the boot — reverting the previous one first, so a device a run left slim comes back to a person on exactly the default tier — and restarts a running device that is on another tier. A boot that asks for none gets `agent.lean`'s tier, as before. Each device reports its current tier on register and on `device:ready`, and the relay counts a restart onto another tier as a cold boot for the per-Mac boot gate. `tapflow flow run --service-tier slim --keep push,photos` asks for it; flow-runner exports `parseServiceTier` and `SERVICE_FEATURES`; agent-core exports `sameServiceTier`. `LeanStore.apply` is now private: change a device's tier through `setTier`.
+- 486b1d3: The UI tree carries a text field's placeholder as its own field, `placeholder`, and a bare-text selector falls back to it after label. A field with no label and no identifier could not be found by any selector before; `tapOn: "Nickname"` now finds it. The placeholder is the last stage, after a partial label, so a step that found an element before finds the same one now, and it never matches in part. A step that found nothing because the field had only a placeholder now sees it: `assertNotVisible` on that text, which always passed before, now fails while the field is on screen. iOS reads it from `placeholderValue`, which it keeps after a value is typed. The relay's inbound schema lists the field, so it reaches clients. Android is unchanged for now.
+
+### Patch Changes
+
+- fe644c9: `device:ready` carries an optional `payload.cold`: whether this boot brought the device up, as opposed to finding it already running. Both agents report it. The relay's per-host boot gate, in this release, charges a boot by it. Absent means unknown, never `false`.
+
+
+- 17aa45f: A tap from a flow or an AI agent on iOS now lasts at least 50ms. Clients send the touch's down and up back to back, and a `UISwitch` ignored most such taps (3 of 20 toggled on iOS 26.5, 20 of 20 with the hold); the agent now holds the up back until the touch has lasted that long, and acks the tap once the up is written. A person's tap and a swipe usually last longer already, so they are rarely held, and one that is held only gains contact time.
+- 0d4a09c: The iOS UI tree reads a text field's identifier and a selected element's label correctly. A field with placeholder text reported an identifier with the placeholder glued on (`email', placeholderValue: 'Email`), so a flow or MCP selector naming it by `id` never matched; a selected tab reported an empty label, so it could not be found by its text once chosen.
+- 5d774ab: Lean mode no longer disables `com.apple.financed`. Wallet's `passd` depends on it and crashed at start-up on lean simulators (3 of 7 measured boots on iOS 26.5, none with it on). A device already lean picks the change up on its next cold boot. The slim tier's `wallet` keep now keeps `com.apple.financed` along with `com.apple.passd`.
+- 0e18ee1: Follow-ups to service tiers. **The feature list is renamed from `allow` to `keep`** (`serviceTier.keep`, `tapflow flow run --keep push,photos`) before any release carried it: "allow push" read as granting the app a permission. `--service-tier stock --keep ...` is refused, since stock switches nothing off. The run record keeps the tier a run asked for (`serviceTier`, migration 018), and the run page shows it. The dashboard marks a running device a run left slim (**Most services off**) and says in the info card that a restart turns its services back on. `tapflow doctor` counts devices by tier (`on (2 devices: 1 lean, 1 slim now)`). And a simulator whose override marker cannot be read is put back on its plist defaults for every label a tier can touch, instead of having its current overrides recorded as the originals and left off for good: `LeanStore` takes the managed labels as its second constructor argument (`MANAGED_LABELS`).
+- Updated dependencies [1445649]
+- Updated dependencies [fe644c9]
+- Updated dependencies [c5acd02]
+- Updated dependencies [c9f1ff8]
+- Updated dependencies [1e41b29]
+- Updated dependencies [64a7bc0]
+- Updated dependencies [d310508]
+- Updated dependencies [0e18ee1]
+- Updated dependencies [d4055b4]
+- Updated dependencies [486b1d3]
+  - @tapflowio/protocol@0.29.0
+  - @tapflowio/agent-core@0.29.0
+  - @tapflowio/audiotap-helper@0.3.14
+
 ## 0.28.1
 
 ### Patch Changes

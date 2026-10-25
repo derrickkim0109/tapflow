@@ -123,7 +123,7 @@ describe('the live head is the newest fresh sample for the selected Mac', () => 
     cpuPercent: 42.34, memUsedMB: 8000, memTotalMB: 16000, slotsAvailable: 1, slotsTotal: 1, reportedAt: T - 5_000, ...over,
   })
   const entry = (agentName: string, resources?: AgentResources, platform = 'ios'): SessionInfo => ({
-    agentName, platform, capabilities: [], devices: [], resources,
+    agentName, platform, capabilities: [], admission: { booting: false, overloaded: false, memoryRefuses: [] }, devices: [], resources,
   })
 
   it('reads CPU and RAM from a fresh sample, rounded the way the history is', () => {

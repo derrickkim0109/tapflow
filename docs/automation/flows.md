@@ -6,20 +6,20 @@ description: "The YAML flow format that tapflow flow run replays deterministical
 # Flow Reference
 
 ::: warning Experimental
-tapflow's **AI Automation axis** — the MCP server and the flow runner — is experimental. The manual QA dashboard is the mature, production path; this axis is additive and still maturing. Expect rough edges, especially in selector matching and in timing right after an app launches.
+tapflow's **AI agents** (the MCP server) and **Automation** (the flow runner) are experimental. The manual QA dashboard is the most mature part of tapflow; these two are still maturing. Expect rough edges, especially in selector matching and in timing right after an app launches.
 :::
 
 A flow is a UI test scenario written in YAML, replayed deterministically by `tapflow flow run` with no LLM calls. The same flow always runs in the same order from the same input, so it is idempotent — and it costs nothing in API calls in CI.
 
-::: info Two QA axes
-tapflow has two QA axes. The browser dashboard is the **manual QA axis**, where your team tests by hand; the flow runner covered here is the **automated QA axis**, whose main stage is CI/CD.
+::: info Three ways to use tapflow
+There are three ways to use tapflow, all on the same devices and sessions: **Manual QA** in the browser dashboard, where your team tests by hand; **AI agents**, which drive a device through MCP; and **Automation**, the flow runner covered here, whose main stage is CI/CD.
 
 Flows are not a language you hand-write from scratch — they are an artifact a coding agent generates or a recording produces. To author them with an agent, see [MCP in CI/CD](/automation/mcp-ci).
 :::
 
 ## Flow file structure
 
-A flow has three top-level keys.
+A flow is made of these top-level keys.
 
 ```yaml
 name: login-smoke
@@ -38,7 +38,8 @@ steps:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `name` | No | Name shown in reports. Defaults to the file name. |
-| `appId` | Conditional | Bundle id of the app under test. Required when `clearState` is used without an argument. |
+| `appId` | Conditional | Bundle id of the app under test. Required when `clearState` is used without an argument. With `--build`, it is compared with that build's bundle id ([Choosing flows](#choosing-flows)). |
+| `tags` | No | A list of tags. Use them to pick flows with `--include-tags` and `--exclude-tags`. A tag cannot contain a comma. |
 | `steps` | Yes | The list of steps, run top to bottom. |
 
 Coordinates are normalized 0–1 everywhere. Selectors point at screen elements directly, so you will rarely write pixel coordinates into a flow.
@@ -83,11 +84,13 @@ There is no fixed `sleep` step. Waiting is always condition-based. To wait for a
 - tapOn: { role: cell, index: 2 }
 ```
 
-A bare-string selector resolves in the order **exact identifier → exact label → partial label**. Once a stage matches, later stages are not tried.
+A bare-string selector resolves in the order **exact identifier → exact label → partial label → exact placeholder**. Once a stage matches, later stages are not tried.
+
+A placeholder is the hint text an empty input field shows. An input field with neither a label nor an identifier can be found by its placeholder. Because the placeholder is the last stage, an element whose label is the same text matches first. A placeholder never matches in part. On iOS the field can still be found by its placeholder after a value is typed into it. A `label:` selector looks at labels only.
 
 If a `tapOn` selector matches more than one element, it fails immediately and lists the candidates. It never picks the first one implicitly, so an ambiguous selector fails visibly instead of quietly tapping the wrong place. `assertVisible` checks presence only, so it passes when at least one element matches.
 
-When a `tapOn` fails because its selector matched nothing or more than one element, the runner prints up to three lines to try instead, taken from the screen at the moment it failed: `try: tapOn: "Sign in"`. Each one is a selector checked to tap exactly that one element on that screen, and it is kept in the [run record](#run-records) too. An input field is suggested by its `id`, never its label, so what was typed into it is not shown. An image is suggested only when its name matches the selector's, ignoring case, spacing and punctuation, because an image's name is usually an asset name rather than text on the screen. A failed `assertVisible` gets no suggestions: the expected text being missing can mean the app changed, and swapping in similar text would hide the regression.
+When a `tapOn` fails because its selector matched nothing or more than one element, the runner prints up to three lines to try instead, taken from the screen at the moment it failed: `try: tapOn: "Sign in"`. Each one is a selector checked to tap exactly that one element on that screen, and it is kept in the [run record](#run-records) too. An input field is suggested by its `id` or its placeholder, never its label, so what was typed into it is not shown. An image is suggested only when its name matches the selector's, ignoring case, spacing and punctuation, because an image's name is usually an asset name rather than text on the screen. A failed `assertVisible` gets no suggestions: the expected text being missing can mean the app changed, and swapping in similar text would hide the regression.
 
 To resolve an ambiguous match, add a disambiguator to the object form:
 
@@ -101,6 +104,8 @@ The object form needs at least one of `id`, `label`, or `role`; `role`/`index` r
 ### Resetting state
 
 `clearState` wipes the app data so every run starts from the same state. It uses `pm clear` on Android and empties the app data container on iOS. The installed binary survives either way, so you can follow `clearState` with `launchApp`.
+
+`tapflow flow run` also resets the device before the flows start, so a run does not begin from an earlier run's data, keychain or permissions. `clearState` is still how a flow resets its app between its own steps. What the run resets is listed under [`tapflow flow run`](/reference/cli#tapflow-flow-run).
 
 If the app is already running, `launchApp` does not restart it: it brings the app forward on whatever screen it was last on. A flow can then start from a screen an earlier run or a manual test left behind, so a flow that must start from the app's first screen puts `clearState` before `launchApp`. `clearState` stops the app before wiping its data.
 
@@ -136,14 +141,27 @@ tapflow flow run .tapflow/flows/login.yaml .tapflow/flows/checkout.yaml
 | `--artifacts <dir>` | Failure-screenshot directory (default `.tapflow/artifacts`) |
 | `--timeout <seconds>` | Default per-selector wait (default 10, max 2147483.647) |
 | `--no-record` | Do not record this run on the relay. |
+| `--include-tags <tags>` | Run only flows tagged with at least one of these (comma-separated). |
+| `--exclude-tags <tags>` | Skip flows tagged with any of these (comma-separated). Wins over `--include-tags`. |
 
 The `launchApp` step takes no argument and launches the build passed via `--build`. That keeps the build id out of the flow file, so the same flow runs against a fresh build on every CI run.
 
 When the run starts, the runner prints a dashboard link on a `watch this run:` line. Open it to watch, live, the flow driving the device; the watch ends when the run does. In CI the line is not printed (detected from the `CI` environment variable, Jenkins's `JENKINS_URL` or Azure Pipelines' `TF_BUILD`), because the link shows the relay's address and would stay in a public repository's log. How the address is chosen, and who can watch, are the same as for the [MCP server](/automation/mcp-server#watch-the-device), with the `--relay` address in place of `TAPFLOW_RELAY_URL`.
 
+### Choosing flows {#choosing-flows}
+
+A flow that does not fit this run is skipped rather than run. There are two cases.
+
+- **A flow for another app**: with `--build`, each flow's `appId` is compared with that build's bundle id. When they differ, the runner prints both ids, as in `– login (skipped: flow is for com.example.app, build 42 is com.example.app.debug)`, and skips the flow. You can pass a directory that mixes several apps' flows, and only the ones for the build run. A flow with no `appId` runs against any build.
+- **A flow the tags filter out**: `--include-tags smoke,login` runs only flows that carry at least one of the two. `--exclude-tags flaky` skips flows that carry it, and when the two overlap, `--exclude-tags` wins.
+
+A skipped flow does not count as a failure. The last line counts it separately, as in `1/1 flows passed, 1 skipped`. When no flow runs at all, the run stops with exit code `2` before choosing a device, so a run that tested nothing cannot read as a pass. A build id the relay does not have stops the run the same way.
+
+Comparing `appId` needs a token that can read the build: an API-type token (`view, builds:write`). With no token, or a `view` token, the runner prints an `app check skipped` line and runs every flow whatever its `appId`. If you run a flow against a build whose bundle id carries a suffix, such as a debug build (`com.example.app.debug`), set `appId` to that build's id or remove it.
+
 ### Run records {#run-records}
 
-With a token, the runner records the run on the relay: each flow's pass or fail and steps, a screenshot of the screen each flow failed on or ended on, the device it ran on, and the build passed with `--build`. In CI it also records the provider, branch, commit and a link to the CI run. When the relay created the record, the runner prints its id on a `recorded as run` line at the end of the run, followed outside CI by a link to the run's dashboard page. The records are on the dashboard's [Flow Runs](/automation/runs) page.
+With a token, the runner records the run on the relay: each flow's pass, fail or skip, why a flow was skipped, its steps, a screenshot of the screen each flow failed on or ended on, the device it ran on and what it was reset of, and the build passed with `--build`. In CI it also records the provider, branch, commit and a link to the CI run. When the relay created the record, the runner prints its id on a `recorded as run` line at the end of the run, followed outside CI by a link to the run's dashboard page. The records are on the dashboard's [Flow Runs](/automation/runs) page.
 
 - Recording never changes the result or the exit code. If the relay does not answer or refuses the record, the runner prints one warning line and records nothing more for that run. A screenshot the relay cannot take (for example, one over 5 MB) gets its own warning, and the rest of the run is still recorded. At the end of a run it waits at most 10 seconds for the record to finish sending. Capturing a passed flow's last screen takes one screenshot before the next flow starts, at most 5 seconds.
 - While recording, the runner also sends each flow's video. It cuts the device stream it already receives, so a flow never waits on the video being sent. On iOS it asks the agent for an H.264 stream for this, and when the agent is set to send JPEG (`TAPFLOW_IOS_CODEC=jpeg`) no video is kept. If video cannot be sent, the runner prints one warning line and the record carries on. At the end of a run the record is sent first, and video gets what is left of the 10 seconds. The relay keeps a passed flow's video for 3 days by default, and when all videos together pass 20 GB it removes passed flows' videos first, oldest first.
@@ -167,7 +185,7 @@ Distinguishing `1` from `2` matters: a product failure (`1`) and an infrastructu
 
 A run cancelled while its flows are running leaves its session and, when it is being recorded, marks the record cancelled before it exits. A second signal exits at once.
 
-A failed flow leaves a screenshot from the point of failure in the artifacts directory, and with `--junit` each flow is recorded as one `testcase`.
+A failed flow leaves a screenshot from the point of failure in the artifacts directory, and with `--junit` each flow is recorded as one `testcase`. A skipped flow is a `testcase` with `<skipped>`.
 
 ## File location convention
 

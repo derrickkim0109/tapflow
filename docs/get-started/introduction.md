@@ -82,11 +82,15 @@ flowchart TD
 Visual quality and latency may differ between the two. Resolution and decoder adapt to each viewer's connection — see [Streaming Quality](/operate/streaming-quality).
 :::
 
-## Two testing paths {#testing-paths}
+## Three ways to use tapflow {#testing-paths}
 
-tapflow is built for manual testing first: CI or the operator uploads a build, and teammates test it in the browser. The Get started and Test apps sections cover this path.
+There are three ways to use tapflow, and a team can start from any of them. All three run on the same devices and sessions.
 
-There is also an MCP server that lets a coding agent drive the simulator. It is a separate, experimental feature, and the manual path does not depend on it. See [MCP server](/automation/mcp-server).
+- **Manual QA**: CI or the operator uploads a build, and teammates test it in the browser. This is the most mature path, and the Get started and Test apps sections cover it.
+- **AI agents** (experimental): the [MCP server](/automation/mcp-server) lets a coding agent drive a simulator or emulator.
+- **Automation** (experimental): the [flow runner](/automation/flows) replays YAML flows with no LLM calls, mainly in CI.
+
+Each one works on its own, and manual testing never depends on the other two.
 
 ## Next steps {#next-steps}
 

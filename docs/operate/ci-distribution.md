@@ -17,10 +17,10 @@ CI pipeline
 
 The CI job uploads the build artifact. From there, anyone on the team can test directly in the browser — no IDE, no device setup needed.
 
-::: info Two testing paths
-This guide covers the **manual review path**: CI delivers the build; people do the testing.
+::: info Manual review
+This guide covers **manual review**: CI delivers the build, and people test it.
 
-For automated testing where an LLM agent controls the simulator, see [MCP in CI/CD](/automation/mcp-ci). That is a separate, experimental feature.
+To have CI replay flows, or to let an LLM agent drive the device, see [MCP in CI/CD](/automation/mcp-ci). Both are experimental.
 :::
 
 ## Any build tool

@@ -59,13 +59,23 @@ One interface, three unrelated failure signals — this is the part that is easy
 
 | path | dispatch | how failure shows | client-side cancellation |
 |---|---|---|---|
-| `EmulatorGrpcClient` | promise | rejects; input RPCs carry a deadline | yes, of *our wait* — see the caveat below |
+| `EmulatorGrpcClient` | promise, **one touch call at a time** | rejects; input RPCs carry a deadline | yes, of *our wait* — see the caveat below |
 | `ScrcpyControl` | `socket.write()`, returns `void` | **nothing**. `write()` does not throw for a dead peer, so `isReady()` (`socket.writable`) is the only signal | n/a |
 | `AndroidTouchHelper` | `adb shell input …` | promise rejects | no — the child is not killed |
 
 Measured against a killed emulator: the gRPC RPC rejects in **4ms** with `14 UNAVAILABLE … ECONNREFUSED`, so an unreachable emulator answers on its own and the deadline never comes into it. `isReady()` stays `true` through that, because for this backend it only reports "we closed it"; the rejection carries the rest.
 
 **What the deadline does and does not buy.** It cancels *our* call, not a request the emulator already applied. Since an unreachable emulator rejects immediately, the only case the deadline actually fires in is a client still connected but not responding — and there we cannot know whether the input landed, so a caller that retries on the error can double it. That is the same hazard that argued against bounding the adb path; it is accepted here only because the window is much narrower (1500ms of silence from a connected emulator, versus every stuck `adb` call). If it turns out to matter, the answer is a distinct outcome meaning "unknown, do not retry", not a shorter deadline.
+
+**Touch calls are serialised, so the deadline adds up.** Each touch event is its own unary call, and the emulator does
+not take concurrent calls in the order they were sent — measured: right after an app install a tap's up overtook its
+down, the kernel dropped the up, and the touch stayed pressed. `EmulatorGrpcClient` therefore sends each touch call once
+the one before it has settled. Two consequences. On a connected emulator that does not answer, the worst wait is the
+queue depth × 1500ms, not 1500ms: a tap's ack comes after about 3s, past MCP's 2s window, and a swipe's after its moves
+too, so those callers see an unanswered input rather than `failed`. And "settled" includes a call our deadline gave up
+on, which the emulator may still apply later — the order holds for answered calls, not for abandoned ones. A dashboard
+drag sends a move every 16ms, so an emulator slower than that per call builds a backlog behind the drag; coalescing
+queued moves would bound it, and is unmeasured and undecided.
 
 - **`isReady()` is not a liveness probe.** `socket.writable` is a local-end flag: it goes false after our own destroy, after a FIN (`allowHalfOpen` defaults false, so node ends our writable side), or after an error was already observed. Edge-triggered and one turn late, so the first input after a silent death still reads ready. It cannot see a live socket whose guest stopped consuming. The ack promises delivery, not landing, so that is consistent — do not read more into it.
 - **The adb path is deliberately unbounded.** Racing a timer would not help: the child cannot be killed (`bounded()` records why — killing `input` mid-write can leave the guest worse off), so a timeout would answer failure while the input was still on its way, invite a retry, and land it twice. Unbounded means a wedged guest produces no ack and the caller falls back to its own timeout, which is what happened before this change. One child per input the user actually made is the honest ceiling.

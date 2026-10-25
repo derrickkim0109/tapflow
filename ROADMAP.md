@@ -19,15 +19,15 @@ it is ready for.
 
 ---
 
-## The three QA axes
+## Three ways to use tapflow
 
-tapflow is one QA workflow used from three starting points, all sharing the same session, app, and runtime (see [VISION.md](./VISION.md) for the why).
+**tapflow Core** is the layer every part of tapflow shares: devices, sessions, UI trees, builds, run records, and resource management. It is a concept, not a separate package or product. There are three ways to use it, and a team can start from any of them (see [VISION.md](./VISION.md) for the why).
 
 - **Manual QA** — the browser dashboard: the team tests by hand on a real simulator or emulator. Shipping today (Phases 1–4).
-- **AI Automation** — the deterministic flow runner (`tapflow flow run`) and the MCP server for LLM agents. Shipping today but **experimental**: additive and still maturing, with rough edges in selector matching and post-launch timing (Phase 5 foundation).
-- **Manual ↔ AI bridge** — turning a manual session into a replayable flow. Today an agent can author a flow by demonstrating it through the MCP tools. The larger goal is **Flow Capture**: a person operates the app in the dashboard and tapflow records the actions as tree-based selectors, no agent required (Phase 5+, not built yet).
+- **AI agents (via MCP)** — the MCP server lets an LLM agent drive a device, in the same session a person can open and watch. Shipping today but **experimental** (Phase 5 foundation).
+- **Automation** — the deterministic flow runner (`tapflow flow run`), mainly in CI. Shipping today but **experimental**: still maturing, with rough edges in selector matching and post-launch timing (Phase 5 foundation).
 
-The bridge (especially Flow Capture) is the differentiator — it drops the cost of turning manual QA into automation to nearly zero.
+What sets tapflow apart is how the three connect. Today an agent can author a flow through the MCP tools and replay it, and a failed run is a record a person or an agent can read. The larger goal is **Flow Capture**: a person or an agent operates the app and tapflow records each action as a flow, with no model required (Phase 5+, not built yet). It drops the cost of turning QA already done into automation to nearly zero.
 
 ## Current status
 
@@ -98,9 +98,8 @@ Scalability, extensibility, and CI/CD integration.
 
 ## Phase 4 — Experience (DX + UX)
 
-Polish the **primary path**: a team opens a browser and tests on a real simulator/emulator with
-no friction. This is tapflow's core value, so it comes first, and most of the work lands here
-release to release. The open items live under the
+Polish the **manual path**: a team opens a browser and tests on a real simulator/emulator with
+no friction. It is the most mature part, so most of the work lands here release to release. The open items live under the
 [`phase-4` label](https://github.com/jo-duchan/tapflow/issues?q=is%3Aopen+label%3Aphase-4) rather
 than in this file, because that list changes every week.
 
@@ -136,17 +135,17 @@ only toolchain is the new one.
 
 ## Phase 5 — Agent Experience (AX)
 
-tapflow has two QA axes. The browser dashboard is the **manual QA axis**: the whole team tests by
-hand, no setup required. The MCP path is the **automated QA axis**: its main stage is CI/CD. Both
-axes share the same session infrastructure (relay, agents, dashboard observation); the automated
-axis is opt-in and never affects the manual path.
+Phase 5 covers the two ways of using tapflow beyond the dashboard: **AI agents**, which drive a
+device through MCP, and **Automation**, the flow runner whose main stage is CI/CD. Both run on the
+same session infrastructure as manual QA (relay, agents, dashboard observation), are opt-in, and
+never affect the manual path.
 
-The guiding principle for the automated axis: **an LLM is involved only at authoring time — replay
+The guiding principle: **an LLM is involved only at authoring time — replay
 is deterministic.** Agents explore the app through MCP tools and generate flow files; CI replays
 those flows with zero LLM calls, which keeps runs idempotent and API cost at zero. Flow files are
 a generated artifact, not a language users must learn.
 
-The foundation shipped; the axis is still marked experimental because selector matching and
+The foundation shipped; both are still marked experimental because selector matching and
 post-launch timing are where it breaks. Hardening is tracked under the
 [`phase-5` label](https://github.com/jo-duchan/tapflow/issues?q=is%3Aopen+label%3Aphase-5).
 
@@ -182,7 +181,7 @@ Refine:
 - [ ] Product vs environment failure shown first on a run record.
 - [ ] Selector fix suggestions. When a selector fails, tapflow suggests a YAML patch built from the UI
   tree at that moment, with no LLM involved.
-- [ ] Run records readable through MCP, so an agent can repair a failed flow and replay it
+- [x] Run records readable through MCP, so an agent can repair a failed flow and replay it
   deterministically.
 
 ---
@@ -205,7 +204,7 @@ Larger tracks that fit tapflow's mission but are not yet committed to a version.
 
 The following are out of scope for tapflow's core mission ("browser-based simulator control, data on-premises"):
 
-- **External automation framework integration (WebDriverAgent, Appium, Selenium)** — the automated QA axis is served by tapflow's own minimal, deterministic flow runner (Phase 5); wiring in external drivers is not planned
+- **External automation framework integration (WebDriverAgent, Appium, Selenium)** — Automation is served by tapflow's own minimal, deterministic flow runner (Phase 5); wiring in external drivers is not planned
 - **Cloud hosting / SaaS mode** — tapflow is self-hosted by design
 - **Video streaming via WebRTC** — DataChannel instability and lack of P2P benefit in a relay-intermediary architecture make this a net negative
 

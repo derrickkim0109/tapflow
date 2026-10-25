@@ -90,6 +90,21 @@ describe('RunRecorder', () => {
     expect(warn).toHaveBeenCalledTimes(1)
     expect(fetchMock.mock.calls.map(([u]) => String(u)).some((u) => u.endsWith('/finish'))).toBe(false)
   })
+
+  // A relay older than flow starts has no route for one: the run is still recorded, and nothing is said about it.
+  it('keeps recording, without a word, when the relay has no route for a flow start', async () => {
+    const { r, warn, fetchMock } = recorder((u) => u.endsWith('/start') ? Promise.resolve(Response.json({ error: 'Not found' }, { status: 404 })) : ok(u))
+    r.create(planned)
+    r.reportFlowStart(0, { sessionId: 's1', id: 'dev1', name: 'iPhone' })
+    r.reportFlow(0, flow)
+    r.finish({ status: 'passed', exitCode: 0 })
+    expect(await r.drain(1000)).toEqual({ runId: 'run-1', complete: true })
+    expect(fetchMock.mock.calls.map(([u]) => String(u).replace('http://relay.test/api/v1/runs', ''))).toEqual([
+      '', '/run-1/flows/0/start', '/run-1/flows/0', '/run-1/finish',
+    ])
+    expect(JSON.parse(fetchMock.mock.calls[1]![1]!.body as string)).toEqual({ sessionId: 's1', deviceId: 'dev1', deviceName: 'iPhone' })
+    expect(warn).not.toHaveBeenCalled()
+  })
 })
 
 describe('ciContext', () => {

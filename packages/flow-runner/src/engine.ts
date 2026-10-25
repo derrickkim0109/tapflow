@@ -250,7 +250,7 @@ async function resolveOne(
         const matches = matchSelector(q.tree, sel)
         if (matches.length === 1) return matches[0]
         if (matches.length > 1) {
-          const described = matches.slice(0, 5).map((m) => `${m.role} "${m.label}"${m.identifier ? ` id=${m.identifier}` : ''}`).join(' | ')
+          const described = matches.slice(0, 5).map((m) => `${m.role} "${m.label}"${m.identifier ? ` id=${m.identifier}` : ''}${m.placeholder ? ` placeholder="${m.placeholder}"` : ''}`).join(' | ')
           throw new StepFailure(`${matches.length} elements match ${describeSelector(sel)} — add an index or a more specific role/label (candidates: ${described})`)
         }
       } else {

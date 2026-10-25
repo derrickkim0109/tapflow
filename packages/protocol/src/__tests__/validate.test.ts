@@ -15,7 +15,7 @@
  */
 import { describe, expect, it } from 'vitest'
 
-import { directionOf, parseInbound } from '../validate/index.js'
+import { directionOf, parseInbound, readRunResetReport, readServiceTier, readyFacts } from '../validate/index.js'
 
 /** The narrowing every test does. Written once because `parseInbound` returns a union and each test
  *  would otherwise repeat the same four lines to reach `msg`. */
@@ -360,5 +360,113 @@ describe('a client newer than this relay still joins', () => {
 
   it('still refuses a kind that is not a string', () => {
     expect(fail({ type: 'session:start', sessionId: 's1', clientKind: 7 }).reason).toBe('bad-shape')
+  })
+})
+
+describe('readyFacts reads the checked fields the boot gate needs off a forwarded ready', () => {
+  const ready = (payload: Record<string, unknown>) => ({ type: 'device:ready', sessionId: 's', payload: { deviceId: 'd', ...payload } })
+  it('returns cold and the tier when they are well formed', () => {
+    expect(readyFacts(ready({ cold: true }))).toEqual({ cold: true })
+    expect(readyFacts(ready({ cold: false, serviceTier: { name: 'slim', keep: ['push'] } }))).toEqual({ cold: false, serviceTier: { name: 'slim', keep: ['push'] } })
+    expect(readyFacts(ready({ serviceTier: 'unsupported' }))).toEqual({ serviceTier: 'unsupported' })
+  })
+  it('drops each field it cannot read, alone', () => {
+    expect(readyFacts(ready({}))).toEqual({})
+    expect(readyFacts(ready({ cold: 'yes', serviceTier: { name: 'slim', keep: [] } }))).toEqual({ serviceTier: { name: 'slim', keep: [] } })
+    expect(readyFacts(ready({ cold: true, serviceTier: { name: 'turbo', keep: [] } }))).toEqual({ cold: true })
+    expect(readyFacts({ type: 'device:ready', sessionId: 's' })).toEqual({})
+  })
+})
+
+describe('a boot can ask for a service tier', () => {
+  const boot = (serviceTier: unknown) => parseInbound({ type: 'device:boot', sessionId: 's', requestId: 'r', payload: { deviceId: 'd', serviceTier } })
+  it('takes a known tier and features', () => {
+    expect(boot({ name: 'slim', keep: ['push', 'photos'] }).ok).toBe(true)
+  })
+  it('refuses an unknown feature rather than booting slim without it', () => {
+    expect(boot({ name: 'slim', keep: ['push', 'teleport'] }).ok).toBe(false)
+  })
+})
+
+describe('readServiceTier checks a tier from outside a frame against the boot\'s schema', () => {
+  it('takes a tier, and nothing else', () => {
+    expect(readServiceTier({ name: 'slim', keep: ['push'] })).toEqual({ name: 'slim', keep: ['push'] })
+    expect(readServiceTier({ name: 'turbo', keep: [] })).toBeUndefined()
+    expect(readServiceTier({ name: 'slim', keep: ['teleport'] })).toBeUndefined()
+    expect(readServiceTier({ name: 'slim' })).toBeUndefined()
+    expect(readServiceTier('slim')).toBeUndefined()
+    expect(readServiceTier(undefined)).toBeUndefined()
+  })
+})
+
+describe('a boot can ask for a run reset', () => {
+  const boot = (runReset: unknown) => parseInbound({ type: 'device:boot', sessionId: 's', requestId: 'r', payload: { deviceId: 'd', runReset } })
+  const payloadOf = (r: ReturnType<typeof boot>) => (r.ok ? (r.msg as { payload: Record<string, unknown> }).payload : undefined)
+  it('forwards a well-formed request', () => {
+    expect(payloadOf(boot({ uninstall: ['com.example.app'], clear: [] }))?.runReset).toEqual({ uninstall: ['com.example.app'], clear: [] })
+  })
+  // The agent's report is the evidence, so a reset that cannot be read is dropped and the run warns — the boot stands.
+  it('drops a malformed request and keeps the boot', () => {
+    for (const bad of [{ uninstall: 'com.example.app', clear: [] }, { uninstall: [''], clear: [] }, { uninstall: Array(33).fill('a'), clear: [] }, 'yes']) {
+      const r = boot(bad)
+      expect(r.ok).toBe(true)
+      // What the agent receives is the serialized product, and `undefined` does not survive it.
+      expect(JSON.parse(JSON.stringify(payloadOf(r)))).not.toHaveProperty('runReset')
+    }
+  })
+})
+
+describe('readRunResetReport reads what an agent reported resetting', () => {
+  it('keeps the items it knows and drops the rest', () => {
+    expect(readRunResetReport({ done: ['keychain', 'teleport'], failed: ['location'] })).toEqual({ done: ['keychain'], failed: ['location'] })
+  })
+  it('is undefined for anything that is not a report', () => {
+    expect(readRunResetReport({ done: ['keychain'] })).toBeUndefined()
+    expect(readRunResetReport(undefined)).toBeUndefined()
+  })
+})
+
+// A lease names no session, so a refusal at the door would have no address and the client would wait out its
+// deadline. Every payload value the door cannot use is read as absent instead, and the relay answers.
+// `correlatedRequestsGated` exempts `device:lease` from `ANSWERABLE` on the strength of this test.
+describe('a lease is never dropped for its payload', () => {
+  const lease = (payload: unknown) => parseInbound({ type: 'device:lease', requestId: 'r', payload })
+  const payloadOf = (r: ReturnType<typeof lease>) => (r.ok ? JSON.parse(JSON.stringify((r.msg as { payload: unknown }).payload)) as Record<string, unknown> : undefined)
+
+  it('keeps every well-formed field', () => {
+    const full = {
+      platform: 'android', buildId: 7, serviceTier: { name: 'lean', keep: [] }, acceptH264: true,
+      runReset: { uninstall: ['com.example.app'], clear: [] }, stream: false, exclude: ['s1'],
+    }
+    expect(payloadOf(lease(full))).toEqual(full)
+  })
+
+  it('reads each unusable field as absent and keeps the rest', () => {
+    const bad = {
+      platform: 'windows', buildId: 1.5, serviceTier: 'slim', acceptH264: 'yes',
+      runReset: { uninstall: 'x' }, stream: 1, exclude: [''],
+    }
+    // Two good fields beside the bad one, so dropping the whole payload is told apart from dropping the field.
+    const good = { platform: 'ios', buildId: 3 }
+    for (const [key, value] of Object.entries(bad)) {
+      const r = lease({ ...good, [key]: value })
+      expect(r.ok, key).toBe(true)
+      const kept: Record<string, unknown> = { ...good }
+      delete kept[key]
+      expect(payloadOf(r), key).toEqual(kept)
+    }
+  })
+
+  it('reads a payload that is not an object as empty', () => {
+    for (const payload of [undefined, null, 'ios', 3, ['ios']]) {
+      const r = lease(payload)
+      expect(r.ok, String(payload)).toBe(true)
+      expect(payloadOf(r)).toEqual({})
+    }
+  })
+
+  it('drops only a frame with no usable correlator, which nothing could answer', () => {
+    expect(parseInbound({ type: 'device:lease', requestId: '', payload: {} }).ok).toBe(false)
+    expect(parseInbound({ type: 'device:lease', payload: {} }).ok).toBe(false)
   })
 })

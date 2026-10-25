@@ -174,8 +174,8 @@ describe('wire payload types are declared once, in @tapflowio/protocol', () => {
     const count = (name) => new Set(resolved(protoDecls, name)).size
     expect(count('ChromeData')).toBe(11)
     expect(count('ChromeButton')).toBe(13)
-    expect(count('DeviceSummary')).toBe(9) // 9 with `holder`, the AI client driving a device
-    expect(count('SessionInfo')).toBe(5)
+    expect(count('DeviceSummary')).toBe(10) // 9 with `holder`, the AI client driving a device; 10 with `serviceTier` (L2)
+    expect(count('SessionInfo')).toBe(6) // 6 with `admission`, the relay's reading of the Mac (L2)
   })
 
   it('guards the payload shapes by name, so a shape cannot silently leave', () => {

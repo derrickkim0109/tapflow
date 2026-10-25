@@ -2,7 +2,8 @@ import { randomUUID } from 'crypto'
 import { WebSocket } from 'ws'
 import type { DeviceStatus } from '@tapflowio/agent-core'
 import type { AgentResources, SessionInfo } from './types.js'
-import type { AiClientKind, ChromePayload, ClientKind, DeviceDetails, DeviceReport, FormFactor, Point, PosturesPayload, WatchEndReason } from '@tapflowio/protocol'
+import type { BooterClass } from './admission/HostBootGate.js'
+import type { AiClientKind, ChromePayload, MacAdmission, ServiceTier, ClientKind, DeviceDetails, DeviceReport, FormFactor, Point, PosturesPayload, WatchEndReason } from '@tapflowio/protocol'
 
 export interface Session {
   id: string
@@ -48,6 +49,9 @@ export interface Session {
   devicePlatform: string
   /** What simctl/adb reported about the device. Drives the device list and the REST guards —
    *  "is this device up", which is a different question from the one below. */
+  /** The service tier the device boots with now: from the agent's register, then from each `device:ready`, since
+   *  the register is a snapshot. Absent from an agent that predates tiers. */
+  deviceServiceTier?: ServiceTier | 'unsupported'
   deviceStatus: DeviceStatus
   /** Whether the relay has told a browser this session is streaming, and has not since taken it
    *  back. This is what the `device:ready` replay keys off. `deviceStatus` cannot answer it: it
@@ -62,6 +66,25 @@ export interface Session {
   postures?: PosturesPayload
   deviceInfo?: DeviceDetails
   idleTimer: ReturnType<typeof setTimeout> | null
+  /** Whether the last holder to let go was an AI client holding the device for itself. Read with `idleTimer`: a device whose idle countdown is
+   *  running for a person is theirs to come back to, and a lease must not take it and wipe it. `lastBoot` cannot
+   *  say so — it names whoever cold-booted the device, and a person picks up automation's devices warm. */
+  lastHolderWasAi?: boolean
+  /** Who cold-booted the device this session drives, and when — kept after the holder leaves, since that is when
+   *  it matters: it is what the per-Mac automation cap counts and shuts down (`admission/capacity.ts`). Set when
+   *  the relay forwards a cold boot, undone if that boot fails or turns out warm, cleared on `shutdown-done`.
+   *  Absent after a relay restart, which counts nothing rather than guess. */
+  lastBoot?: { booterClass: BooterClass; at: number }
+  /** The boot `lastBoot` was set for, and what it held before, so a failure or a warm ready can put it back. */
+  lastBootPending?: { requestId: string; prev: Session['lastBoot'] }
+  /** A boot whose record expired unanswered, kept so a ready that arrives after all is recorded as the boot it was —
+   *  by then the automation client that asked has usually left, and the holder no longer says who started it. */
+  lastBootExpired?: { requestId: string; booterClass: BooterClass }
+  /** The relay shut this device down to make room. Until the agent confirms, it is neither counted nor offered. */
+  evictingAt?: number
+  /** An automation client joined while the idle timer was running and stopped it: its leave starts it again, so a
+   *  device a person left is not kept up for good by a run that borrowed it. */
+  idleResumeOnLeave: boolean
 }
 
 /**
@@ -149,7 +172,7 @@ export class SessionManager {
   private static agentFields(
     agent: AgentIdentity,
     device: DeviceReport,
-  ): Pick<Session, 'agentId' | 'agentName' | 'agentPlatform' | 'agentCapabilities' | 'deviceName' | 'devicePlatform' | 'deviceStatus' | 'deviceOsVersion' | 'deviceFormFactor'> {
+  ): Pick<Session, 'agentId' | 'agentName' | 'agentPlatform' | 'agentCapabilities' | 'deviceName' | 'devicePlatform' | 'deviceStatus' | 'deviceOsVersion' | 'deviceFormFactor' | 'deviceServiceTier'> {
     return {
       agentId: agent.agentId,
       agentName: agent.agentName,
@@ -160,6 +183,7 @@ export class SessionManager {
       deviceStatus: device.status as DeviceStatus,
       deviceOsVersion: device.osVersion,
       deviceFormFactor: device.formFactor,
+      deviceServiceTier: device.serviceTier,
     }
   }
 
@@ -184,6 +208,7 @@ export class SessionManager {
         deviceId: d.id,
         readySent: false,
         idleTimer: null,
+        idleResumeOnLeave: false,
       })
       agentIds.add(id)
       this.agentSocketIndex.set(agentSocket, agentIds)
@@ -216,6 +241,15 @@ export class SessionManager {
       if ((s.agentId ?? s.agentName) === identity && s.agentPlatform === platform) sockets.add(s.agentSocket)
     }
     return Array.from(sockets)
+  }
+
+  all(): Session[] {
+    return Array.from(this.sessions.values())
+  }
+
+  /** Every session whose agent runs on the Mac `hostKey` names, across that Mac's agents. */
+  getAllOnHost(hostKey: string, keyOf: (s: Session) => string): Session[] {
+    return Array.from(this.sessions.values()).filter((s) => keyOf(s) === hostKey)
   }
 
   /** Sessions currently claiming a device id. More than one only while a held session (#426) has
@@ -284,6 +318,10 @@ export class SessionManager {
     ) {
       return { ok: false, failure: 'held-by-another' }
     }
+    // Decided by the join that stops a countdown. A later re-join by the same client (MCP's `connect_device` again)
+    // finds no timer and must not forget it; a person taking the device over makes it theirs to leave.
+    if (session.idleTimer !== null) session.idleResumeOnLeave = isAiClientKind(holder.kind)
+    else if (!isAiClientKind(holder.kind)) session.idleResumeOnLeave = false
     if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null }
     // Unconditional, and **the order is what makes it safe**: this releases the session from whichever
     // socket held it, which on a re-join is the socket joining. Removing and re-adding the same entry is a
@@ -330,6 +368,11 @@ export class SessionManager {
     if (session.browserSocket) {
       this.unindexBrowser(session)
       session.browserSocket = null
+    }
+    // An AI client that joined during a countdown hands it back when it goes (`idleResumeOnLeave`), so the countdown
+    // stays whoever's it was: a person's stays a person's, and one an AI client left stays leasable.
+    if (session.owner !== null) {
+      session.lastHolderWasAi = isAiClientKind(session.holderKind) && (!session.idleResumeOnLeave || session.lastHolderWasAi === true)
     }
     session.owner = null
     session.ownerMinted = false
@@ -519,6 +562,13 @@ export class SessionManager {
     if (session) session.readySent = value
   }
 
+  /** A `device:ready` said which tier the device came up with; `undefined` once it is off or starting again, until
+   *  the next ready says. */
+  setDeviceServiceTier(sessionId: string, tier: ServiceTier | 'unsupported' | undefined): void {
+    const session = this.sessions.get(sessionId)
+    if (session) session.deviceServiceTier = tier
+  }
+
   updateDeviceStatus(sessionId: string, status: DeviceStatus): void {
     const session = this.sessions.get(sessionId)
     if (session) session.deviceStatus = status
@@ -546,7 +596,8 @@ export class SessionManager {
       isAlive(s.browserSocket)
   }
 
-  list(asker: string, isAlive: (ws: WebSocket) => boolean): SessionInfo[] {
+  /** `admissionOf` is asked once per agent, with that agent's sessions. */
+  list(asker: string, isAlive: (ws: WebSocket) => boolean, admissionOf: (sessions: Session[]) => MacAdmission): SessionInfo[] {
     // Group sessions by agentSocket
     const agentMap = new Map<WebSocket, Session[]>()
     for (const session of this.sessions.values()) {
@@ -571,6 +622,7 @@ export class SessionManager {
       // "advertises nothing", and the viewer gates on membership. Leaving it undefined would make
       // every consumer repeat the same fallback, and one of them would forget.
       capabilities: group[0].agentCapabilities ?? [],
+      admission: admissionOf(group),
       devices: group.map((s) => ({
         id: s.deviceId,
         name: s.deviceName,
@@ -578,6 +630,7 @@ export class SessionManager {
         status: s.deviceStatus,
         osVersion: s.deviceOsVersion,
         formFactor: s.deviceFormFactor,
+        ...(s.deviceServiceTier !== undefined ? { serviceTier: s.deviceServiceTier } : {}),
         sessionId: s.id,
         ...(this.liveAiHolder(s, isAlive) ? { holder: { kind: s.holderKind as AiClientKind, user: s.holderLabel ?? 'unknown' } } : {}),
         busy:

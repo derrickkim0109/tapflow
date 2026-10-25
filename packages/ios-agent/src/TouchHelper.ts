@@ -31,6 +31,13 @@ const READY_MARKER = 'touch-helper ready'
 // observed rather than a tight bound.
 const READY_DEADLINE_MS = 5_000
 
+// The shortest contact a tap is given. Clients that drive a device — flow-runner, the MCP server — send
+// the touch's down and up back to back. Measured on iPhone 17 Pro / iOS 26.5, 20 taps each on a
+// `UISwitch`: 3 toggled with the up sent at once, 20 with this 50ms hold (a button took every tap either
+// way). A person's tap and a swipe usually last longer already, so they are rarely held, and one that is
+// held only gains contact time.
+export const MIN_CONTACT_MS = 50
+
 export class TouchHelper {
   private proc: ChildProcess | null = null
   // The process that received the current gesture's opening frame. Mid-gesture frames are only
@@ -42,8 +49,14 @@ export class TouchHelper {
   private ready = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
   private spawns: number[] = []
+  // When the current touch went down, and the up held back until it has lasted `MIN_CONTACT_MS`.
+  private touchStartedAt = 0
+  private heldEnd: { timer: ReturnType<typeof setTimeout>; resolve: (sent: boolean) => void } | null = null
 
-  constructor(private readonly udid: string) {}
+  constructor(
+    private readonly udid: string,
+    private readonly minContactMs: number = MIN_CONTACT_MS,
+  ) {}
 
   start(): void {
     this.stopped = false
@@ -51,6 +64,8 @@ export class TouchHelper {
   }
 
   stop(): void {
+    // A held-back up is answered, not dropped: its caller is waiting on it to ack the tap.
+    this.releaseHeldEnd(false)
     this.stopped = true
     this.clearReadyDeadline()
     killWithSigkillFallback(this.proc)
@@ -103,9 +118,15 @@ export class TouchHelper {
   }
 
   touchStart(x: number, y: number): boolean {
+    // Opened before the coordinates move on: a held-back up flushed by the open belongs to the last
+    // touch and carries its position. The helper releases at its own latch anyway (type 3 ignores the
+    // frame's coordinates), but a frame naming another touch's point is one protocol change from a
+    // tap on the wrong target.
+    const sent = this.openGesture(this.coordFrame(1, x, y))
     this.lastX = x
     this.lastY = y
-    return this.openGesture(this.coordFrame(1, x, y))
+    this.touchStartedAt = Date.now()
+    return sent
   }
 
   touchMove(x: number, y: number): boolean {
@@ -116,6 +137,32 @@ export class TouchHelper {
 
   touchEnd(): boolean {
     return this.continueGesture(this.coordFrame(3, this.lastX, this.lastY))
+  }
+
+  /**
+   * `touchEnd`, once the touch has lasted `MIN_CONTACT_MS`. What a terminal frame from a client goes
+   * through; the answer is the same `touchEnd` gives, so an ack keeps meaning what it meant.
+   */
+  touchEndAfterMinContact(): Promise<boolean> {
+    const wait = this.touchStartedAt + this.minContactMs - Date.now()
+    if (wait <= 0 || this.stopped) return Promise.resolve(this.touchEnd())
+    // A second up for the same touch replaces nothing: answer the earlier one now, as a fresh up would.
+    if (this.heldEnd) this.releaseHeldEnd(this.touchEnd())
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.heldEnd = null
+        resolve(this.touchEnd())
+      }, wait)
+      this.heldEnd = { timer, resolve }
+    })
+  }
+
+  private releaseHeldEnd(sent: boolean): void {
+    const held = this.heldEnd
+    if (!held) return
+    this.heldEnd = null
+    clearTimeout(held.timer)
+    held.resolve(sent)
   }
 
   pressButton(usagePage: number, usage: number): boolean {
@@ -206,6 +253,10 @@ export class TouchHelper {
   // A gesture's opening frame. Self-contained, and it records which process is serving the
   // gesture so the frames that follow can be held to it.
   private openGesture(buf: Buffer): boolean {
+    // A new gesture while the last touch's up is still held back: that up goes first, now, so the two
+    // cannot overlap — a down written over an open touch moves it rather than taps, and an up landing
+    // inside a pinch lifts a finger the pinch is using.
+    if (this.heldEnd) this.releaseHeldEnd(this.touchEnd())
     const sent = this.sendSelfContained(buf)
     // Only a *delivered* open owns the gesture. Recording unconditionally looks equivalent and is
     // not: during the start-up window the open is refused while `this.proc` is a healthy process

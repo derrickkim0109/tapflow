@@ -504,20 +504,29 @@ function checkBootedSimulator(allDevices: Simulator[] | null): DoctorCheck {
  * without the shutdown, until the next connect puts it back.
  */
 function checkLeanMode(lean: boolean, simulators: Simulator[] | null): DoctorCheck {
-  let count = 0
+  // Devices by the service tier their marker records: Lean mode's own, or `slim` from a run that asked for it.
+  const byTier = new Map<string, number>()
   try {
     // The host directory outlives `simctl delete`, so a marker for a device that is gone is not counted.
     // With no list at all this counts nothing: that failure is the Simulator check's to report.
     const exists = new Set((simulators ?? []).map((d) => d.udid))
-    count = new LeanStore().applied().filter((udid) => exists.has(udid)).length
+    const store = new LeanStore()
+    for (const udid of store.applied().filter((u) => exists.has(u))) {
+      const name = store.currentTier(udid).name
+      byTier.set(name, (byTier.get(name) ?? 0) + 1)
+    }
   } catch {
     // An unreadable store directory still leaves this check able to say what the setting is.
   }
-  const devices = `${count} device${count === 1 ? '' : 's'}`
-  if (lean) return { label: count > 0 ? `Lean mode (iOS): on (${devices} lean now)` : 'Lean mode (iOS): on', ok: true }
+  const count = [...byTier.values()].reduce((a, b) => a + b, 0)
+  const noun = `${count} device${count === 1 ? '' : 's'}`
+  // "1 device lean", or "2 devices: 1 lean, 1 slim" when a run left some on another tier.
+  const tiers = byTier.size === 1 ? [...byTier.keys()][0]! : [...byTier].map(([name, n]) => `${n} ${name}`).join(', ')
+  const devices = byTier.size === 1 ? `${noun} ${tiers}` : `${noun}: ${tiers}`
+  if (lean) return { label: count > 0 ? `Lean mode (iOS): on (${devices} now)` : 'Lean mode (iOS): on', ok: true }
   if (count === 0) return { label: 'Lean mode (iOS): off', ok: true }
   return {
-    label: `Lean mode (iOS): off (${devices} still lean)`,
+    label: byTier.size === 1 ? `Lean mode (iOS): off (${noun} still ${tiers})` : `Lean mode (iOS): off (${noun} still changed: ${tiers})`,
     ok: false,
     warn: true,
     // Only shut-down devices are put back on connect, and one whose marker or store cannot be read is

@@ -3,9 +3,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 vi.mock('node:child_process')
 vi.mock('node:fs')
 vi.mock('node:net')
-const lean = vi.hoisted(() => ({ applied: [] as string[] }))
+const lean = vi.hoisted(() => ({ applied: [] as string[], tiers: {} as Record<string, string> }))
 vi.mock('@tapflowio/ios-agent', () => ({
-  LeanStore: vi.fn(function () { return { applied: () => lean.applied } }),
+  LeanStore: vi.fn(function () { return { applied: () => lean.applied, currentTier: (udid: string) => ({ name: lean.tiers[udid] ?? 'lean', keep: [] }) } }),
 }))
 
 import { execSync, spawnSync } from 'node:child_process'
@@ -640,6 +640,7 @@ describe('Lean mode', () => {
       return ''
     })
     lean.applied = []
+    lean.tiers = {}
   })
   afterEach(() => vi.restoreAllMocks())
 
@@ -672,6 +673,14 @@ describe('Lean mode', () => {
   it('asks simctl for the device list once, not once per check', async () => {
     await leanCheck(true)
     expect(mockExecSync.mock.calls.filter(([c]) => String(c).startsWith('xcrun simctl list devices'))).toHaveLength(1)
+  })
+
+  it('names the tier a run left a device on', async () => {
+    lean.applied = ['AAA', 'BBB']
+    lean.tiers = { BBB: 'slim' }
+    expect((await leanCheck(true))?.label).toBe('Lean mode (iOS): on (2 devices: 1 lean, 1 slim now)')
+    lean.applied = ['BBB']
+    expect((await leanCheck(false))?.label).toBe('Lean mode (iOS): off (1 device still slim)')
   })
 
   it('says when it is off but a device is still lean, and when that clears', async () => {

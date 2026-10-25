@@ -1,5 +1,33 @@
 # @tapflowio/android-agent
 
+## 0.29.0
+
+### Minor Changes
+
+- 64a7bc0: The boot gate refuses new devices on a Mac whose kernel reports critical memory pressure. Agents report `kern.memorystatus_vm_pressure_level` as `agent:resources.resources.memoryPressure` (`normal`, `warn`, `critical`; macOS only, absent elsewhere). While an agent on a Mac reports `critical`, the relay refuses automated cold boots there with `device:boot-error` `reason: 'host-memory-critical'`, and holds a person's cold boot in the reservation as it does behind another boot; the reading lapses 15 s after the last report that said so. `device:boot-waiting` carries an optional `reason` and is sent again when the wait's reason changes. flow-runner and MCP treat any `reason` on a refused boot as a busy Mac, including one they do not know (`AdmissionReason`, `'unrecognised-refusal'`), so a newer relay's reason is waited out instead of failing the run.
+- d310508: `tapflow flow run` resets the device before its flows, and `--no-reset` turns that off. `device:boot` takes `runReset: { uninstall, clear }` (app ids), which a relay drops rather than refusing the boot when it is malformed; the agent carries it out after the device is up and before `device:ready`, and reports `runReset: { done, failed }` there as `RunResetItem`s. iOS uninstalls the apps the run will install, clears the files of the rest, waits for `simctl bootstatus` on a cold boot, then resets the keychain, `simctl privacy` grants, pasteboard and simulated location; Android `pm clear`s every named app and clears the clipboard over gRPC. `agent-core` adds `runResetSteps`, `resetApps` and `RESETTABLE_APP_ID`, which keeps an id that is not an app id away from `adb shell`. `RelayClient.bootDevice` now returns what the ready said (`BootOutcome`). Run records gain `device_reset_json` (migration 019), written as `requested` at creation and filled from `POST /api/v1/runs/:id/device` right after the boot; the run page shows it.
+
+### Patch Changes
+
+- 259f8c7: On an emulator, a tap's up could overtake its down and leave the touch pressed. Each touch event is its own gRPC call, and the emulator does not take concurrent calls in the order they were sent: while it was busy right after an app install, the up arrived first, the kernel dropped it as a release of a touch that was already up, and the down that followed stayed pressed, so the app ignored that tap and the next one. Touch calls from a stream now go out one at a time, each after the one before it is answered or times out; a call that timed out may still be applied after the next one. Measured on Android 14: 3 of 16 fresh-install runs missed a tap before, none of 19 after.
+- 7830e81: The Android UI tree keeps a node that has an id even when it is neither clickable nor labelled, as the iOS tree does. A Compose `Slider` (a `SeekBar` that is focusable but not clickable) and the selected item of a navigation bar (which reports `selected` and drops `clickable`) were missing, so a selector naming them by `id` never matched. Keeping more nodes surfaced a rounding defect too: a node flush with the bottom edge came out at `y + height = 1.0001`, and every client refuses the whole tree for one element outside 0–1. The far edge is now rounded down, as on iOS. The window's decor (`android:id/content` and the status and navigation bar backgrounds) is left out: Android puts an id on nearly every view, the framework's included.
+- fe644c9: `device:ready` carries an optional `payload.cold`: whether this boot brought the device up, as opposed to finding it already running. Both agents report it. The relay's per-host boot gate, in this release, charges a boot by it. Absent means unknown, never `false`.
+
+
+- Updated dependencies [1445649]
+- Updated dependencies [fe644c9]
+- Updated dependencies [c5acd02]
+- Updated dependencies [c9f1ff8]
+- Updated dependencies [1e41b29]
+- Updated dependencies [64a7bc0]
+- Updated dependencies [d310508]
+- Updated dependencies [0e18ee1]
+- Updated dependencies [d4055b4]
+- Updated dependencies [486b1d3]
+  - @tapflowio/protocol@0.29.0
+  - @tapflowio/agent-core@0.29.0
+  - @tapflowio/audiotap-helper@0.3.14
+
 ## 0.28.1
 
 ### Patch Changes

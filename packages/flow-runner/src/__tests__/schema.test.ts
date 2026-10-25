@@ -168,6 +168,34 @@ steps:
     expect(() => parseFlow('steps:\n  - tapOn:\n      label: OK\n      timeout: 0.0004\n', 'x.yaml')).toThrow(/at least 1ms/)
   })
 
+  describe('tags', () => {
+    it('reads a list of tags, trimmed', () => {
+      expect(parseFlow('tags: [smoke, " login "]\nsteps:\n  - launchApp\n', 'x.yaml').tags).toEqual(['smoke', 'login'])
+    })
+
+    it('leaves tags out when the flow has none', () => {
+      expect(parseFlow('steps:\n  - launchApp\n', 'x.yaml')).not.toHaveProperty('tags')
+    })
+
+    it.each([
+      ['a string', 'tags: smoke'],
+      ['an empty tag', 'tags: [smoke, ""]'],
+      ['a blank tag', 'tags: ["  "]'],
+      ['a number', 'tags: [1]'],
+      ['a comma', 'tags: ["smoke,login"]'],
+    ])('rejects %s', (_, line) => {
+      expect(() => parseFlow(`${line}\nsteps:\n  - launchApp\n`, 'x.yaml')).toThrow(/"tags" must be a list of non-empty strings without commas/)
+    })
+
+    it('agrees with the JSON schema on what a tag may be', () => {
+      const schema = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'tapflow-flow.schema.json'), 'utf8'))
+      const item = schema.properties.tags.items
+      const pattern = new RegExp(item.pattern)
+      for (const ok of ['smoke', ' login ', 'a b']) expect(pattern.test(ok)).toBe(true)
+      for (const bad of ['', '  ', 'a,b']) expect(pattern.test(bad) && bad.length >= item.minLength).toBe(false)
+    })
+  })
+
   it('keeps the JSON schema timeout floor consistent with the parser', () => {
     // The parser rejects timeouts that round to 0ms, i.e. anything below
     // 0.0005s — so the shipped JSON schema must reject them too, or

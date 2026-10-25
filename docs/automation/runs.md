@@ -6,7 +6,7 @@ description: "See tapflow flow run's records on the dashboard's Flow Runs page: 
 # Flow Runs
 
 ::: warning Experimental
-The flow runner and its run records are part of tapflow's **AI automation axis**, which is experimental. The mature path is the manual QA dashboard.
+The flow runner and its run records belong to **Automation**, one of the three ways to use tapflow, and are experimental. The most mature part of tapflow is the manual QA dashboard.
 :::
 
 The dashboard's **Flow Runs** page shows the records `tapflow flow run` leaves. When CI runs your flows on every build, anyone on the team can see in a browser which flow failed on which build, and why. A failure in the app is kept apart from an environment problem such as the device, the agent or the relay.
@@ -30,6 +30,7 @@ A run's page lists its flows in the order they ran.
 - A failed flow shows its failure message, each step's result and a screenshot from the moment it failed. A passed flow shows the screen it ended on, as the evidence that it passed: a login flow shows the screen it logged in to. Select a screenshot to open it full size.
 - A `tapOn` step that failed because it found no element, or several, lists lines to try instead under **Try instead**, from the screen at the moment it failed. Each line has a **Copy** button. [Flows](/automation/flows#selectors) explains how they are chosen.
 - A flow the run never reached is marked **Not run**.
+- A flow the runner chose not to run is marked **Skipped: another app** (a flow for a different app than the build) or **Skipped: tags** (left out by the tag options), with the reason beside it. The list shows how many were skipped next to the passed count. See [Choosing flows](/automation/flows#choosing-flows).
 - **Open the CI run** opens the run on the CI side when the CI recorded a link to it. For a run with a build, **Other runs of this build** lists the same build's other runs.
 
 ### Watch a flow's video {#flow-video}
@@ -44,6 +45,8 @@ A flow the runner kept a video of has a **Play the video** button. It downloads 
 ### Watch a run in progress {#watch-a-run}
 
 While a run is in progress, the list and the run's page refresh every few seconds. **Watch the device** on the run's page shows the device the runner is driving, live and read-only: nothing you click reaches the device. Up to 4 people can watch a session.
+
+A run across several devices (`--parallel`) lists them at the top of its page, each with its reset, the flow it is running now and a **Watch** link for that device. A running flow says which device it is on after **Running on**, and the list shows how many devices the run used.
 
 ## What the statuses mean {#statuses}
 

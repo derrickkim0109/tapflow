@@ -1,4 +1,4 @@
-import { fetchWithToken, fixedToken, tokenRefusal, type TokenSource } from '@tapflowio/flow-runner'
+import { fetchWithToken, fixedToken, tokenRefusal, type BootOutcome, type ServiceTier, type SkipReason, type TokenSource } from '@tapflowio/flow-runner'
 import type { CiContext } from './ci.js'
 
 /**
@@ -15,8 +15,9 @@ import type { CiContext } from './ci.js'
 
 export interface RunRecorderDeps {
   fetch: typeof fetch
-  /** One line to the person running the command. At most twice per run: once if recording stops, and once
-   *  the first time a flow's screenshot (the screen it failed on or ended on) cannot be sent. */
+  /** One line to the person running the command. At most three times per run: once if recording stops, once
+   *  the first time a flow's screenshot (the screen it failed on or ended on) cannot be sent, and once if the relay
+   *  refuses a skipped flow. */
   warn: (line: string) => void
   callTimeoutMs?: number
 }
@@ -35,6 +36,10 @@ export interface FlowReport {
   device?: { id: string; name: string; platform?: string }
 }
 
+/** The device a flow or a boot happened on, named by the session that holds it, so a run on several devices can tell
+ *  them apart. */
+export interface RunDeviceRef { sessionId: string; id: string; name: string }
+
 export interface RunOutcome {
   status: 'passed' | 'failed' | 'aborted'
   exitCode: number
@@ -44,7 +49,16 @@ export interface RunOutcome {
 
 const CALL_TIMEOUT_MS = 5_000
 
-class RecordRefused extends Error {}
+class RecordRefused extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message)
+  }
+}
+
+export interface SkippedReport {
+  reason: SkipReason
+  message: string
+}
 
 export class RunRecorder {
   private queue: Promise<void> = Promise.resolve()
@@ -52,6 +66,7 @@ export class RunRecorder {
   private stopped = false
   private finished = false
   private screenshotWarned = false
+  private skippedWarned = false
   /** Aborts the call in flight when the drain gives up, so nothing keeps the process alive past the cap. */
   private readonly gaveUp = new AbortController()
   private readonly callTimeoutMs: number
@@ -75,7 +90,7 @@ export class RunRecorder {
     return this.id
   }
 
-  create(run: { client: string; buildId?: number; flows: PlannedFlow[]; ci: CiContext | null }): void {
+  create(run: { client: string; buildId?: number; flows: PlannedFlow[]; ci: CiContext | null; serviceTier?: ServiceTier; resetRequested?: boolean }): void {
     this.enqueue(false, async () => {
       try {
         await this.createRun(run)
@@ -85,12 +100,14 @@ export class RunRecorder {
     })
   }
 
-  private async createRun(run: { client: string; buildId?: number; flows: PlannedFlow[]; ci: CiContext | null }): Promise<void> {
+  private async createRun(run: { client: string; buildId?: number; flows: PlannedFlow[]; ci: CiContext | null; serviceTier?: ServiceTier; resetRequested?: boolean }): Promise<void> {
     const res = await this.post('/api/v1/runs', JSON.stringify({
       client: run.client,
       ...(run.buildId !== undefined ? { buildId: run.buildId } : {}),
       flows: run.flows,
       ...(run.ci ? { ci: run.ci } : {}),
+      ...(run.serviceTier ? { serviceTier: run.serviceTier } : {}),
+      ...(run.resetRequested !== undefined ? { resetRequested: run.resetRequested } : {}),
     }), 'application/json')
     // A relay older than run records answers an unknown `/api/` POST with the dashboard's `index.html` and a
     // 200, so "ok" is not "supported". Only an id says it was recorded.
@@ -127,6 +144,65 @@ export class RunRecorder {
             this.deps.warn(`screenshot not recorded (flow ${idx + 1}): ${reason}; the rest of the run is still recorded`)
           }
         }
+      }
+    })
+  }
+
+  /**
+   * A flow the run chose not to replay. **A relay that refuses it is not a reason to stop recording**: one older
+   * than skipped flows answers 400, and stopping there would drop every report after it and the finish too, so the
+   * relay would close the run as "runner disconnected". Skipped reports are sent before any flow runs, so that
+   * would be the whole run.
+   */
+  reportSkipped(idx: number, skipped: SkippedReport): void {
+    if (this.finished) return
+    this.enqueue(true, async () => {
+      try {
+        await this.post(`/api/v1/runs/${this.id}/flows/${idx}`, JSON.stringify({
+          status: 'skipped', skipReason: skipped.reason, failureMessage: skipped.message, durationMs: 0, steps: [],
+        }), 'application/json')
+      } catch (e) {
+        if (!(e instanceof RecordRefused && e.status === 400)) throw e
+        if (!this.skippedWarned) {
+          this.skippedWarned = true
+          this.deps.warn(`skipped flows not recorded: ${e.message} — update the relay to record them; the rest of the run is still recorded`)
+        }
+      }
+    })
+  }
+
+  /**
+   * What the run's boot said about its device: whether it was already up, and what was reset. Sent as soon as the boot
+   * answers, so a run that then fails to install, is cancelled or loses its runner still has it. A relay that predates
+   * the route answers it with the dashboard's `index.html` and 200, so it passes unrecorded; the 400 and 404 caught
+   * below are this relay refusing the body or having lost the run, neither a reason to stop recording the rest.
+   */
+  reportDevice(device: RunDeviceRef, booted: BootOutcome): void {
+    if (this.finished) return
+    this.enqueue(true, async () => {
+      try {
+        await this.post(`/api/v1/runs/${this.id}/device`, JSON.stringify({
+          sessionId: device.sessionId, deviceId: device.id, deviceName: device.name, ...booted,
+        }), 'application/json')
+      } catch (e) {
+        if (!(e instanceof RecordRefused && (e.status === 400 || e.status === 404))) throw e
+      }
+    })
+  }
+
+  /**
+   * Flow `idx` is starting on `device`, so the runs page can show it running there rather than guess. Refusals are
+   * dropped for `reportDevice`'s reasons; an older relay has no route for it and answers 404, or `index.html` and 200.
+   */
+  reportFlowStart(idx: number, device: RunDeviceRef): void {
+    if (this.finished) return
+    this.enqueue(true, async () => {
+      try {
+        await this.post(`/api/v1/runs/${this.id}/flows/${idx}/start`, JSON.stringify({
+          sessionId: device.sessionId, deviceId: device.id, deviceName: device.name,
+        }), 'application/json')
+      } catch (e) {
+        if (!(e instanceof RecordRefused && (e.status === 400 || e.status === 404))) throw e
       }
     })
   }
@@ -182,7 +258,7 @@ export class RunRecorder {
       body: typeof body === 'string' ? body : new Uint8Array(body),
       signal: AbortSignal.any([AbortSignal.timeout(this.callTimeoutMs), this.gaveUp.signal]),
     }, this.deps.fetch)
-    if (!res.ok) throw new RecordRefused(await refusal(res, this.tokens))
+    if (!res.ok) throw new RecordRefused(await refusal(res, this.tokens), res.status)
     return res
   }
 }

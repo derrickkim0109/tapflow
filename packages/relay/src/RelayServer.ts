@@ -7,10 +7,16 @@ import { randomUUID } from 'crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { SessionManager, isAiClientKind } from './SessionManager.js'
 import type { Session } from './SessionManager.js'
+import type { AgentResources } from './types.js'
 import type { DeviceDetails, UIElement } from './types.js'
-import type { ChromePayload, InputErrorReason, RelayOutbound, PosturesPayload, WatchActionKind, WatchRefusal } from '@tapflowio/protocol'
+import type { AdmissionRefusal, BootRefusalReason, ChromePayload, LeaseRefusalReason, InputErrorReason, MacAdmission, RelayOutbound, PosturesPayload, WatchActionKind, WatchRefusal } from '@tapflowio/protocol'
 import { gestureAction, keyForWatchers } from './lib/watchActions.js'
-import { directionOf, parseInbound } from '@tapflowio/protocol/validate'
+import { HostBootGate, GATE_DEFAULTS, type BooterClass, type Effect, type GateEvent, type GateTiming } from './admission/HostBootGate.js'
+import { defaultCap, idleToFree, planCapacity, type CapacityDevice, type CapacityPlan } from './admission/capacity.js'
+import { classifyBoot } from './admission/classifyBoot.js'
+import { hostKeyOf } from './admission/hostKey.js'
+import { chooseLease, type LeaseCandidate, type LeaseHost } from './admission/leaseChoice.js'
+import { directionOf, parseInbound, readyFacts } from '@tapflowio/protocol/validate'
 import type { ParsedInbound, ParseFailure, ParseResult } from '@tapflowio/protocol/validate'
 import { Router, json } from './router.js'
 import { requireViewAuth, requireAuth, getAuth, verifyPat, touchPat, findPat, findUser } from './middleware/auth.js'
@@ -105,7 +111,7 @@ import { handleGetSettings, handleUpdateSettings } from './api/settings.js'
 import { handleUpdateProfile } from './api/profile.js'
 import { handleUploadRecording, handleListRecordings, handleDownloadRecording, purgeExpiredRecordings } from './api/recordings.js'
 import { handleEndVideo, handleOpenVideo, handleVideoChunk, handleVideoData, handleVideoIndex, purgeRunVideos, releaseStaleVideoReservations, runVideosDirFor, videoSummaries } from './api/runVideos.js'
-import { abandonRunsOf, handleCreateRun, handleFinishRun, handleGetFlowScreenshot, handleGetRun, handleListRuns, handleReportFlow, handleUploadFlowScreenshot, purgeExpiredRuns, runScreenshotsDirFor, type RunHolders } from './api/runs.js'
+import { abandonRunsOf, handleCreateRun, handleFinishRun, handleReportDevice, handleStartFlow, handleGetFlowScreenshot, handleGetRun, handleListRuns, handleReportFlow, handleUploadFlowScreenshot, purgeExpiredRuns, runScreenshotsDirFor, type RunHolders } from './api/runs.js'
 import { handleListAgents, handleGetAgentResources } from './api/agents.js'
 
 const MIME_TYPES: Record<string, string> = {
@@ -125,6 +131,17 @@ const MIME_TYPES: Record<string, string> = {
 
 const _parsedThreshold = parseInt(process.env['TAPFLOW_RESOURCE_THRESHOLD_PERCENT'] ?? '80', 10)
 const RESOURCE_THRESHOLD = Number.isFinite(_parsedThreshold) ? _parsedThreshold : 80
+
+/** How long a device the relay shut down to make room stays out of the automation count without word from its
+ *  agent. A shutdown takes seconds; past this, assume it did not happen and count the device again. */
+const EVICTION_GRACE_MS = 60_000
+
+/** The prose on a refused boot. Clients act on `reason`; this is for the person reading a log. */
+const BOOT_REFUSAL_MESSAGES: Record<BootRefusalReason, string> = {
+  'host-booting': 'Another device is still booting on this Mac. Try again once it has settled.',
+  'host-memory-critical': 'This Mac is critically short of memory. Try again once it has recovered.',
+  'host-at-capacity': 'This Mac already runs as many automation devices as it allows, and all of them are in use.',
+}
 
 // Messages that only agents are allowed to send. Authenticated browser sockets
 // that send any of these are disconnected immediately.
@@ -201,6 +218,9 @@ function describeRejection(failure: ParseFailure, suppressed: number): string | 
 /** One member of the parse product, by literal. `route` narrows to these; a handler that takes one
  *  gets exactly what the door proved for that type and nothing else. */
 type Inbound<T extends ParsedInbound['type']> = Extract<ParsedInbound, { type: T }>
+
+/** A boot as the boot gate holds it: the frame it will forward and the socket that asked, which any answer goes to. */
+type HeldBoot = { ws: WebSocket; msg: Inbound<'device:boot'>; cost: 'cold' | 'warm'; booterClass: BooterClass }
 
 /** The five inputs an ack answers, and the six it does not. Written as unions of `Inbound<…>` rather
  *  than as `& { requestId: string }` intersections: the correlator is now declared on the members
@@ -360,6 +380,12 @@ export class RelayServer {
   /** How long a tracked boot lives without an answer. An option so tests can shrink the
    *  180s horizon; production always takes the default. */
   private readonly pendingBootTtlMs: number
+  /** One cold boot at a time per Mac (`admission/HostBootGate.ts`). */
+  private readonly bootGate: HostBootGate<HeldBoot>
+  /** `TAPFLOW_MAX_AUTOMATED_DEVICES`, when it is usable; otherwise each Mac's cap comes from its memory. */
+  private readonly automatedCapOverride: number | null
+  private readonly evictionGraceMs: number
+  private bootGateTimer: ReturnType<typeof setTimeout> | null = null
   private readonly corsAllowed: Set<string>
   // One-shot warning when XFF arrives on a loopback socket but TAPFLOW_TRUSTED_PROXIES is unset.
   private warnedProxyMisconfig = false
@@ -425,7 +451,7 @@ export class RelayServer {
     timer: ReturnType<typeof setTimeout>
   }>()
 
-  constructor(private readonly options: { port: number; publicDir?: string; uploadsDir?: string; idleTimeoutMs?: number; wsBackpressureBytes?: number; screenshotTimeoutMs?: number; uiTreeTimeoutMs?: number; trustedProxies?: string[]; corsOrigins?: string[]; tls?: { cert: string; key: string }; agentGraceMs?: number; pendingBootTtlMs?: number; tunnel?: TunnelRuntime; tunnelPort?: number }) {
+  constructor(private readonly options: { port: number; publicDir?: string; uploadsDir?: string; idleTimeoutMs?: number; wsBackpressureBytes?: number; screenshotTimeoutMs?: number; uiTreeTimeoutMs?: number; trustedProxies?: string[]; corsOrigins?: string[]; tls?: { cert: string; key: string }; agentGraceMs?: number; pendingBootTtlMs?: number; bootGate?: Partial<GateTiming>; evictionGraceMs?: number; tunnel?: TunnelRuntime; tunnelPort?: number }) {
     // 0 on both sides is two ephemeral ports, which is what the tests ask for.
     if (options.tunnelPort !== undefined && options.tunnelPort !== 0 && options.tunnelPort === options.port) {
       throw new Error(`The tunnel port (${options.tunnelPort}) must differ from the relay port. Set TAPFLOW_TUNNEL_PORT to another port.`)
@@ -449,11 +475,20 @@ export class RelayServer {
     const graceUsable = Number.isFinite(graceEnv) && graceEnv >= 0
     this.agentGraceMs = options.agentGraceMs ?? (graceUsable ? graceEnv : DEFAULT_AGENT_GRACE_MS)
     this.pendingBootTtlMs = options.pendingBootTtlMs ?? PENDING_BOOT_TTL_MS
+    this.evictionGraceMs = options.evictionGraceMs ?? EVICTION_GRACE_MS
+    this.bootGate = new HostBootGate<HeldBoot>(() => Date.now(), { ...GATE_DEFAULTS, ...options.bootGate })
     // Say so rather than only documenting it. Both times this parsing was wrong the symptom was
     // the same — the hold switched off and nothing mentioned it — and somebody who types `15s` is
     // reading their terminal, not the configuration table.
     if (options.agentGraceMs === undefined && graceRaw && !graceUsable) {
       logger.warn(`TAPFLOW_AGENT_GRACE_MS="${graceRaw}" is not a usable number of milliseconds — using ${DEFAULT_AGENT_GRACE_MS}`)
+    }
+    // Same reason: a cap someone set and mistyped would quietly become the automatic one, which may allow more.
+    const capRaw = process.env['TAPFLOW_MAX_AUTOMATED_DEVICES']?.trim()
+    const capEnv = capRaw ? Number(capRaw) : NaN
+    this.automatedCapOverride = Number.isInteger(capEnv) && capEnv > 0 ? capEnv : null
+    if (capRaw && this.automatedCapOverride === null) {
+      logger.warn(`TAPFLOW_MAX_AUTOMATED_DEVICES="${capRaw}" is not a positive whole number — using half each Mac's memory in GB`)
     }
     this.sessions = new SessionManager({
       idleTimeoutMs: options.idleTimeoutMs,
@@ -577,8 +612,10 @@ export class RelayServer {
     this.router.post('/api/v1/runs', handleCreateRun)
     this.router.get('/api/v1/runs', (req, res) => handleListRuns(req, res, this.runHolders))
     this.router.get('/api/v1/runs/:id', (req, res, params) => handleGetRun(req, res, params, this.runHolders, videoSummaries))
+    this.router.post('/api/v1/runs/:id/device', handleReportDevice)
     this.router.post('/api/v1/runs/:id/finish', handleFinishRun)
     this.router.post('/api/v1/runs/:id/flows/:idx', handleReportFlow)
+    this.router.post('/api/v1/runs/:id/flows/:idx/start', handleStartFlow)
     this.router.post('/api/v1/runs/:id/flows/:idx/screenshot', (req, res, params) => handleUploadFlowScreenshot(req, res, params, this.runScreenshotsDir))
     this.router.get('/api/v1/runs/:id/flows/:idx/screenshot', (req, res, params) => handleGetFlowScreenshot(req, res, params, this.runScreenshotsDir))
     // a flow's video (A4) — uploaded by the runner while the flow runs, kept by the retention policy
@@ -748,6 +785,7 @@ export class RelayServer {
     // Same argument as the holds above: an expiry firing after `stop()` would run against a dead
     // server, and an unref'd 180s timer still outlives the test runner's process.
     for (const key of this.pendingBoots.keys()) this.forgetBoot(key)
+    if (this.bootGateTimer) { clearTimeout(this.bootGateTimer); this.bootGateTimer = null }
     const closeTunnel = new Promise<void>((resolve, reject) => {
       // Not listening means `start()` never reached it, or its listen failed; `close()` would reject.
       if (!this.tunnelServer?.listening) return resolve()
@@ -957,13 +995,7 @@ export class RelayServer {
       }
       return keys
     },
-    heldSession: (keys) => {
-      for (const ws of this.openSocketsOf(keys)) {
-        const held = this.sessions.getByBrowserSocket(ws)
-        if (held.length > 0) return held[0].id
-      }
-      return null
-    },
+    heldSessions: (keys) => this.openSocketsOf(keys).flatMap((ws) => this.sessions.getByBrowserSocket(ws).map((s) => s.id)),
   }
 
   private isAlive(ws: WebSocket): boolean {
@@ -1007,6 +1039,13 @@ export class RelayServer {
    * records; the network requester is not one, so the name lost the word rather than the entry
    * lost the function.
    */
+  /** A session is gone for good: from the manager, from the per-session state, and from the boot gate. */
+  private removeSession(sessionId: string): void {
+    this.sessions.remove(sessionId)
+    this.forgetSessionState(sessionId)
+    this.gateEvent({ kind: 'session-removed', sessionId })
+  }
+
   private forgetSessionState(sessionId: string): void {
     this.dropHandlers.delete(sessionId)
     this.dropHandlers.delete(`${sessionId} watchers`)
@@ -1381,7 +1420,10 @@ export class RelayServer {
       if (this.stopping) return
       for (const held of this.sessions.getByBrowserSocket(ws)) {
         this.sessions.clearBrowser(held.id, () => this.idleShutdown(held.id))
+        // Spent, as on a leave: the countdown just started is the one it would have handed back.
+        held.idleResumeOnLeave = false
         this.tellWatchers(held.id, { type: 'watch:holder-left', sessionId: held.id })
+        this.gateEvent({ kind: 'browser-closed', sessionId: held.id })
       }
       // A run is its runner's socket: the flow runner does not reconnect, so the last socket with its key
       // closing is the end of that run, finished or not. Not done while stopping (above) — a relay going
@@ -1540,7 +1582,8 @@ export class RelayServer {
       case 'agents:list': {
         this.sendTo(ws, {
           type: 'agents:listed',
-          sessions: this.sessions.list(this.ownerOf(ws), (holder) => this.isAlive(holder)),
+          sessions: this.sessions.list(this.ownerOf(ws), (holder) => this.isAlive(holder), (group) => this.macAdmission(group)),
+          features: ['device-lease'],
         })
         break
       }
@@ -1586,15 +1629,21 @@ export class RelayServer {
           // Silently: the holder ended it, and the shutdown may still complete on the device — saying it
           // failed would be a guess. The caller keeps its own deadline, as it did before #567.
           if (ended) this.settleShutdownRequesters(ended, null)
-          this.sessions.remove(msg.sessionId)
-          this.forgetSessionState(msg.sessionId)
+          this.removeSession(msg.sessionId)
         }
         break
       }
       case 'session:leave': {
-        if (this.ownsSession(ws, this.sessions.get(msg.sessionId))) {
-          this.sessions.clearBrowser(msg.sessionId)
+        const leaving = this.sessions.get(msg.sessionId)
+        if (this.ownsSession(ws, leaving)) {
+          // An automation client that stopped a person's idle countdown by joining starts it again by leaving;
+          // otherwise a leave keeps the device up, as it always has (a CI job reuses the device it left).
+          const resume = leaving?.idleResumeOnLeave === true
+          // Cleared after, not before: `clearBrowser` reads it to record whose countdown this is.
+          this.sessions.clearBrowser(msg.sessionId, resume ? () => this.idleShutdown(msg.sessionId) : undefined)
+          if (leaving) leaving.idleResumeOnLeave = false
           this.forgetSessionState(msg.sessionId)
+          this.gateEvent({ kind: 'browser-closed', sessionId: msg.sessionId })
           // **A leave is the end, not a blip.** The holder said it is done — a flow run finishing, an MCP
           // `disconnect_device` — so the watch ends. `watch:holder-left` is for a socket that dropped, which
           // may come back; sent here it left a watcher of every finished CI run waiting forever.
@@ -1667,6 +1716,7 @@ export class RelayServer {
         const session = this.sessions.get(msg.sessionId)
         if (!session) break
         this.sessions.clearDeviceCache(session.id)
+        this.sessions.setDeviceServiceTier(session.id, undefined)
         if (session.browserSocket?.readyState === WebSocket.OPEN) {
           session.browserSocket.send(JSON.stringify(raw))
         }
@@ -1678,17 +1728,29 @@ export class RelayServer {
         // even when nobody is left to forward to. An id-less frame answers no request, so it
         // clears nothing.
         this.settleBoot(msg.sessionId, msg.requestId)
+        this.gateEvent({ kind: 'boot-error', sessionId: msg.sessionId, requestId: msg.requestId })
         const session = this.sessions.get(msg.sessionId)
+        if (session) this.undoLastBoot(session, msg.requestId)
         if (session?.browserSocket?.readyState === WebSocket.OPEN) {
-          session.browserSocket.send(JSON.stringify(raw))
+          // `reason` is the relay's word that the Mac is busy, and clients wait out any frame carrying one. An agent's
+          // boot failure is a failure, so a `reason` an agent put on it does not reach them.
+          const { reason: _agentReason, ...fromAgent } = raw
+          session.browserSocket.send(JSON.stringify(fromAgent))
         }
         break
       }
       case 'device:shutdown-done': {
+        this.gateEvent({ kind: 'shutdown-done', sessionId: msg.sessionId })
         const session = this.sessions.get(msg.sessionId)
         if (!session) break
         this.sessions.updateDeviceStatus(session.id, 'shutdown')
         this.sessions.setReadySent(session.id, false)
+        this.sessions.setDeviceServiceTier(session.id, undefined)
+        // Unless a boot went out after the shutdown this answers: the shutdown carries no correlator, and a device
+        // the relay shut down to make room can be picked up and started again before the agent reports back.
+        if (session.lastBootPending === undefined) session.lastBoot = undefined
+        session.lastBootExpired = undefined
+        session.evictingAt = undefined
         if (session.browserSocket?.readyState === WebSocket.OPEN) {
           session.browserSocket.send(JSON.stringify(raw))
         }
@@ -1700,6 +1762,12 @@ export class RelayServer {
         // and not confirmed, so the device may well still be running.
         const session = this.sessions.get(msg.sessionId)
         if (!session) break
+        // An eviction the agent could not carry out: the device may still be up, so it is up again as far as the cap
+        // and the next boot's classification are concerned.
+        if (session.evictingAt !== undefined) {
+          session.evictingAt = undefined
+          this.sessions.updateDeviceStatus(session.id, 'booted')
+        }
         if (session.browserSocket?.readyState === WebSocket.OPEN) {
           session.browserSocket.send(JSON.stringify(raw))
         }
@@ -1715,6 +1783,10 @@ export class RelayServer {
         this.settleBoot(msg.sessionId, msg.requestId)
         const session = this.sessions.get(msg.sessionId)
         if (!session) break
+        const facts = readyFacts(raw)
+        if (facts.serviceTier !== undefined) this.sessions.setDeviceServiceTier(session.id, facts.serviceTier)
+        this.settleLastBoot(session, msg.requestId, facts.cold)
+        this.gateEvent({ kind: 'ready', hostKey: hostKeyOf(session), sessionId: session.id, cold: facts.cold })
         this.sessions.updateDeviceStatus(session.id, 'booted')
         this.sessions.setReadySent(session.id, true)
         if (session.browserSocket?.readyState === WebSocket.OPEN) {
@@ -1787,33 +1859,11 @@ export class RelayServer {
         // the diagnosis arrives and is discarded. That defect shipped twice from agent code
         // (`open-url:error`, then `clipboard:error`); here the producer is the relay, where
         // `correlatedRequestsGated` cannot see it because the field is optional.
-        const boot = this.dispatchTarget(ws, msg.sessionId)
-        if (!boot.ok) {
-          this.sendTo(ws, {
-            type: 'device:boot-error',
-            sessionId: msg.sessionId,
-            requestId: msg.requestId,
-            message: boot.message,
-          })
-          break
-        }
-        // Tag the boot with whether the viewer is external (public IP) so the agent can pick the
-        // downscale tier. The browser already reports secureContext in the payload.
-        //
-        // **Mutating the parse product, not the frame that arrived**, which is what makes this safe as
-        // well as correct: `payload` is a fresh object the parser built, so `raw` is untouched. The
-        // presence check the old line carried is gone because the schema requires the payload — and
-        // `external` is deliberately not declared on `DeviceBoot`, since the browser never sends it.
-        (msg.payload as Record<string, unknown>)['external'] = this.wsExternal.get(ws) ?? false
-        // Whether an automation client (flow runner, MCP) is booting, so the iOS agent can start its UI-tree runner
-        // now instead of inside the first selector step's timeout. Only the holder can boot (`dispatchTarget`), so the
-        // holder's kind is the booter's. A dashboard boot is never warmed: the runner costs about 520 MB per device.
-        ;(msg.payload as Record<string, unknown>)['automation'] = isAiClientKind(boot.session.holderKind)
-        // Tracked by the socket it actually goes to (#885): a rebind invalidates only the boots
-        // tied to the replaced socket, so a boot dispatched after the rebind stays answerable.
-        this.rememberBoot(msg.sessionId, msg.requestId, boot.session.agentSocket)
-        // The parse product, so a key a viewer appended from devtools is gone before the agent sees it.
-        boot.session.agentSocket.send(JSON.stringify(msg))
+        this.handleBoot(ws, msg)
+        break
+      }
+      case 'device:lease': {
+        this.handleLease(ws, msg)
         break
       }
       case 'device:shutdown': {
@@ -2008,7 +2058,14 @@ export class RelayServer {
 
   private handleAgentResources(ws: WebSocket, msg: Inbound<'agent:resources'>): void {
     this.sessions.setResources(ws, msg.resources)
-    const agentName = this.sessions.getAllByAgentSocket(ws)[0]?.agentName
+    const first = this.sessions.getAllByAgentSocket(ws)[0]
+    if (first) {
+      this.gateEvent({ kind: 'sample', hostKey: hostKeyOf(first), cpuPercent: msg.resources.cpuPercent })
+      // No reading is not "normal": an agent that cannot read pressure, beside one that can, would clear it every 5 s.
+      const pressure = msg.resources.memoryPressure
+      if (pressure !== undefined) this.gateEvent({ kind: 'pressure', hostKey: hostKeyOf(first), critical: pressure === 'critical' })
+    }
+    const agentName = first?.agentName
     if (agentName) {
       const buf = this.resourceBuffers.get(agentName) ?? { cpu: [], mem: [] }
       buf.cpu.push(msg.resources.cpuPercent)
@@ -2098,6 +2155,113 @@ export class RelayServer {
     }
   }
 
+  /**
+   * The `session:start` resource gate's reading of a session's Mac, before the per-join memory exemption.
+   * One reading for the gate and the device listing, so the dashboard's Mac card shows what a join would meet
+   * rather than a threshold of its own (the card used to recompute 80 % and block on it, which disagreed with the
+   * relay as soon as the relay grew exceptions). Null when the agent has sent no sample, or is away — its last
+   * sample is the dead socket's, and an overloaded Mac is a common reason to restart an agent: fail open.
+   *
+   * While a boot holds this Mac's slot the CPU is that boot's, and the boot gate already decides when the next one
+   * may start. A join is not a boot: refusing it would lock a person out of a device that is already up for the
+   * 30–90 s the boot takes to settle.
+   */
+  private resourceLoad(session: Session): { cpuOver: boolean; memOver: boolean; over: boolean } | null {
+    if (session.agentSocket.readyState !== WebSocket.OPEN) return null
+    const resources = this.sessions.getResources(session.agentSocket)
+    if (!resources) return null
+    const cpuOver = resources.cpuPercent > RESOURCE_THRESHOLD && !this.bootGate.isBooting(hostKeyOf(session))
+    const memOver = (resources.memUsedMB / resources.memTotalMB) * 100 > RESOURCE_THRESHOLD
+    return { cpuOver, memOver, over: cpuOver || memOver }
+  }
+
+  /**
+   * What a person picking one of this agent's devices would meet, summarised for the Mac card. The same reading
+   * `handleSessionStart` applies, with its memory exemption: a person rejoining a device the relay has up
+   * (`readySent`) is not held to memory, so memory alone blocks the Mac only when there is no such device.
+   */
+  private macAdmission(group: Session[]): MacAdmission {
+    const load = this.resourceLoad(group[0]!)
+    const memOver = load?.memOver ?? false
+    return {
+      booting: this.bootGate.isBooting(hostKeyOf(group[0]!)),
+      overloaded: (load?.cpuOver ?? false) || (memOver && !group.some((s) => s.readySent)),
+      memoryRefuses: memOver ? group.filter((s) => !s.readySent).map((s) => s.deviceId) : [],
+    }
+  }
+
+  private gateEvent(ev: GateEvent): void {
+    this.applyGate(this.bootGate.onEvent(ev))
+  }
+
+  /** Carry out what the boot gate decided, then wake it at its next deadline. */
+  private applyGate(effects: Effect<HeldBoot>[]): void {
+    for (const fx of effects) {
+      switch (fx.kind) {
+        case 'deliver':
+          this.forwardBoot(fx.message)
+          break
+        case 'refuse':
+          this.sendTo(fx.message.ws, {
+            type: 'device:boot-error', sessionId: fx.sessionId, requestId: fx.requestId, reason: fx.reason,
+            message: BOOT_REFUSAL_MESSAGES[fx.reason],
+          })
+          break
+        case 'waiting':
+          this.sendTo(fx.message.ws, { type: 'device:boot-waiting', sessionId: fx.sessionId, requestId: fx.requestId, until: fx.until, reason: fx.reason })
+          break
+        case 'withdraw':
+          this.sendTo(fx.message.ws, {
+            type: 'device:boot-error', sessionId: fx.sessionId, requestId: fx.requestId,
+            message: fx.why === 'replaced'
+              ? 'Replaced by a newer boot request for this session'
+              : 'The viewer left while this boot was waiting its turn on this Mac',
+          })
+          break
+        case 'log':
+          logger.info(`boot gate: ${fx.event} on ${fx.hostKey}${fx.sessionId ? ` (session ${fx.sessionId})` : ''}`)
+          break
+        default: {
+          const never: never = fx
+          throw new Error(`unhandled boot gate effect ${JSON.stringify(never)}`)
+        }
+      }
+    }
+    if (this.bootGateTimer) { clearTimeout(this.bootGateTimer); this.bootGateTimer = null }
+    const next = this.bootGate.nextDeadline()
+    if (next !== null && !this.stopping) {
+      this.bootGateTimer = setTimeout(() => {
+        this.bootGateTimer = null
+        this.applyGate(this.bootGate.tick())
+      }, Math.max(0, next - Date.now()))
+    }
+  }
+
+  /**
+   * Send a boot the gate let through. **Resolved again here** even when the gate answered at once: a held boot can
+   * have outlived its holder's ownership or its agent, and one path for both keeps the two from drifting. A boot
+   * that can no longer go is answered, and the gate is told so the slot it was given is not held for nothing.
+   */
+  private forwardBoot({ ws, msg, cost, booterClass }: HeldBoot): void {
+    const boot = this.dispatchTarget(ws, msg.sessionId)
+    if (!boot.ok) {
+      this.sendTo(ws, { type: 'device:boot-error', sessionId: msg.sessionId, requestId: msg.requestId, message: boot.message })
+      this.gateEvent({ kind: 'boot-error', sessionId: msg.sessionId, requestId: msg.requestId })
+      return
+    }
+    if (cost === 'cold') {
+      const s = boot.session
+      // A boot still out keeps the value from before it: `prev` may itself be absent, which is the answer, not a gap.
+      s.lastBootPending = { requestId: msg.requestId, prev: s.lastBootPending ? s.lastBootPending.prev : s.lastBoot }
+      s.lastBoot = { booterClass, at: Date.now() }
+    }
+    // Tracked by the socket it actually goes to (#885): a rebind invalidates only the boots
+    // tied to the replaced socket, so a boot dispatched after the rebind stays answerable.
+    this.rememberBoot(msg.sessionId, msg.requestId, boot.session.agentSocket)
+    // The parse product, so a key a viewer appended from devtools is gone before the agent sees it.
+    boot.session.agentSocket.send(JSON.stringify(msg))
+  }
+
   private bootKey(sessionId: string, requestId: string): string {
     return `${sessionId} ${requestId}`
   }
@@ -2142,6 +2306,8 @@ export class RelayServer {
       if (!oldSockets.has(pending.agentSocket)) continue
       this.forgetBoot(key)
       const session = this.sessions.get(pending.sessionId)
+      // The agent that would have answered is gone, so nothing else will settle the record this boot made.
+      if (session) this.undoLastBoot(session, pending.requestId)
       // `sendTo` skips a socket that is not OPEN, and a session nobody has joined has no
       // `browserSocket` at all — either way the entry is still gone, so nothing later answers
       // a request nobody holds.
@@ -2265,8 +2431,7 @@ export class RelayServer {
     // better diagnosis — and only a caller that never joined hears from `settleShutdownRequesters`.
     for (const s of agentSessions) {
       this.settleShutdownRequesters(s, SHUTDOWN_OUTCOME_LOST)
-      this.sessions.remove(s.id)
-      this.forgetSessionState(s.id)
+      this.removeSession(s.id)
     }
     this.sessions.removeResources(ws)
     logger.info(cause === 'replaced'
@@ -2317,6 +2482,7 @@ export class RelayServer {
           // for the eviction below, which tells the browser the session ended.
           if (!device) continue
           this.sessions.rebind(s.id, ws, device, agent)
+          this.gateEvent({ kind: 'rebound', sessionId: s.id })
           rebound.set(s.deviceId, s.id)
           reboundOldSockets.add(old)
         }
@@ -2346,8 +2512,7 @@ export class RelayServer {
           this.sendTo(s.browserSocket, { type: 'session:terminated', sessionId: s.id, reason: 'agent-disconnected' })
         }
         this.settleShutdownRequesters(s, SHUTDOWN_OUTCOME_LOST)
-        this.sessions.remove(s.id)
-        this.forgetSessionState(s.id)
+        this.removeSession(s.id)
       }
     }
 
@@ -2385,6 +2550,169 @@ export class RelayServer {
     this.agentNames.set(ws, msg.agentName || msg.agentId || 'unknown')
     // Through `pushLog` too, so `tapflow logs` shows an agent coming back after the line about it leaving.
     this.pushLog(`agent connected: ${msg.agentName || msg.agentId || 'unknown'} (${msg.platform || 'unknown'}) — ${registeredSessions.length} device(s)`)
+  }
+
+  /** `device:boot`, and the boot a lease sends for the device it chose. */
+  private handleBoot(ws: WebSocket, msg: Inbound<'device:boot'>): void {
+    const boot = this.dispatchTarget(ws, msg.sessionId)
+    if (!boot.ok) {
+      this.sendTo(ws, {
+        type: 'device:boot-error',
+        sessionId: msg.sessionId,
+        requestId: msg.requestId,
+        message: boot.message,
+      })
+      return
+    }
+    // Tag the boot with whether the viewer is external (public IP) so the agent can pick the
+    // downscale tier. The browser already reports secureContext in the payload.
+    //
+    // **Mutating the parse product, not the frame that arrived**, which is what makes this safe as
+    // well as correct: `payload` is a fresh object the parser built, so `raw` is untouched. The
+    // presence check the old line carried is gone because the schema requires the payload — and
+    // `external` is deliberately not declared on `DeviceBoot`, since the browser never sends it.
+    (msg.payload as Record<string, unknown>)['external'] = this.wsExternal.get(ws) ?? false
+    // Whether an automation client (flow runner, MCP) is booting, so the iOS agent can start its UI-tree runner
+    // now instead of inside the first selector step's timeout. Only the holder can boot (`dispatchTarget`), so the
+    // holder's kind is the booter's. A dashboard boot is never warmed: the runner costs about 520 MB per device.
+    ;(msg.payload as Record<string, unknown>)['automation'] = isAiClientKind(boot.session.holderKind)
+    const cost = classifyBoot(boot.session.deviceStatus, msg.payload, boot.session.deviceServiceTier)
+    const booterClass: BooterClass = isAiClientKind(boot.session.holderKind) ? 'automated' : 'interactive'
+    // The automation cap is decided before the gate and acted on after it: an idle device is shut down to make
+    // room only if this boot actually goes, so a boot the gate refuses costs nobody their device.
+    const capacity = cost === 'cold' && booterClass === 'automated' ? this.planCapacityFor(boot.session) : { ok: true as const, evict: [] }
+    if (!capacity.ok) {
+      this.sendTo(ws, {
+        type: 'device:boot-error', sessionId: msg.sessionId, requestId: msg.requestId,
+        reason: 'host-at-capacity', message: BOOT_REFUSAL_MESSAGES['host-at-capacity'],
+      })
+      return
+    }
+    // The boot gate decides whether this goes now, waits (a person), or is refused (automation).
+    const effects = this.bootGate.admit({
+      hostKey: hostKeyOf(boot.session),
+      sessionId: msg.sessionId,
+      requestId: msg.requestId,
+      cost,
+      booterClass,
+      message: { ws, msg, cost, booterClass },
+    })
+    const goes = effects.some((fx) => fx.kind === 'deliver' && fx.requestId === msg.requestId)
+    const critical = effects.some((fx) => fx.kind === 'refuse' && fx.requestId === msg.requestId && fx.reason === 'host-memory-critical')
+    this.applyGate(effects)
+    if (goes) for (const id of capacity.evict) this.evictForCapacity(id)
+    // Idle automation devices are what fills a Mac this way, and while it is critical no boot gets far enough to
+    // shut one down for the cap. So the refusal itself frees one — the oldest idle, never one in use, and not
+    // while an earlier one on this Mac is still shutting down.
+    else if (critical) this.freeOneForMemory(boot.session)
+  }
+
+  /**
+   * `device:lease`: choose a device, make this client its holder and boot it, in this one call. Nothing here is
+   * awaited, so no other message can take the device between the choice and the join — that is what makes the lease
+   * atomic, and why the two steps are not two messages.
+   *
+   * Every check the join and the boot will make is asked first, without recording anything (`wouldRefuseAutomated`,
+   * `planCapacityFor`, `resourceLoad`), so the device chosen is one both will let through and nothing is undone on a
+   * Mac passed over. Then the ordinary join and the ordinary boot run, so a lease is held to exactly what a client
+   * naming the device would be.
+   */
+  private handleLease(ws: WebSocket, msg: Inbound<'device:lease'>): void {
+    const { requestId } = msg
+    const refuse = (reason: LeaseRefusalReason, message: string) => this.sendTo(ws, {
+      type: 'device:lease-refused', requestId, reason, message, retryable: reason !== 'no-device' && reason !== 'bad-request',
+    })
+    const { payload } = msg
+    let platform = payload.platform
+    if (payload.buildId !== undefined) {
+      const build = getDb().prepare('SELECT platform FROM builds WHERE id = ?').get(payload.buildId) as { platform: string | null } | undefined
+      if (!build) return refuse('bad-request', `build ${payload.buildId} not found`)
+      if (build.platform === 'ios' || build.platform === 'android') platform = build.platform
+    }
+    if (!platform) return refuse('bad-request', 'no platform: name one, or a build this relay has')
+
+    const excluded = new Set(payload.exclude ?? [])
+    const now = Date.now()
+    const ofPlatform = this.sessions.all().filter((s) => s.devicePlatform === platform && !excluded.has(s.id))
+    if (ofPlatform.length === 0) return refuse('no-device', `no ${platform} device on this relay`)
+
+    // Boot records nobody answered expire where the cap reads them (`capacityDevices`), which a lease meeting only
+    // devices already up would never reach; an expired one would otherwise hide its device from every lease.
+    for (const key of new Set(ofPlatform.map(hostKeyOf))) this.capacityDevices(this.sessions.getAllOnHost(key, hostKeyOf))
+    const tier = payload.serviceTier ? { serviceTier: payload.serviceTier } : {}
+    const candidates: LeaseCandidate[] = []
+    const sessionOf = new Map<string, Session>()
+    for (const s of ofPlatform) {
+      if (s.agentSocket.readyState !== WebSocket.OPEN) continue
+      if (s.owner !== null || this.sessions.watchersOf(s.id).length > 0) continue
+      if (s.evictingAt !== undefined && now - s.evictingAt < this.evictionGraceMs) continue
+      if (s.lastBootPending !== undefined) continue
+      // A person's idle countdown: theirs to come back to. Leasing it would wipe it with the run's reset.
+      if (s.idleTimer !== null && !s.lastHolderWasAi) continue
+      // Off, or up because automation brought it up through this relay. A simulator opened by hand, or one up before
+      // a relay restart, has no `lastBoot`, and one booting or shutting down reads `unknown`: any of them may be
+      // someone's, so none is ours to reset. Not `readySent`: one of ours whose agent reconnected has lost it, and
+      // the lease's boot binds it again.
+      const ours = s.deviceStatus === 'booted' && s.lastBoot?.booterClass === 'automated'
+      if (s.deviceStatus !== 'shutdown' && !ours) continue
+      // The boot's own judgement, so the lease cannot disagree with it: one of ours on another tier is restarted onto
+      // the one asked for, which is a cold boot like any other and goes through the same checks.
+      const pool = ours && classifyBoot(s.deviceStatus, tier, s.deviceServiceTier) === 'warm'
+      sessionOf.set(s.id, s)
+      candidates.push({ sessionId: s.id, hostKey: hostKeyOf(s), pool, bootedAt: s.lastBoot?.at ?? 0, refusal: this.leaseRefusal(s, pool) })
+    }
+    if (candidates.length === 0) return refuse('all-held', `every ${platform} device is in use`)
+
+    const choice = chooseLease(candidates, this.leaseHosts(candidates))
+    if (!choice.ok) {
+      const onCritical = choice.criticalHost !== undefined ? candidates.find((c) => c.hostKey === choice.criticalHost) : undefined
+      if (onCritical) this.freeOneForMemory(sessionOf.get(onCritical.sessionId)!)
+      return refuse(choice.reason, choice.reason === 'agent-resources-exhausted' ? 'Agent resources exhausted' : BOOT_REFUSAL_MESSAGES[choice.reason])
+    }
+    const session = sessionOf.get(choice.sessionId)!
+    this.sendTo(ws, {
+      type: 'device:leased', requestId, sessionId: session.id, deviceId: session.deviceId, deviceName: session.deviceName,
+      platform, source: candidates.find((c) => c.sessionId === session.id)!.pool ? 'pool' : 'boot',
+    })
+    this.handleSessionStart(ws, { type: 'session:start', sessionId: session.id, clientKind: 'flow-runner', ...(payload.stream === false ? { stream: false } : {}) })
+    // The checks above are the join's own, so this holds; if it ever does not, the join has answered the client.
+    if (!this.ownsSession(ws, session)) return
+    this.handleBoot(ws, {
+      type: 'device:boot', sessionId: session.id, requestId,
+      payload: {
+        deviceId: session.deviceId,
+        ...(payload.acceptH264 ? { acceptH264: true } : {}),
+        ...(payload.serviceTier ? { serviceTier: payload.serviceTier } : {}),
+        ...(payload.runReset ? { runReset: payload.runReset } : {}),
+      },
+    })
+  }
+
+  /** What the join and the boot would refuse an AI client taking this device for, asked without recording anything.
+   *  The join's CPU and memory checks, then for a cold boot the automation cap and the boot gate, in their order. */
+  private leaseRefusal(s: Session, pool: boolean): AdmissionRefusal | null {
+    const load = this.resourceLoad(s)
+    if (load && (load.cpuOver || load.memOver)) return 'agent-resources-exhausted'
+    if (pool) return null
+    if (!this.planCapacityFor(s).ok) return 'host-at-capacity'
+    return this.bootGate.wouldRefuseAutomated(hostKeyOf(s))
+  }
+
+  /** Each candidate Mac's room, from its agents' latest report. Not corrected for a boot the report does not show
+   *  yet: a boot in flight holds its Mac's slot, so it already keeps every further boot off that Mac, and memory is
+   *  only ever compared between Macs that could take one. */
+  private leaseHosts(candidates: readonly LeaseCandidate[]): Map<string, LeaseHost> {
+    const hosts = new Map<string, LeaseHost>()
+    for (const key of new Set(candidates.map((c) => c.hostKey))) {
+      const onHost = this.sessions.getAllOnHost(key, hostKeyOf)
+      const reports = [...new Set(onHost.map((s) => s.agentSocket))].map((a) => this.sessions.getResources(a)).filter((r): r is AgentResources => r !== undefined)
+      const latest = reports.sort((x, y) => y.reportedAt - x.reportedAt)[0]
+      const automated = this.capacityDevices(onHost).filter((d) => d.automated).length
+      hosts.set(key, latest
+        ? { freeMB: latest.memTotalMB - latest.memUsedMB, cpuPercent: latest.cpuPercent, automated }
+        : { freeMB: null, cpuPercent: null, automated })
+    }
+    return hosts
   }
 
   /** The only producer of `error` — all five exits below, and nothing else in the repo sends that message.
@@ -2434,11 +2762,22 @@ export class RelayServer {
     // Read before the resource gate, and answered before it too. The gate would otherwise read the
     // dead socket's last sample — and an overloaded Mac is a common reason to restart an agent, so
     // the tester would be told the Mac is exhausted at the exact moment it is recovering.
+    //
+    // A person rejoining a device this relay has up is not held to the memory half. The dashboard re-sends
+    // `session:start` on every socket reconnect and the close already cleared the owner, so the tester coming
+    // back reads as a newcomer — and once other devices had pushed memory over the line, a Wi-Fi blink lost
+    // them the device they were using. Booting is what spends the memory, and this one is up.
+    //
+    // `readySent`, not `deviceStatus`: a simulator booted before the agent registered says `booted` without
+    // this relay ever bringing it up (#440), so the viewer's next `device:boot` would be a full boot let in on
+    // a full Mac. An AI client keeps the memory half: its boot warms the UI-tree runner, which does cost
+    // memory on a device already up. The CPU half applies to every join — a join usually starts a stream, and a
+    // stream's encoding is the load #107 is about.
     const agentAway = session.agentSocket.readyState !== WebSocket.OPEN
-    const resources = agentAway ? undefined : this.sessions.getResources(session.agentSocket)
-    if (resources) {
-      const memPercent = (resources.memUsedMB / resources.memTotalMB) * 100
-      if (resources.cpuPercent > RESOURCE_THRESHOLD || memPercent > RESOURCE_THRESHOLD) {
+    const load = this.resourceLoad(session)
+    if (load) {
+      const memSpent = session.readySent && !isAiClientKind(msg.clientKind)
+      if (load.cpuOver || (load.memOver && !memSpent)) {
         this.sendTo(ws, { type: 'error', sessionId: msg.sessionId, message: 'Agent resources exhausted', reason: 'agent-resources-exhausted' })
         return
       }
@@ -2683,6 +3022,99 @@ export class RelayServer {
       sessionId: session.id,
       payload: { deviceId: session.deviceId },
     })
+  }
+
+  /**
+   * Put `lastBoot` right once the agent says what the boot was. A boot charged cold that found the device running
+   * started nothing, so the record goes back; a boot let through warm that had to start the device after all is
+   * the holder's.
+   */
+  private settleLastBoot(session: Session, requestId: string | undefined, cold: boolean | undefined): void {
+    const pending = session.lastBootPending
+    if (pending && pending.requestId === requestId) {
+      if (cold === false) session.lastBoot = pending.prev
+      session.lastBootPending = undefined
+    } else if (cold === true) {
+      const expired = session.lastBootExpired?.requestId === requestId ? session.lastBootExpired : undefined
+      const booterClass = expired?.booterClass ?? (isAiClientKind(session.holderKind) ? 'automated' : 'interactive')
+      session.lastBoot = { booterClass, at: Date.now() }
+      // An earlier boot of this session brought the device up while a newer one is still out: that newer one
+      // turning out warm must fall back to this, not to before either.
+      if (pending) pending.prev = session.lastBoot
+    }
+  }
+
+  /** A boot that did not bring the device up (failed, or stranded by a rebind) says nothing about who started it. */
+  private undoLastBoot(session: Session, requestId: string | undefined): void {
+    if (session.lastBootPending && session.lastBootPending.requestId === requestId) {
+      session.lastBoot = session.lastBootPending.prev
+      session.lastBootPending = undefined
+    }
+  }
+
+  /** How many automation devices this Mac may keep up: `TAPFLOW_MAX_AUTOMATED_DEVICES`, else from its memory, else
+   *  no cap while no agent there has reported any. */
+  private automatedCap(onHost: Session[]): number {
+    if (this.automatedCapOverride !== null) return this.automatedCapOverride
+    let latest: AgentResources | undefined
+    for (const s of onHost) {
+      const r = this.sessions.getResources(s.agentSocket)
+      if (r && (!latest || r.reportedAt > latest.reportedAt)) latest = r
+    }
+    return latest ? defaultCap(latest.memTotalMB) : Number.POSITIVE_INFINITY
+  }
+
+  private planCapacityFor(requester: Session): CapacityPlan {
+    const onHost = this.sessions.getAllOnHost(hostKeyOf(requester), hostKeyOf)
+    return planCapacity(this.capacityDevices(onHost), { sessionId: requester.id, platform: requester.devicePlatform }, this.automatedCap(onHost))
+  }
+
+  private capacityDevices(onHost: Session[]): CapacityDevice[] {
+    const now = Date.now()
+    // A boot nobody has answered within the correlator's TTL is taken as not having happened. Checked here rather
+    // than on that timer, which a leave or an end clears with the session's other state while the record stays;
+    // a late ready still records the boot again (`settleLastBoot` on `cold: true`).
+    for (const s of onHost) {
+      if (s.lastBootPending && s.lastBoot && now - s.lastBoot.at >= this.pendingBootTtlMs) {
+        s.lastBootExpired = { requestId: s.lastBootPending.requestId, booterClass: s.lastBoot.booterClass }
+        this.undoLastBoot(s, s.lastBootPending.requestId)
+      }
+    }
+    return onHost
+      // A device being shut down to make room is neither up nor available, until the agent says otherwise.
+      .filter((s) => s.evictingAt === undefined || now - s.evictingAt >= this.evictionGraceMs)
+      .map((s) => ({
+        sessionId: s.id,
+        platform: s.devicePlatform,
+        // Up, or being started by automation now: `deviceStatus` reads `shutdown` while a boot runs, so the
+        // boot in flight is known by its pending record instead. An eviction past its grace with no answer from
+        // the agent (filtered above while within it) is taken as not having happened: still up, and idle.
+        automated: s.lastBoot?.booterClass === 'automated' && (s.deviceStatus === 'booted' || s.evictingAt !== undefined || s.lastBootPending !== undefined),
+        booted: (s.deviceStatus === 'booted' || s.evictingAt !== undefined) && s.lastBootPending === undefined,
+        inUse: s.owner !== null || this.sessions.watchersOf(s.id).length > 0,
+        reachable: s.agentSocket.readyState === WebSocket.OPEN,
+        bootedAt: s.lastBoot?.at ?? 0,
+      }))
+  }
+
+  private freeOneForMemory(requester: Session): void {
+    const onHost = this.sessions.getAllOnHost(hostKeyOf(requester), hostKeyOf)
+    const now = Date.now()
+    if (onHost.some((s) => s.evictingAt !== undefined && now - s.evictingAt < this.evictionGraceMs)) return
+    const victim = idleToFree(this.capacityDevices(onHost), requester.id)
+    if (victim) this.evictForCapacity(victim)
+  }
+
+  /** Shut down an idle automation device to make room. Marked first, so nothing replays it as up or picks it again
+   *  while the agent works; the mark lifts on `shutdown-done`, `shutdown-error` or after `evictionGraceMs`. */
+  private evictForCapacity(sessionId: string): void {
+    const session = this.sessions.get(sessionId)
+    if (session?.agentSocket.readyState !== WebSocket.OPEN) return
+    session.evictingAt = Date.now()
+    this.sessions.updateDeviceStatus(session.id, 'shutdown')
+    this.sessions.setReadySent(session.id, false)
+    logger.info(`boot gate: shutting down idle automation device ${session.deviceName} on ${hostKeyOf(session)} to make room`)
+    this.sendTo(session.agentSocket, { type: 'device:shutdown', sessionId: session.id, payload: { deviceId: session.deviceId } })
   }
 
   /** Where a browser-role command can be dispatched, or what its sender needs to be told instead.

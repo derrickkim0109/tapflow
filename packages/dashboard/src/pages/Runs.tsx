@@ -269,8 +269,16 @@ function RunRow({ run }: { run: RunListItem }) {
           {build}
         </Link>
       </TableCell>
-      {/* Passed of planned, nothing else: the status column already says how the run ended. */}
-      <TableCell><TechLabel>{run.flowsPassed}/{run.flowsTotal}</TechLabel></TableCell>
+      {/* Passed of planned: the status column already says how the run ended. Skipped flows are named, or a run that
+          skipped two of three would read as one that lost them. */}
+      <TableCell>
+        <TechLabel>{run.flowsPassed}/{run.flowsTotal}</TechLabel>
+        {run.flowsSkipped > 0 && <span className="ml-1 text-xs text-muted-foreground">({run.flowsSkipped} skipped)</span>}
+        {/* A parallel run: its time is not one device's, so say how many shared it. */}
+        {(run.deviceReset?.devices?.length ?? 0) > 1 && (
+          <span className="ml-1 text-xs text-muted-foreground">on {run.deviceReset!.devices!.length} devices</span>
+        )}
+      </TableCell>
       <TableCell className="text-sm text-muted-foreground">{runSourceLabel(run)}</TableCell>
       <TableCell className="text-sm text-muted-foreground">{formatAgo(run.createdAt)}</TableCell>
       <TableCell><TechLabel>{runDuration(run)}</TechLabel></TableCell>

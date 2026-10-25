@@ -6,7 +6,7 @@ description: "@tapflowio/mcp-server를 설치하고 코딩 에이전트에 연�
 # MCP 서버
 
 ::: warning 실험적 기능
-tapflow의 **AI 자동화 축**인 MCP 서버와 플로우 러너는 실험적 기능입니다. 성숙한 정식 경로는 수동 QA 대시보드이며, 이 축은 부가 기능으로서 아직 다듬어지는 중입니다. 특히 셀렉터 매칭과 앱 실행 직후 타이밍에서 거친 부분이 있을 수 있습니다.
+tapflow의 **AI 에이전트**(MCP 서버)와 **자동화**(플로우 러너)는 실험적 기능입니다. tapflow에서 가장 성숙한 부분은 수동 QA 대시보드이고 두 기능은 아직 다듬어지는 중입니다. 특히 셀렉터 매칭과 앱 실행 직후 타이밍에서 거친 부분이 있을 수 있습니다.
 :::
 
 `@tapflowio/mcp-server`는 tapflow를 [Model Context Protocol(MCP)](https://modelcontextprotocol.io) 서버로 노출합니다. Claude Code, Codex 등 MCP를 지원하는 LLM 에이전트가 iOS 시뮬레이터와 Android 에뮬레이터를 네이티브 도구로 직접 제어할 수 있습니다. 스크립팅도, 좌표 하드코딩도 필요 없습니다.
@@ -142,21 +142,24 @@ MCP를 지원하는 클라이언트라면 모두 tapflow를 사용할 수 있습
 | `run_flow` | YAML 플로우를 결정적으로 재생 (추가 LLM 호출 없음) |
 | `list_runs` | `tapflow flow run`이 릴레이에 남긴 실행 기록 목록 조회 (상태·빌드·플로우 이름·CI 여부로 거르기) |
 | `get_run` | 실행 기록 하나 조회. 실패한 플로우의 단계(통과한 플로우는 단계 수)·실패 메시지·플로우 파일 경로와 실패한 플로우의 스크린샷(최대 4장) |
+| `get_testing_guide` | 이 도구들로 모바일 기능을 테스트하는 방법. 다룰 경우, 여기서 테스트할 수 없는 것, 잘못된 버그 판정을 피하는 법, 검증된 경로를 플로우로 남기는 법, 보고 형식 |
 
 ## 일반적인 워크플로우
 
 LLM 에이전트는 보통 아래 순서로 도구를 호출합니다.
 
 ```text
+get_testing_guide  → 무엇을 다루고 어떻게 보고할지 확인 (테스트 전에 한 번)
 list_devices       → 사용 가능한 기기와 sessionId 확인
 connect_device     → 세션 참여, 지켜볼 링크를 사람에게 전달
 boot_device        → 부팅 대기 (이미 부팅 중이면 생략 가능)
 install_app        → 앱 설치
 launch_app         → 앱 실행
-screenshot         → 화면 캡처 → LLM이 분석
+query_ui_tree      → 화면 읽기 (시각적인 확인에만 screenshot)
 tap / swipe / ...  → 조작
-screenshot         → 결과 확인 → 반복
-disconnect_device  → 세션 종료
+query_ui_tree      → 결과 확인 → 반복
+run_flow           → 검증한 시나리오를 플로우로 재생
+disconnect_device  → 세션 종료, 다른 사람이 기기를 쓸 수 있게 반납
 ```
 
 ::: info 시뮬레이터 이미 부팅된 경우
@@ -164,6 +167,15 @@ disconnect_device  → 세션 종료
 :::
 
 CI 파이프라인에서 실행하는 방법은 [CI/CD에서 MCP 활용하기](/ko/automation/mcp-ci)를 참고하세요.
+
+## 에이전트가 받는 안내 {#agent-guidance}
+
+MCP 서버는 코딩 에이전트에게 두 가지 안내를 줍니다. 그래서 경우를 하나하나 적지 않고 "로그인 화면 테스트해 줘"라고만 요청해도 꼼꼼히 테스트합니다.
+
+- **서버 instructions**: 에이전트가 연결할 때 한 번 전달됩니다. 도구 호출 순서, 화면은 스크린샷보다 `query_ui_tree`로 읽기, 끝나면 기기 반납하기, 부팅 거절이나 확인되지 않은 입력이 무슨 뜻인지를 담습니다. MCP 서버 instructions를 지원하는 클라이언트가 이 내용을 에이전트 컨텍스트에 넣습니다. Claude Code와 VS Code가 지원하고, Gemini CLI는 신뢰한 폴더에서만 넣습니다. Codex는 tapflow 도구 묶음의 설명으로 보여 줍니다. 지원하지 않는 클라이언트를 위해 가장 중요한 두 규칙은 `connect_device` 설명에도 들어 있습니다.
+- **`get_testing_guide`**: 에이전트가 테스트 전에 부르는 도구입니다. 다룰 경우, 이 도구들로 테스트할 수 없는 것, 버그로 판단하기 전에 확인할 것, 검증된 경로를 플로우로 남기는 법, 보고 형식을 돌려줍니다.
+
+instructions는 세션마다 약 400토큰이 듭니다. 테스트 가이드는 약 1,200토큰이고, 에이전트가 부를 때만 듭니다.
 
 ## 코딩 에이전트가 조작하는 기기 보기 {#watch-the-device}
 

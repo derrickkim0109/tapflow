@@ -1,5 +1,54 @@
 # tapflow
 
+## 0.29.0
+
+### Minor Changes
+
+- 34287be: A run decides which flows apply before it touches a device. `isEligible` in flow-runner is the one place that decides, for `tapflow flow run` and MCP's `run_flow` alike. With a build, a flow whose `appId` differs from the build's bundle id is skipped and the line names both ids; until now `appId` was read only by `clearState`, so a flow for another app ran and failed on its first selector, which read as a regression. A flow can carry `tags`, and `flow run --include-tags` / `--exclude-tags` pick by them (include is any of, exclude wins). A skipped flow is not a failure, but a run where none ran exits 2 before choosing a device, so a CI job that tested nothing does not pass. The build's bundle id is read from `GET /api/v1/builds/:id`; only a 404 is an error, and a token without `builds:write`, no token or no answer leaves the app check out with one line. The run record keeps a skipped flow and why (`skipReason`), the runs page and `list_runs` count them, and JUnit lists them as `<skipped>`. The relay migrates `flow_run_flows` to allow it. A new CLI on an older relay warns once that skipped flows are not recorded and records the rest.
+- 00b8d3f: `tapflow flow run --parallel N` shares a run's flows across up to N devices (1–16) the relay chooses. Each device is leased (`device:lease`): the relay picks a device automation left up, or boots one, and resets it with the run's reset (unless `--no-reset`); the run installs the build on it and the device takes flows off one queue until none are left. Every device is held under the run's one client id, so the relay sees one run. `--platform ios|android` names the platform of a run without `--build`; with one, the relay reads the build's. `--parallel` cannot be combined with `--device` or `--session`, and a relay that cannot lease is told apart before anything waits.
+
+  A device that cannot boot or install, or whose flow fails outside the app, leaves the run and is excluded from the run's later leases; its flow is not replayed, and the other devices go on. Flows no device ran end the run with exit code 2, as a relay with no device of the platform does. Output lines are prefixed with the device's name, each flow is recorded with the device it ran on, and each device cuts its own videos.
+
+  `@tapflowio/flow-runner` adds `toJUnitXmlSuites`, which writes a `<testsuite>` per device, skipped flows in a `tapflow-flows (skipped)` suite and flows no device ran as `<error>` cases in a `tapflow-flows (not run)` suite, so a CI report does not read them as green; `toJUnitXml`'s output is unchanged. It also adds `leasedSessionOf(error)`, the session a lease had been given before its join or boot failed, so a caller sharing devices can keep that one out of later leases.
+
+- c9f1ff8: The relay caps how many devices automation keeps running on each Mac (`TAPFLOW_MAX_AUTOMATED_DEVICES`, default half the Mac's memory in GB, 1–8; an Android emulator counts as two). Each session remembers who cold-booted its device (`lastBoot`), past the holder leaving. An automated cold boot past the cap shuts down the longest-running idle device automation started, once the gate lets the boot through; with none idle it is refused with the new `BootRefusalReason` `host-at-capacity`, which flow-runner and MCP wait out. An automated boot refused for `host-memory-critical` also shuts down one idle automation device, one at a time per Mac. An automation client that joined a device during a person's idle countdown restarts the countdown when it leaves.
+- 1e41b29: The relay boots one device at a time per Mac. A boot holds the Mac's slot from the moment it is let through until the device has settled — its CPU flat across three reports, or a cap — because the boot is what slows the other sessions on that Mac. An automated boot (flow runner, MCP) that finds the slot taken is answered with `device:boot-error` carrying `reason: 'host-booting'`. A person's boot is never refused: it waits in the Mac's one reservation, ahead of any automated retry, for at most 60 s. While a boot holds the slot, the `session:start` CPU check is paused for that Mac. `tapflow flow run` waits out a refusal with backoff, letting go of the session while it waits, for up to `--admission-timeout` (600 s). flow-runner exports `retryAdmission`, `admissionRefusalOf` and `AdmissionRefusedError`; MCP's `boot_device` says the Mac is busy and to call it again.
+- 64a7bc0: The boot gate refuses new devices on a Mac whose kernel reports critical memory pressure. Agents report `kern.memorystatus_vm_pressure_level` as `agent:resources.resources.memoryPressure` (`normal`, `warn`, `critical`; macOS only, absent elsewhere). While an agent on a Mac reports `critical`, the relay refuses automated cold boots there with `device:boot-error` `reason: 'host-memory-critical'`, and holds a person's cold boot in the reservation as it does behind another boot; the reading lapses 15 s after the last report that said so. `device:boot-waiting` carries an optional `reason` and is sent again when the wait's reason changes. flow-runner and MCP treat any `reason` on a refused boot as a busy Mac, including one they do not know (`AdmissionReason`, `'unrecognised-refusal'`), so a newer relay's reason is waited out instead of failing the run.
+- c031327: A run's record can hold several devices. `POST /api/v1/runs/:id/device` takes the reporting device's `sessionId`, `deviceId` and `deviceName` and keeps one entry per session in `deviceReset.devices`, merged inside the write so devices reporting at once do not overwrite each other; the fields beside it stay the first device's. A new `POST /api/v1/runs/:id/flows/:idx/start` says which device a flow started on, so the run page shows each running flow on its device instead of guessing the first unreported one; a run from a runner that does not send it is shown as before. `GET /api/v1/runs/:id` adds `watchSessionIds`, every session the runner holds.
+
+  `tapflow flow run` sends both. The run page lists the devices of a run on several, each with its reset, the flow it is on and its own watch link, and the runs list says how many devices a run shared.
+
+- d310508: `tapflow flow run` resets the device before its flows, and `--no-reset` turns that off. `device:boot` takes `runReset: { uninstall, clear }` (app ids), which a relay drops rather than refusing the boot when it is malformed; the agent carries it out after the device is up and before `device:ready`, and reports `runReset: { done, failed }` there as `RunResetItem`s. iOS uninstalls the apps the run will install, clears the files of the rest, waits for `simctl bootstatus` on a cold boot, then resets the keychain, `simctl privacy` grants, pasteboard and simulated location; Android `pm clear`s every named app and clears the clipboard over gRPC. `agent-core` adds `runResetSteps`, `resetApps` and `RESETTABLE_APP_ID`, which keeps an id that is not an app id away from `adb shell`. `RelayClient.bootDevice` now returns what the ready said (`BootOutcome`). Run records gain `device_reset_json` (migration 019), written as `requested` at creation and filled from `POST /api/v1/runs/:id/device` right after the boot; the run page shows it.
+- d4055b4: A run can choose which background services an iOS simulator boots with. `device:boot.payload.serviceTier` (`{ name: 'stock' | 'lean' | 'slim', keep }`) asks for a tier; the iOS agent writes exactly that tier's launchd overrides before the boot — reverting the previous one first, so a device a run left slim comes back to a person on exactly the default tier — and restarts a running device that is on another tier. A boot that asks for none gets `agent.lean`'s tier, as before. Each device reports its current tier on register and on `device:ready`, and the relay counts a restart onto another tier as a cold boot for the per-Mac boot gate. `tapflow flow run --service-tier slim --keep push,photos` asks for it; flow-runner exports `parseServiceTier` and `SERVICE_FEATURES`; agent-core exports `sameServiceTier`. `LeanStore.apply` is now private: change a device's tier through `setTier`.
+
+### Patch Changes
+
+- 0e18ee1: Follow-ups to service tiers. **The feature list is renamed from `allow` to `keep`** (`serviceTier.keep`, `tapflow flow run --keep push,photos`) before any release carried it: "allow push" read as granting the app a permission. `--service-tier stock --keep ...` is refused, since stock switches nothing off. The run record keeps the tier a run asked for (`serviceTier`, migration 018), and the run page shows it. The dashboard marks a running device a run left slim (**Most services off**) and says in the info card that a restart turns its services back on. `tapflow doctor` counts devices by tier (`on (2 devices: 1 lean, 1 slim now)`). And a simulator whose override marker cannot be read is put back on its plist defaults for every label a tier can touch, instead of having its current overrides recorded as the originals and left off for good: `LeanStore` takes the managed labels as its second constructor argument (`MANAGED_LABELS`).
+- Updated dependencies [259f8c7]
+- Updated dependencies [7830e81]
+- Updated dependencies [1445649]
+- Updated dependencies [fe644c9]
+- Updated dependencies [c5acd02]
+- Updated dependencies [34287be]
+- Updated dependencies [00b8d3f]
+- Updated dependencies [c9f1ff8]
+- Updated dependencies [1e41b29]
+- Updated dependencies [64a7bc0]
+- Updated dependencies [17aa45f]
+- Updated dependencies [0d4a09c]
+- Updated dependencies [5d774ab]
+- Updated dependencies [26f0c11]
+- Updated dependencies [c031327]
+- Updated dependencies [d310508]
+- Updated dependencies [0e18ee1]
+- Updated dependencies [d4055b4]
+- Updated dependencies [486b1d3]
+  - @tapflowio/android-agent@0.29.0
+  - @tapflowio/relay@0.29.0
+  - @tapflowio/ios-agent@0.29.0
+  - @tapflowio/flow-runner@0.29.0
+  - @tapflowio/agent-core@0.29.0
+
 ## 0.28.1
 
 ### Patch Changes

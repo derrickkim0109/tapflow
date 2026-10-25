@@ -1,5 +1,28 @@
 # @tapflowio/agent-core
 
+## 0.29.0
+
+### Minor Changes
+
+- 64a7bc0: The boot gate refuses new devices on a Mac whose kernel reports critical memory pressure. Agents report `kern.memorystatus_vm_pressure_level` as `agent:resources.resources.memoryPressure` (`normal`, `warn`, `critical`; macOS only, absent elsewhere). While an agent on a Mac reports `critical`, the relay refuses automated cold boots there with `device:boot-error` `reason: 'host-memory-critical'`, and holds a person's cold boot in the reservation as it does behind another boot; the reading lapses 15 s after the last report that said so. `device:boot-waiting` carries an optional `reason` and is sent again when the wait's reason changes. flow-runner and MCP treat any `reason` on a refused boot as a busy Mac, including one they do not know (`AdmissionReason`, `'unrecognised-refusal'`), so a newer relay's reason is waited out instead of failing the run.
+- d310508: `tapflow flow run` resets the device before its flows, and `--no-reset` turns that off. `device:boot` takes `runReset: { uninstall, clear }` (app ids), which a relay drops rather than refusing the boot when it is malformed; the agent carries it out after the device is up and before `device:ready`, and reports `runReset: { done, failed }` there as `RunResetItem`s. iOS uninstalls the apps the run will install, clears the files of the rest, waits for `simctl bootstatus` on a cold boot, then resets the keychain, `simctl privacy` grants, pasteboard and simulated location; Android `pm clear`s every named app and clears the clipboard over gRPC. `agent-core` adds `runResetSteps`, `resetApps` and `RESETTABLE_APP_ID`, which keeps an id that is not an app id away from `adb shell`. `RelayClient.bootDevice` now returns what the ready said (`BootOutcome`). Run records gain `device_reset_json` (migration 019), written as `requested` at creation and filled from `POST /api/v1/runs/:id/device` right after the boot; the run page shows it.
+- d4055b4: A run can choose which background services an iOS simulator boots with. `device:boot.payload.serviceTier` (`{ name: 'stock' | 'lean' | 'slim', keep }`) asks for a tier; the iOS agent writes exactly that tier's launchd overrides before the boot — reverting the previous one first, so a device a run left slim comes back to a person on exactly the default tier — and restarts a running device that is on another tier. A boot that asks for none gets `agent.lean`'s tier, as before. Each device reports its current tier on register and on `device:ready`, and the relay counts a restart onto another tier as a cold boot for the per-Mac boot gate. `tapflow flow run --service-tier slim --keep push,photos` asks for it; flow-runner exports `parseServiceTier` and `SERVICE_FEATURES`; agent-core exports `sameServiceTier`. `LeanStore.apply` is now private: change a device's tier through `setTier`.
+
+### Patch Changes
+
+- 0e18ee1: Follow-ups to service tiers. **The feature list is renamed from `allow` to `keep`** (`serviceTier.keep`, `tapflow flow run --keep push,photos`) before any release carried it: "allow push" read as granting the app a permission. `--service-tier stock --keep ...` is refused, since stock switches nothing off. The run record keeps the tier a run asked for (`serviceTier`, migration 018), and the run page shows it. The dashboard marks a running device a run left slim (**Most services off**) and says in the info card that a restart turns its services back on. `tapflow doctor` counts devices by tier (`on (2 devices: 1 lean, 1 slim now)`). And a simulator whose override marker cannot be read is put back on its plist defaults for every label a tier can touch, instead of having its current overrides recorded as the originals and left off for good: `LeanStore` takes the managed labels as its second constructor argument (`MANAGED_LABELS`).
+- Updated dependencies [1445649]
+- Updated dependencies [fe644c9]
+- Updated dependencies [c5acd02]
+- Updated dependencies [c9f1ff8]
+- Updated dependencies [1e41b29]
+- Updated dependencies [64a7bc0]
+- Updated dependencies [d310508]
+- Updated dependencies [0e18ee1]
+- Updated dependencies [d4055b4]
+- Updated dependencies [486b1d3]
+  - @tapflowio/protocol@0.29.0
+
 ## 0.28.1
 
 ### Patch Changes

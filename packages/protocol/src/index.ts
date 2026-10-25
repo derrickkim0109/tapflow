@@ -19,7 +19,17 @@ export interface AgentResources {
   slotsTotal: number
   /** Date.now() */
   reportedAt: number
+  /** The kernel's own memory pressure on the agent's Mac. Absent where the agent cannot read it (not macOS) and
+   *  from agents that predate it. */
+  memoryPressure?: MemoryPressure
 }
+
+/**
+ * macOS `kern.memorystatus_vm_pressure_level` (1, 2, 4). An 8 GB Mac idles at `warn` with no simulator running,
+ * so only `critical` means anything to admission: the relay refuses automated cold boots on it
+ * (`host-memory-critical`).
+ */
+export type MemoryPressure = 'normal' | 'warn' | 'critical'
 
 /** What kind of device it is, for what the viewer draws around it. A string literal union, not a
  *  runtime list, so it erases under `import type`; the one runtime copy is the register schema in
@@ -38,6 +48,76 @@ export interface DeviceReport {
    *  does not know rather than refusing the register, so a newer agent's new form factor reaches an
    *  older viewer as absent — which every consumer reads as "draw it as a phone". */
   formFactor?: FormFactor
+  /** The service tier the device boots with now — what its agent last wrote for it. `'unsupported'` for a
+   *  device whose runtime cannot take one (iOS before 18.5, every Android device). Absent from an agent that
+   *  predates tiers. See `ServiceTier`. */
+  serviceTier?: ServiceTier | 'unsupported'
+}
+
+/**
+ * How many of a simulator's background services are switched off when it boots (iOS only). A boot's cost to
+ * the other sessions on its Mac falls with the list: measured on 8 GB, the full list cut the boot's CPU
+ * saturation from 20–49 s to 7–14 s, while `lean` was indistinguishable from `stock`
+ * (`contributing/simulator-boot-contention.md`).
+ *
+ * - `stock`: nothing off.
+ * - `lean`: what the agent's Lean mode turns off — services apps rarely need. A person's default when Lean mode is on.
+ * - `slim`: almost everything, including widgets, Spotlight, push, StoreKit, photos and contacts. Only for an
+ *   automated run that asked for it, with `keep` naming what its app needs back.
+ *
+ * Asked for by a run (`device:boot.payload.serviceTier`), never chosen from who is booting, so the same flow
+ * replays on the same services every time. A boot without one gets the agent's own setting.
+ */
+export type ServiceTierName = 'stock' | 'lean' | 'slim'
+
+/** Features a run can keep on under a tier, each backed by the services it needs (simslim's feature map). */
+export type ServiceFeature =
+  | 'push' | 'storekit' | 'app-store' | 'universal-links' | 'spotlight' | 'siri' | 'icloud' | 'keychain-sync'
+  | 'contacts' | 'calendar' | 'reminders' | 'mail' | 'photos' | 'health' | 'homekit' | 'imessage' | 'widgets'
+  | 'wallet' | 'maps' | 'weather' | 'news' | 'game-center' | 'find-my' | 'screen-time'
+
+/** One value, so a relay that does not know the field drops the tier and its exceptions together — never the
+ *  exceptions alone, which would boot slim with services the app needs switched off. */
+export interface ServiceTier {
+  name: ServiceTierName
+  keep: ServiceFeature[]
+}
+
+/**
+ * What `tapflow flow run` asks the agent to reset before a run, so one run does not inherit what the last left on the
+ * device. A device that stays up between runs keeps it, and so does one shut down and booted again: app data, the
+ * keychain and privacy grants live on disk.
+ *
+ * - `uninstall`: apps the run is about to install. Removing them first drops their data container, App Group
+ *   containers, notification settings and privacy grants in one step, which clearing files cannot (cached defaults).
+ * - `clear`: apps the run uses but does not install. Their files are cleared and they keep running as installed.
+ *
+ * Absent from every other boot: a person's session and an AI agent's exploration keep their state.
+ */
+export interface RunResetRequest {
+  uninstall: string[]
+  clear: string[]
+}
+
+/**
+ * One thing an agent reset, named for what it covers rather than what was hoped for.
+ *
+ * - `app-uninstall` / `app-files`: the two `RunResetRequest` lists (iOS). `app-data`: `pm clear` (Android), which
+ *   covers files, permissions and the running process.
+ * - `keychain`: iOS `simctl keychain reset`. Roots added with `add-root-cert` stay trusted.
+ * - `privacy-services`: iOS `simctl privacy reset all` — only the services simctl names; notifications are not one.
+ * - `pasteboard`: set to an empty string, which is not the same as nothing ever copied.
+ * - `location`: iOS simulated location cleared.
+ *
+ * Device-wide except the app items. An item a platform does not do is never reported, so absence means not reset.
+ */
+export type RunResetItem = 'app-uninstall' | 'app-files' | 'app-data' | 'keychain' | 'privacy-services' | 'pasteboard' | 'location'
+
+/** What the agent actually reset. The only evidence a reset happened: a relay or agent that predates it drops the
+ *  request without a word. */
+export interface RunResetReport {
+  done: RunResetItem[]
+  failed: RunResetItem[]
 }
 
 /** A device as the relay lists it, after adding what only the relay knows. Named `DeviceSummary`
@@ -119,6 +199,10 @@ export interface UIElement {
   role: UIElementRole
   label: string
   identifier?: string
+  /** A text field's placeholder (iOS `placeholderValue`, Android `hint`), apart from `label` on purpose: a
+   *  placeholder is not a name, and folding it into one hides the app's missing label. Absent when there is
+   *  none — and from an agent that predates the field, which reads the same as none. */
+  placeholder?: string
   frame: UIElementFrame
   enabled: boolean
   rawRole?: string
@@ -142,7 +226,24 @@ export interface SessionInfo {
    *  absent; the door already defaults it that way (`validate/index.ts`). Optional here would
    *  describe a frame nobody sends and hand every consumer a `?.` to carry for good. */
   capabilities: string[]
+  /** What the relay would do with this Mac now, so the picker shows the relay's judgement instead of
+   *  recomputing a threshold of its own. The same value on every agent of one Mac. Required: one
+   *  producer (`SessionManager.list()`), and the dashboard ships inside the relay package. */
+  admission: MacAdmission
   devices: DeviceSummary[]
+}
+
+export interface MacAdmission {
+  /** A cold boot holds this Mac's boot slot (`relay/src/admission/`). Another boot waits or is refused. */
+  booting: boolean
+  /** No person's `session:start` on this Mac would be let in now (`agent-resources-exhausted`): CPU is over the
+   *  line, or memory is and the relay has no device up here to rejoin. */
+  overloaded: boolean
+  /** Devices of this agent a person's join would be refused for memory now: memory is over the line and the
+   *  relay has not brought these up (`readySent`), so joining would start them. Empty when memory is fine. Per
+   *  device rather than a flag, because "running" by the device list's `status` is not the relay's rule — a
+   *  simulator booted before its agent registered reads `booted` and is still refused. */
+  memoryRefuses: string[]
 }
 
 export interface ChromeRect {
@@ -534,7 +635,30 @@ export interface DeviceReady {
   sessionId?: string
   /** Absent = this is not the answer to a `device:boot`. See 「Lifecycle correlation」 in AGENTS.md. */
   requestId?: string
-  payload: { deviceId: string }
+  payload: {
+    deviceId: string
+    /**
+     * Whether this boot brought the device up, as opposed to finding it already running. Only the agent
+     * can say: it reads the device list after `device:booting` has gone out, and the relay's own
+     * `deviceStatus` is a snapshot from registration. A boot that brings a device up is what costs the
+     * host 30–90 s of memory pressure (`contributing/simulator-boot-contention.md`), so this is the fact
+     * a per-host boot gate needs.
+     *
+     * Judged from the agent's device-list read at the start of this boot, so a device stopped after
+     * that read and booted again reports `false` — an undercharge the gate accepts. A device found
+     * mid-transition counts as cold where the agent can see that state (iOS `unknown`); Android's adb
+     * cannot, and reports `false` for an emulator it can already see.
+     *
+     * Absent = unknown: an agent that predates the field, or the relay's own replay of a ready it
+     * already forwarded. A reader must not treat absent as `false`.
+     */
+    cold?: boolean
+    /** The tier this boot came up with. The relay records it as the device's current tier, since the device
+     *  list it registered with is a snapshot. Absent from an agent that predates tiers. */
+    serviceTier?: ServiceTier | 'unsupported'
+    /** Present only when the boot carried `runReset` and the agent knows it. */
+    runReset?: RunResetReport
+  }
 }
 
 /**
@@ -590,7 +714,34 @@ export interface DeviceBootError extends SessionScoped {
   type: 'device:boot-error'
   message: string
   requestId?: string
+  /**
+   * Set only when the relay's per-host boot gate refused the boot, so a client can tell "wait and try
+   * again" from a boot that failed. An agent's own boot failures carry no reason. See `BootRefusalReason`.
+   */
+  reason?: BootRefusalReason
 }
+
+/**
+ * Why the relay refused a boot before it reached an agent. Only automated clients are refused; a person's
+ * boot is held instead (`packages/relay/src/admission/`).
+ *
+ * - `host-booting`: another boot on the same Mac has not settled yet. One boot at a time is the rule,
+ *   because a boot is what slows the other sessions on that Mac (`contributing/simulator-boot-contention.md`).
+ * - `host-memory-critical`: the Mac's kernel reports critical memory pressure (`AgentResources.memoryPressure`).
+ *   Another device started now would push the running ones into swap, so automated boots wait it out.
+ * - `host-at-capacity`: the Mac already runs as many automation-started devices as it is allowed, and every one
+ *   of them is in use. The relay shuts an idle one down to make room when it can, so this means none was idle.
+ */
+export type BootRefusalReason = 'host-booting' | 'host-memory-critical' | 'host-at-capacity'
+
+/**
+ * Every refusal a client may meet on its way to a booted device that means "the Mac is busy, not broken" —
+ * all of them worth waiting out. A join refused for resources and a boot refused by the gate call for the same
+ * response, so they are one type even though they arrive on different messages (`error.reason`,
+ * `device:boot-error.reason`). Types only, like the rest of this entry; a client that needs the members at
+ * runtime mirrors them in a `Record<AdmissionRefusal, true>`, as `SESSION_START_FAILURES` does.
+ */
+export type AdmissionRefusal = BootRefusalReason | Extract<SessionStartFailure, 'agent-resources-exhausted'>
 
 export interface OpenUrlError extends SessionScoped {
   type: 'open-url:error'
@@ -928,7 +1079,17 @@ export type RelayOrAgentToBrowser =
 export interface AgentsListed {
   type: 'agents:listed'
   sessions: SessionInfo[]
+  /**
+   * What this relay understands beyond the messages every relay does: `'device-lease'` (`device:lease`). A client
+   * reads it before sending one, because an older relay drops an unknown message without a word and the client
+   * would otherwise learn that only from its own deadline. Optional, unlike the rest of the listing: the
+   * dashboard cannot skew from the relay it ships in, but a flow runner can, and an older relay omits the key.
+   */
+  features?: RelayFeature[]
 }
+
+/** Values of `AgentsListed.features`. A client meeting one it does not know ignores it. */
+export type RelayFeature = 'device-lease'
 
 export interface SessionJoined {
   type: 'session:joined'
@@ -1131,9 +1292,66 @@ export interface WatchAction {
 }
 
 /** Messages the relay originates and no agent sends. */
+/**
+ * A person's boot the relay is holding until another boot on the same Mac has settled, or until the Mac's critical
+ * memory pressure has passed. Sent when the boot is held, and again with the same `until` when what it waits for
+ * changes; it then goes ahead by itself and `device:booting` follows. Answers the held boot,
+ * so it carries its correlator. An automated boot is refused instead (`BootRefusalReason`) and never
+ * receives this.
+ */
+export interface DeviceBootWaiting {
+  type: 'device:boot-waiting'
+  sessionId: string
+  requestId: string
+  /** Epoch ms after which the boot goes ahead even if the other has not settled. */
+  until: number
+  /** What it waits for. Read absence as `host-booting`, the only wait there was before the field. */
+  reason?: BootRefusalReason
+}
+
+/**
+ * The relay chose a device for a `device:lease`, made this client its holder and sent its boot. The boot's own
+ * `device:ready` or `device:boot-error` follows with the lease's `requestId`, as it would for a `device:boot`, after
+ * the `session:joined` a join sends. Sent before both, so the client knows which session they are about.
+ */
+export interface DeviceLeased {
+  type: 'device:leased'
+  requestId: string
+  sessionId: string
+  deviceId: string
+  deviceName: string
+  platform: 'ios' | 'android'
+  /** `pool`: already up from an earlier automated boot, so the boot is warm. `boot`: started for this lease. */
+  source: 'pool' | 'boot'
+}
+
+/**
+ * No device could be leased now. Nothing was joined or booted. `retryable` says whether asking again can help:
+ * every `AdmissionRefusal` and `all-held` can, the others will answer the same until something is changed.
+ */
+export interface DeviceLeaseRefused {
+  type: 'device:lease-refused'
+  requestId: string
+  reason: LeaseRefusalReason
+  message: string
+  retryable: boolean
+}
+
+/**
+ * - an `AdmissionRefusal`: every Mac with a fitting device refused it — the boot gate, the automation cap, or the
+ *   CPU and memory a join is held to; the reason given is the one most worth waiting out.
+ * - `all-held`: every fitting device is held by someone, or is a person's.
+ * - `no-device`: no agent offers a device of this platform, or every one was excluded.
+ * - `bad-request`: no platform could be read: none given, or the build named is not one this relay has.
+ */
+export type LeaseRefusalReason = AdmissionRefusal | 'all-held' | 'no-device' | 'bad-request'
+
 export type RelayToBrowser =
   | RelayOrAgentToBrowser
   | AgentsListed
+  | DeviceBootWaiting
+  | DeviceLeased
+  | DeviceLeaseRefused
   | SessionJoined
   | SessionTerminated
   | SessionAgentAway
@@ -1627,7 +1845,36 @@ export interface DeviceBoot {
    * `device:shutdown` below stays optional for the opposite reason — the relay sends that one itself.
    */
   requestId: string
-  payload: { deviceId: string; resetMode?: 'app-only' | 'full-erase'; acceptH264?: boolean; secureContext?: boolean }
+  payload: { deviceId: string; resetMode?: 'app-only' | 'full-erase'; acceptH264?: boolean; secureContext?: boolean; serviceTier?: ServiceTier; runReset?: RunResetRequest }
+}
+
+/**
+ * Ask the relay for a device instead of naming one: it picks a free device of the platform — one automation left
+ * up first, then one it boots on the Mac with the most room — makes this client its holder and boots it, all in one
+ * step, so two clients asking at once never get the same device and every boot still passes the Mac's boot gate.
+ * Answered by `device:leased` then the boot's reply, or by `device:lease-refused`. Send only to a relay listing
+ * `'device-lease'` in `AgentsListed.features`.
+ *
+ * No `sessionId`: choosing the session is what this asks for. So a malformed payload has no address to be refused
+ * at, and every payload field reads an unusable value as absent instead; the relay then refuses what it cannot
+ * serve with `bad-request`.
+ */
+export interface DeviceLease {
+  type: 'device:lease'
+  requestId: string
+  payload: {
+    /** Required unless `buildId` is given; with both, the build's platform wins. */
+    platform?: 'ios' | 'android'
+    /** The build the run installs. The relay reads its platform, which a client holding only `view` cannot. */
+    buildId?: number
+    serviceTier?: ServiceTier
+    acceptH264?: boolean
+    runReset?: RunResetRequest
+    /** As on `session:start`. */
+    stream?: boolean
+    /** Sessions not to lease: ones this run already saw fail. */
+    exclude?: string[]
+  }
 }
 
 export interface AppInstallToRelay {
@@ -1830,6 +2077,7 @@ export type BrowserToRelay =
   | SessionEnd
   | SessionLeave
   | DeviceBoot
+  | DeviceLease
   | DeviceShutdown
   | AppInstallToRelay
   | AppLaunchToRelay

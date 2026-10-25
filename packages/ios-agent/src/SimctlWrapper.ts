@@ -36,6 +36,15 @@ function langToKeyboard(lang: string): string {
 // A hung pasteboard call must not strand the caller: the read path holds a sentinel on the
 // device until it finishes, so "never returns" would leave the device clipboard destroyed.
 const CLIPBOARD_CMD_TIMEOUT_MS = 5_000
+// A run reset's device-wide commands take about a second each (measured: keychain 1.0 s, privacy 0.5 s, location 0.5 s).
+// A command this bound kills does not land later, which is why iOS needs nothing like Android's pending `pm clear` wait:
+// measured on iOS 26.5 by killing `simctl uninstall` and `simctl keychain reset` mid-flight, each either finished before
+// the kill or never happened, nothing changed in the 3 s after, and an install or keychain add sent right after the kill
+// survived — CoreSimulatorService runs a device's requests in order.
+const RESET_CMD_TIMEOUT_MS = 10_000
+// `Booted` appears in `simctl list` before the system services are up: `bootstatus` took 6–28 s more on an iOS 26.5
+// simulator. A reset sent in that gap reaches tccd and securityd before they serve.
+const BOOT_STATUS_TIMEOUT_MS = 60_000
 
 // The rotation helper's `mach_msg` waits with no timeout, and rotations are queued one behind another
 // (#910), so one that never returns would hold every later rotation — and the boot that waits on one.
@@ -287,12 +296,19 @@ export class SimctlWrapper {
     await this.runner.exec('uninstall', udid, bundleId)
   }
 
+  /** `uninstallApp` for a run reset, bounded: it gates the boot's ready, and a wedged CoreSimulatorService would hold
+   *  that boot with nothing able to release it. */
+  async uninstallAppForReset(udid: string, bundleId: string): Promise<void> {
+    await this.runner.execWithOpts({ timeoutMs: RESET_CMD_TIMEOUT_MS }, 'uninstall', udid, bundleId)
+  }
+
   // pm-clear analog for the simulator: wipe the app's data-container contents
   // (Documents / Library / tmp) instead of uninstalling, so the installed
   // binary survives and flow-runner clearState → launchApp keeps working.
-  async clearAppData(udid: string, bundleId: string): Promise<void> {
-    await this.runner.exec('terminate', udid, bundleId).catch(() => { /* not running is fine */ })
-    const out = await this.runner.exec('get_app_container', udid, bundleId, 'data')
+  async clearAppData(udid: string, bundleId: string, timeoutMs?: number): Promise<void> {
+    const exec = (...args: string[]) => (timeoutMs === undefined ? this.runner.exec(...args) : this.runner.execWithOpts({ timeoutMs }, ...args))
+    await exec('terminate', udid, bundleId).catch(() => { /* not running is fine */ })
+    const out = await exec('get_app_container', udid, bundleId, 'data')
     const container = out.trim()
     if (!container.startsWith('/')) {
       throw new PlatformError(`cannot resolve data container for ${bundleId}: ${container || 'empty simctl output'}`)
@@ -302,6 +318,37 @@ export class SimctlWrapper {
       const entries = await fs.readdir(dir).catch(() => [] as string[])
       await Promise.all(entries.map((e) => fs.rm(join(dir, e), { recursive: true, force: true })))
     }
+  }
+
+  /** `clearAppData` for an app that may not be installed: nothing installed is nothing to clear. Bounded, for the
+   *  reason `uninstallAppForReset` gives. */
+  async clearAppDataIfInstalled(udid: string, bundleId: string): Promise<void> {
+    try {
+      await this.clearAppData(udid, bundleId, RESET_CMD_TIMEOUT_MS)
+    } catch (e) {
+      // simctl's answer for an app that is not installed (`NSPOSIXErrorDomain, code=2`). Anything else is a failure.
+      if (/No such file or directory/.test(String((e as { stderr?: unknown }).stderr ?? (e as Error).message))) return
+      throw e
+    }
+  }
+
+  /** Waits until the device's system services are up, not only `Booted` in the device list. */
+  async waitForBootStatus(udid: string): Promise<void> {
+    await this.runner.execWithOpts({ timeoutMs: BOOT_STATUS_TIMEOUT_MS }, 'bootstatus', udid)
+  }
+
+  /** Every keychain item on the device. Roots added with `keychain add-root-cert` stay trusted (measured). */
+  async resetKeychain(udid: string): Promise<void> {
+    await this.runner.execWithOpts({ timeoutMs: RESET_CMD_TIMEOUT_MS }, 'keychain', udid, 'reset')
+  }
+
+  /** Every app's grants for the services simctl names (`simctl help privacy`); notifications are not one of them. */
+  async resetPrivacy(udid: string): Promise<void> {
+    await this.runner.execWithOpts({ timeoutMs: RESET_CMD_TIMEOUT_MS }, 'privacy', udid, 'reset', 'all')
+  }
+
+  async clearLocation(udid: string): Promise<void> {
+    await this.runner.execWithOpts({ timeoutMs: RESET_CMD_TIMEOUT_MS }, 'location', udid, 'clear')
   }
 
   async installApp(udid: string, appPath: string): Promise<void> {

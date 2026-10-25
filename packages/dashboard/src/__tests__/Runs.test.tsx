@@ -13,9 +13,11 @@ function listItem(overrides: Partial<RunListItem> = {}): RunListItem {
   return {
     id: 'r1', status: 'passed', finishedBy: 'client', failureKind: null, errorMessage: null, exitCode: 0,
     isCi: true, ci: { provider: 'github', branch: 'main', commit: 'abcdef123456', jobUrl: 'https://github.com/o/r/actions/runs/1' },
+    serviceTier: null,
+    deviceReset: null,
     build: { id: 7, appName: 'Coffee', versionName: '1.2.0', buildNumber: '42', platform: 'ios' },
     createdBy: 'ci', flowsTotal: 2, createdAt: '2026-10-11 01:00:00', finishedAt: '2026-10-11 01:01:05',
-    flowsPassed: 2, flowsFailed: 0,
+    flowsPassed: 2, flowsFailed: 0, flowsSkipped: 0,
     ...overrides,
   }
 }
@@ -62,6 +64,24 @@ describe('Runs list', () => {
     expect(urls[0]).toBe('/api/v1/runs?ci=1&limit=25')
     expect(screen.getByText('GitHub Actions · main')).toBeTruthy()
     expect(link.closest('tr')?.textContent).toContain('2/2')
+  })
+
+  // Mutation: drop the skipped count, and a run that skipped two of three reads as one that lost them.
+  it('names the flows a run skipped beside the passed count', async () => {
+    stubRelay(() => Response.json({ items: [listItem({ flowsTotal: 3, flowsPassed: 1, flowsSkipped: 2 }), listItem({ id: 'r2' })], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    const rows = (await screen.findAllByRole('link', { name: /^Coffee 1\.2\.0 · build 42, Passed, / })).map((l) => l.closest('tr')?.textContent)
+    expect(rows[0]).toContain('1/3(2 skipped)')
+    expect(rows[1]).not.toContain('skipped')
+  })
+
+  it('says how many devices a run shared, and nothing for a run on one', async () => {
+    const devices = (n: number) => ({ requested: true, booted: true as const, devices: Array.from({ length: n }, (_, i) => ({ sessionId: `s${i}` })) })
+    stubRelay(() => Response.json({ items: [listItem({ deviceReset: devices(3) }), listItem({ id: 'r2', deviceReset: devices(1) })], nextCursor: null, prevCursor: null }))
+    renderAt('/automation/runs')
+    const rows = (await screen.findAllByRole('link', { name: /^Coffee 1\.2\.0 · build 42, Passed, / })).map((l) => l.closest('tr')?.textContent)
+    expect(rows[0]).toContain('2/2on 3 devices')
+    expect(rows[1]).not.toContain('devices')
   })
 
   it('tells a run the environment failed apart from one the app failed, in the row and its name', async () => {
@@ -244,6 +264,43 @@ describe('Run detail', () => {
     }
   }
 
+  it('says which services the run asked its device to boot with, and nothing when it asked for none', async () => {
+    stubRelay(() => Response.json(detail({ serviceTier: { name: 'slim', keep: ['push', 'photos'] } })))
+    const { unmount } = renderAt('/automation/runs/r1')
+    expect(await screen.findByText('slim, keeping push, photos')).toBeTruthy()
+    unmount()
+    stubRelay(() => Response.json(detail()))
+    renderAt('/automation/runs/r1')
+    await screen.findByRole('status')
+    expect(screen.queryByText(/^Services/)).toBeNull()
+  })
+
+  it('says what the run\'s device was reset of, and nothing for a run that predates resets', async () => {
+    const cases: [Run['deviceReset'], string][] = [
+      [{ requested: true, booted: true, cold: false, report: { done: ['keychain'], failed: [] } }, 'reset, already running'],
+      [{ requested: true, booted: true, cold: true, report: { done: ['keychain'], failed: ['location', 'pasteboard'] } }, 'reset except location, pasteboard'],
+      // Nothing done is not a reset, whether something failed or there was nothing to do.
+      [{ requested: true, booted: true, cold: true, report: { done: [], failed: ['keychain'] } }, 'reset failed: keychain'],
+      [{ requested: true, booted: true, cold: true, report: { done: [], failed: [] } }, 'nothing reset'],
+      [{ requested: true, booted: true, cold: true }, 'reset not confirmed'],
+      [{ requested: false, booted: true }, 'not reset'],
+    ]
+    for (const [deviceReset, label] of cases) {
+      stubRelay(() => Response.json(detail({ deviceReset })))
+      const { unmount } = renderAt('/automation/runs/r1')
+      expect(await screen.findByText(label)).toBeTruthy()
+      unmount()
+    }
+    // Nothing for a run that predates resets, nor for one that never reached a device.
+    for (const deviceReset of [null, { requested: true }]) {
+      stubRelay(() => Response.json(detail({ deviceReset })))
+      const { unmount } = renderAt('/automation/runs/r1')
+      await screen.findByRole('status')
+      expect(screen.queryByText(/^Device/)).toBeNull()
+      unmount()
+    }
+  })
+
   it('offers to watch only while the relay says which session the runner holds', async () => {
     stubRelay(() => Response.json(detail({ status: 'running', finishedAt: null, exitCode: null, watchSessionId: 's1' })))
     const { unmount } = renderAt('/automation/runs/r1')
@@ -256,6 +313,51 @@ describe('Run detail', () => {
     await screen.findByText('Running. This page follows the run.')
     expect(screen.queryByRole('link', { name: 'Watch the device' })).toBeNull()
     expect(screen.getByText(/^Running for/)).toBeTruthy()
+  })
+
+  // A parallel run, shown as a CI page shows jobs: a line per device, each with its own reset and watch link.
+  it('lists each device of a run on several, with its reset, the flow it is on and a link to watch it', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'running', finishedAt: null, exitCode: null, watchSessionId: 'sa', watchSessionIds: ['sa', 'sb'],
+      deviceReset: {
+        requested: true, booted: true, cold: true, report: { done: ['keychain'], failed: [] },
+        devices: [
+          { sessionId: 'sa', deviceName: 'iPhone A', cold: true, report: { done: ['keychain'], failed: [] } },
+          { sessionId: 'sb', deviceName: 'iPhone B', cold: false, report: { done: ['keychain'], failed: ['location'] } },
+          { sessionId: 'sc', deviceId: 'dev-c' },
+          { sessionId: 'sd' },
+        ],
+      },
+      flows: [
+        { idx: 0, name: 'login', file: null, status: 'running', device: { id: null, name: 'iPhone B', sessionId: 'sb' } },
+        { idx: 1, name: 'checkout', file: null, status: 'pending' },
+      ],
+    })))
+    renderAt('/automation/runs/r1')
+    const list = await screen.findByRole('list', { name: 'Devices' })
+    const lines = [...list.querySelectorAll('li')].map((li) => li.textContent)
+    expect(lines).toEqual([
+      'iPhone AresetWatch',
+      'iPhone Breset except location, already runningRunning loginWatch',
+      'dev-creset not confirmed',
+      'Device 4reset not confirmed',
+    ])
+    expect(screen.getByRole('link', { name: 'Watch iPhone B' }).getAttribute('href')).toBe('/automation/sessions/sb')
+    expect(screen.getByText('Running on iPhone B')).toBeTruthy()
+    // The header's single-device account would name one device of four.
+    expect(screen.queryByRole('link', { name: 'Watch the device' })).toBeNull()
+    expect(screen.queryByText((_, el) => el?.tagName === 'SPAN' && /^Device reset/.test(el.textContent ?? ''))).toBeNull()
+  })
+
+  it('keeps one device in the header, as a run always said it', async () => {
+    stubRelay(() => Response.json(detail({
+      status: 'running', finishedAt: null, exitCode: null, watchSessionId: 'sa', watchSessionIds: ['sa'],
+      deviceReset: { requested: true, booted: true, cold: true, report: { done: ['keychain'], failed: [] }, devices: [{ sessionId: 'sa', deviceName: 'iPhone A' }] },
+    })))
+    renderAt('/automation/runs/r1')
+    expect(await screen.findByRole('link', { name: 'Watch the device' })).toBeTruthy()
+    expect(screen.getByText('reset')).toBeTruthy()
+    expect(screen.queryByRole('list', { name: 'Devices' })).toBeNull()
   })
 
   it('shows a failed flow with its message, steps and screenshot, and the flows never reached', async () => {
@@ -280,6 +382,21 @@ describe('Run detail', () => {
     expect(shot.getAttribute('src')).toBe('/api/v1/runs/r1/flows/0/screenshot')
     expect(screen.getByText('Not run')).toBeTruthy()
     expect(screen.getByRole('link', { name: /Open the CI run/ }).getAttribute('href')).toBe('https://github.com/o/r/actions/runs/1')
+  })
+
+  it('shows a skipped flow with why, and nothing of a run it never had', async () => {
+    stubRelay(() => Response.json(detail({
+      flows: [
+        { idx: 0, name: 'login', file: 'flows/login.yaml', status: 'skipped', skipReason: 'app-mismatch', failureMessage: 'flow is for com.a, build 7 is com.b' },
+        { idx: 1, name: 'slow', file: null, status: 'skipped', skipReason: 'tag-filter', failureMessage: 'not tagged smoke' },
+      ],
+    })))
+    renderAt('/automation/runs/r1')
+    expect(await screen.findByText('flow is for com.a, build 7 is com.b')).toBeTruthy()
+    expect(screen.getByText('Skipped: another app')).toBeTruthy()
+    expect(screen.getByText('Skipped: tags')).toBeTruthy()
+    expect(screen.getByText('not tagged smoke')).toBeTruthy()
+    expect(screen.queryByRole('img')).toBeNull()
   })
 
   it('marks a run and a flow that failed only on the environment as such, not as the app failing', async () => {

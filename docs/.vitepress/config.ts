@@ -106,7 +106,7 @@ const enSidebar = [
         ],
       },
       {
-        text: 'AI automation (experimental)',
+        text: 'AI agents & automation (experimental)',
         collapsed: true,
         items: [
           { text: 'MCP server', link: '/automation/mcp-server' },
@@ -220,7 +220,7 @@ const koSidebar = [
         ],
       },
       {
-        text: 'AI 자동화 (실험적)',
+        text: 'AI 에이전트·자동화 (실험적)',
         collapsed: true,
         items: [
           { text: 'MCP 서버', link: '/ko/automation/mcp-server' },

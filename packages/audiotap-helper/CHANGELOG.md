@@ -1,5 +1,15 @@
 # @tapflowio/audiotap-helper
 
+## 0.3.14
+
+### Patch Changes
+
+- Updated dependencies [64a7bc0]
+- Updated dependencies [d310508]
+- Updated dependencies [0e18ee1]
+- Updated dependencies [d4055b4]
+  - @tapflowio/agent-core@0.29.0
+
 ## 0.3.13
 
 ### Patch Changes

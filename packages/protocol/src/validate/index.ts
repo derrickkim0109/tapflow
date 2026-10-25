@@ -55,9 +55,9 @@ import * as z from 'zod'
 import type {
   AgentRegister, AgentResourceReport, AgentsList, AppClearState, AppClearStateDone,
   AppClearStateError, AppInstallDone, AppInstallError, AppInstallToRelay, AppLaunchDone,
-  AppLaunchError, AppLaunchToRelay, ClipboardData, ClipboardError, ClipboardRead, ClipboardWrite,
+  AppLaunchError, AppLaunchToRelay, RunResetItem, RunResetReport, ServiceTier, ClipboardData, ClipboardError, ClipboardRead, ClipboardWrite,
   NetworkError, NetworkSet, NetworkState,
-  ClipboardWriteDone, DeviceBoot, DeviceBootError, DeviceBooting, DeviceReady, DeviceShutdown,
+  ClipboardWriteDone, DeviceBoot, DeviceBootError, DeviceLease, DeviceBooting, DeviceReady, DeviceShutdown,
   DeviceShutdownDone, DeviceShutdownError, InputButton, InputDone, InputError, InputKey, InputKeyboardToggle,
   InputPinchEnd, InputPinchMove, InputPinchStart, InputPosture, InputRotate, InputTouchEnd, InputTouchMove,
   InputTouchStart, InputType, InputTypeDone, InputTypeError, KeyboardToggled, OpenUrl, OpenUrlDone,
@@ -75,6 +75,22 @@ import type { Assert, EnvelopeOf, IsEmpty, SchemaExact } from './assert.js'
 // correlator is present-but-empty, which every correlating consumer discards. `.min(1)` does not
 // change what `z.output` infers (`min(minLength): this` — zod 4.4.3 `v4/classic/schemas.d.ts:95`), so
 // it costs the tier assertions nothing.
+const SERVICE_FEATURES = [
+  'push', 'storekit', 'app-store', 'universal-links', 'spotlight', 'siri', 'icloud', 'keychain-sync', 'contacts',
+  'calendar', 'reminders', 'mail', 'photos', 'health', 'homekit', 'imessage', 'widgets', 'wallet', 'maps', 'weather',
+  'news', 'game-center', 'find-my', 'screen-time',
+] as const
+const serviceTier = z.object({ name: z.enum(['stock', 'lean', 'slim']), keep: z.array(z.enum(SERVICE_FEATURES)) })
+/** A tier as an agent reports it. Anything this relay does not know reads as absent rather than refusing the frame. */
+const reportedTier = z.union([serviceTier, z.literal('unsupported')]).optional().catch(undefined)
+
+const RUN_RESET_ITEMS = ['app-uninstall', 'app-files', 'app-data', 'keychain', 'privacy-services', 'pasteboard', 'location'] as const
+const appIds = z.array(z.string().min(1).max(255)).max(32)
+const runResetRequest = z.object({ uninstall: appIds, clear: appIds })
+/** An item this reader does not know is dropped rather than failing the report: a newer agent may reset more. */
+const runResetItems = z.array(z.unknown()).transform((items) => items.filter((i): i is RunResetItem => (RUN_RESET_ITEMS as readonly unknown[]).includes(i)))
+const runResetReport = z.object({ done: runResetItems, failed: runResetItems })
+
 const sessionId = z.string().min(1)
 const requestId = z.string().min(1)
 
@@ -131,7 +147,28 @@ const BROWSER_INBOUND = {
       resetMode: z.enum(['app-only', 'full-erase']).optional(),
       acceptH264: z.boolean().optional(),
       secureContext: z.boolean().optional(),
+      serviceTier: serviceTier.optional(),
+      // A malformed one drops the reset, never the boot: the agent's report is what says a reset happened, so a run
+      // reads the absence and warns rather than being refused for an optional feature.
+      runReset: runResetRequest.optional().catch(undefined),
     }),
+  }),
+  // Every payload field reads an unusable value as absent, and the payload itself does too: the message has no
+  // session, so a refusal here would have no address and the client would wait out its deadline. The relay
+  // answers what it cannot serve (`device:lease-refused`, `bad-request`). Only a bad `requestId` drops the frame,
+  // and then nothing could have been answered anyway.
+  'device:lease': z.object({
+    type: z.literal('device:lease'),
+    requestId,
+    payload: z.object({
+      platform: z.enum(['ios', 'android']).optional().catch(undefined),
+      buildId: z.number().int().positive().optional().catch(undefined),
+      serviceTier: serviceTier.optional().catch(undefined),
+      acceptH264: z.boolean().optional().catch(undefined),
+      runReset: runResetRequest.optional().catch(undefined),
+      stream: z.boolean().optional().catch(undefined),
+      exclude: z.array(sessionId).max(64).optional().catch(undefined),
+    }).catch({}),
   }),
   'device:shutdown': z.object({
     type: z.literal('device:shutdown'),
@@ -243,6 +280,7 @@ const AGENT_CONSUMED = {
       // the register stands. Anything that is not a string is still refused, the line `capabilities`
       // draws — `.catch` over the whole field would swallow that too.
       formFactor: z.union([z.enum(['phone', 'tablet', 'foldable']), z.string().transform(() => undefined)]).optional(),
+      serviceTier: reportedTier,
     })).default([]),
   }),
   'agent:resources': z.object({
@@ -250,6 +288,8 @@ const AGENT_CONSUMED = {
     resources: z.object({
       cpuPercent: z.number(), memUsedMB: z.number(), memTotalMB: z.number(),
       slotsAvailable: z.number(), slotsTotal: z.number(), reportedAt: z.number(),
+      // A level a newer agent adds reads as no reading, rather than costing the whole report.
+      memoryPressure: z.union([z.enum(['normal', 'warn', 'critical']), z.string().transform(() => undefined)]).optional(),
     }),
   }),
   'screenshot:done': z.object({
@@ -272,6 +312,7 @@ const AGENT_CONSUMED = {
       ]),
       label: z.string(),
       identifier: z.string().optional(),
+      placeholder: z.string().optional(),
       frame: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
       enabled: z.boolean(),
       rawRole: z.string().optional(),
@@ -534,6 +575,7 @@ type _SessionStart = Assert<V<'session:start', SessionStart>>
 type _SessionEnd = Assert<V<'session:end', SessionEnd>>
 type _SessionLeave = Assert<V<'session:leave', SessionLeave>>
 type _DeviceBoot = Assert<V<'device:boot', DeviceBoot>>
+type _DeviceLease = Assert<V<'device:lease', DeviceLease>>
 type _DeviceShutdown = Assert<V<'device:shutdown', DeviceShutdown>>
 type _AppInstall = Assert<V<'app:install', AppInstallToRelay>>
 type _AppLaunch = Assert<V<'app:launch', AppLaunchToRelay>>
@@ -592,3 +634,39 @@ type _ClipboardWriteDone = Assert<E<'clipboard:write-done', ClipboardWriteDone>>
 type _ClipboardError = Assert<E<'clipboard:error', ClipboardError>>
 type _NetworkState = Assert<E<'network:state', NetworkState>>
 type _NetworkError = Assert<E<'network:error', NetworkError>>
+
+const READY_FACTS = z.object({ payload: z.object({ cold: z.boolean().optional().catch(undefined), serviceTier: reportedTier }) })
+
+/**
+ * What the boot gate reads off a forwarded `device:ready`: `cold`, and the tier the boot came up with. Each is
+ * checked, and reads as `undefined` when absent or malformed.
+ *
+ * `device:ready` stays in the Envelope tier because the relay forwards it, and refusing a malformed one would
+ * leave a viewer waiting on a ready that was dropped. The boot gate reads this one field, so it gets a parse of
+ * its own rather than a cast: the field rule above holds — nothing unchecked reaches a type — without making the
+ * forward depend on the rest of the payload. Absent and malformed read the same, as "unknown".
+ */
+export function readyFacts(frame: unknown): { cold?: boolean; serviceTier?: ServiceTier | 'unsupported' } {
+  const result = READY_FACTS.safeParse(frame)
+  if (!result.success) return {}
+  const { cold, serviceTier: tier } = result.data.payload
+  return { ...(cold !== undefined ? { cold } : {}), ...(tier !== undefined ? { serviceTier: tier } : {}) }
+}
+
+/**
+ * What an agent reported resetting, from a run record's body, or `undefined` when it is not a report. Items this relay
+ * does not know are dropped, not the report.
+ */
+export function readRunResetReport(value: unknown): RunResetReport | undefined {
+  const result = runResetReport.safeParse(value)
+  return result.success ? result.data : undefined
+}
+
+/**
+ * A service tier from anywhere outside a wire frame — a run record's body — checked against the same schema the boot
+ * is, or `undefined` when it is not one. One definition, so a record can never hold a tier a boot would refuse.
+ */
+export function readServiceTier(value: unknown): ServiceTier | undefined {
+  const result = serviceTier.safeParse(value)
+  return result.success ? result.data : undefined
+}

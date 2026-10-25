@@ -13,7 +13,12 @@
     },
     "appId": {
       "type": "string",
-      "description": "Bundle id / application id of the app under test. Required for the bare clearState step."
+      "description": "Bundle id / application id of the app under test. Required for the bare clearState step. When a run names a build, a flow whose appId differs from the build's is skipped."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "^[^,]*[^,\\s][^,]*$" },
+      "description": "Labels for choosing flows with --include-tags / --exclude-tags. No commas."
     },
     "steps": {
       "type": "array",

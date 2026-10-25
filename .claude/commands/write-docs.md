@@ -134,7 +134,7 @@ KO 헤딩은 `사용 방법 / 플랫폼 지원 / 제한 사항 / 설정(운영�
 
 새 페이지는 세 곳에 등록한다.
 
-1. **`docs/.vitepress/config.ts`의 `enSidebar`와 `koSidebar` 양쪽.** 섹션은 독자가 하는 일로 나뉜다. EN은 Get started / Test apps(하위 그룹 QA Session) / Operate(하위 그룹 Set up a Mac / Deploy the relay / Run the team / Deliver builds / AI automation (experimental)) / Reference / Troubleshooting / Contributing, KO는 시작하기 / 앱 테스트(QA 세션) / 운영(Mac 준비 / 릴레이 배포 / 팀 운영 / 빌드 전달 / AI 자동화 (실험적)) / 레퍼런스 / 문제 해결 / 기여. KO 사이드바는 EN과 같은 트리여야 하고 링크에는 `/ko`만 붙는다(테스트가 검사한다).
+1. **`docs/.vitepress/config.ts`의 `enSidebar`와 `koSidebar` 양쪽.** 섹션은 독자가 하는 일로 나뉜다. EN은 Get started / Test apps(하위 그룹 QA Session) / Operate(하위 그룹 Set up a Mac / Deploy the relay / Run the team / Deliver builds / AI agents & automation (experimental)) / Reference / Troubleshooting / Contributing, KO는 시작하기 / 앱 테스트(QA 세션) / 운영(Mac 준비 / 릴레이 배포 / 팀 운영 / 빌드 전달 / AI 에이전트·자동화 (실험적)) / 레퍼런스 / 문제 해결 / 기여. KO 사이드바는 EN과 같은 트리여야 하고 링크에는 `/ko`만 붙는다(테스트가 검사한다).
 2. **`docs/public/llms.txt`**: 해당 섹션에 `- [제목](https://www.tapflow.dev/{경로}): {한 줄 설명}` 행을 추가한다. `scripts/__tests__/agentReadableDocs.test.mjs`가 강제하는 것은 다음과 같다.
    - 링크 행의 URL 집합이 `docs/` 아래 영어 `.md` 페이지 전체(`ko/`, `AGENTS.md`/`CLAUDE.md`, `layout: home` 랜딩 제외)와 **정확히 같아야** 한다. 빠져도, 남아도 실패한다.
    - `## ` 섹션 하나가 사이드바 최상위 그룹 하나다. 섹션 이름이 그룹 이름(EN)과 같고, 섹션 안의 링크가 그 그룹의 페이지와 **같은 순서**여야 한다. Operate와 Test apps의 하위 그룹은 `### `로 나눠 쓴다.
@@ -148,7 +148,7 @@ KO 헤딩은 `사용 방법 / 플랫폼 지원 / 제한 사항 / 설정(운영�
 | Get started (튜토리얼·소개) | `docs/get-started/{slug}.md` | `docs/ko/get-started/{slug}.md` |
 | Test apps (기능 페이지) | `docs/testing/{slug}.md` | `docs/ko/testing/{slug}.md` |
 | Operate (운영자 how-to) | `docs/operate/{slug}.md` | `docs/ko/operate/{slug}.md` |
-| AI automation (실험적) | `docs/automation/{slug}.md` | `docs/ko/automation/{slug}.md` |
+| AI agents & automation (실험적) | `docs/automation/{slug}.md` | `docs/ko/automation/{slug}.md` |
 | 레퍼런스 | `docs/reference/{slug}.md` | `docs/ko/reference/{slug}.md` |
 | 문제 해결 | `docs/troubleshooting/{slug}.md` | `docs/ko/troubleshooting/{slug}.md` |
 

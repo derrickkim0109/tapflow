@@ -63,6 +63,23 @@ function correlatedRequestTypes(proto) {
   return out
 }
 
+/** Correlated requests whose declaration has no `sessionId`. */
+function unaddressedTypes(proto, types) {
+  return types.filter((type) => {
+    const decl = proto.match(new RegExp(String.raw`^export interface \w+(?: extends \w+)? \{\n {2}type: '${type}'\n([\s\S]*?)\n\}`, 'm'))
+    expect(decl, `${type}: declaration not found`).not.toBeNull()
+    return !/^ {2}sessionId: string$/m.test(decl[1])
+  })
+}
+
+/**
+ * Correlated requests with no session, and so no address for a `bad-payload` refusal: `ParseFailure` carries the
+ * session a reply goes to. Each one's schema must instead read every payload value as absent, so no payload can
+ * make the door drop it — proved by parsing, in `protocol/src/__tests__/validate.test.ts`. Listed, so a new one
+ * is a decision rather than a gap.
+ */
+const UNADDRESSED = ['device:lease']
+
 /**
  * For each literal in the inbound schema map, the **top-level** `requestId` property of its schema.
  *
@@ -118,6 +135,13 @@ function correlatorOf(sf) {
 
   const types = correlatedRequestTypes(proto)
   const bodies = correlatorOf(sf)
+  const unaddressed = unaddressedTypes(proto, types)
+  /** The requests a malformed payload can be answered for: they name the session the answer goes to. */
+  const addressed = types.filter((t) => !unaddressed.includes(t))
+
+  it('the requests with no session are the listed ones', () => {
+    expect(unaddressed.sort()).toEqual([...UNADDRESSED].sort())
+  })
 
   it('finds the correlated request set, derived rather than listed', () => {
     // If this drops to zero the derivation broke and every assertion below would vacuously pass — the
@@ -236,8 +260,8 @@ describe('every correlated browser request is gated at the relay door', () => {
 
   it('every correlated request can be answered when its payload is refused', () => {
     const answerable = answerableTypes(validateSrc)
-    expect([...types].filter((t) => !answerable.has(t)).sort()).toEqual([])
-    expect([...answerable].filter((t) => !types.includes(t)).sort()).toEqual([])
+    expect([...addressed].filter((t) => !answerable.has(t)).sort()).toEqual([])
+    expect([...answerable].filter((t) => !addressed.includes(t)).sort()).toEqual([])
   })
 
   it('each request is refused with the reply its own waiter reads', () => {
@@ -245,7 +269,7 @@ describe('every correlated browser request is gated at the relay door', () => {
     // The `default` arm covers whatever has no case of its own; it must be the input reply, since that
     // is the only one shared by more than one request without being named.
     expect(replies.get('*'), 'refuseMalformed has no default arm').toBe('input:error')
-    for (const type of types) {
+    for (const type of addressed) {
       expect(replies.get(type) ?? replies.get('*'), `${type} is refused with the wrong reply`)
         .toBe(EXPECTED_REPLY[type])
     }
@@ -255,8 +279,8 @@ describe('every correlated browser request is gated at the relay door', () => {
   })
 
   it('the reply table covers exactly the correlated set', () => {
-    expect([...types].filter((t) => !(t in EXPECTED_REPLY)).sort()).toEqual([])
-    expect(Object.keys(EXPECTED_REPLY).filter((t) => !types.includes(t)).sort()).toEqual([])
+    expect([...addressed].filter((t) => !(t in EXPECTED_REPLY)).sort()).toEqual([])
+    expect(Object.keys(EXPECTED_REPLY).filter((t) => !addressed.includes(t)).sort()).toEqual([])
   })
 
   it('the shared constants carry the non-empty half', () => {

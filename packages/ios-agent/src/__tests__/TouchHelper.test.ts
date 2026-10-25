@@ -595,3 +595,78 @@ describe('TouchHelper — which frames may resurrect the helper', () => {
     })
   }
 })
+
+describe('minimum contact', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  // The frame types written so far: 1 down, 2 move, 3 up.
+  const types = (proc: FakeProc) => proc.stdin.write.mock.calls.map((c) => (c[0] as Buffer)[0])
+
+  it('holds back the up of a touch shorter than MIN_CONTACT_MS, then writes it', async () => {
+    const { helper, proc } = await setupHelper()
+    const { MIN_CONTACT_MS } = await import('../TouchHelper.js')
+    vi.useFakeTimers()
+    helper.touchStart(0.5, 0.5)
+    const ended = helper.touchEndAfterMinContact()
+    await vi.advanceTimersByTimeAsync(MIN_CONTACT_MS - 1)
+    expect(types(proc)).toEqual([1])
+    await vi.advanceTimersByTimeAsync(1)
+    expect(types(proc)).toEqual([1, 3])
+    await expect(ended).resolves.toBe(true)
+  })
+
+  it('writes the up at once when the touch already lasted long enough', async () => {
+    const { helper, proc } = await setupHelper()
+    const { MIN_CONTACT_MS } = await import('../TouchHelper.js')
+    vi.useFakeTimers()
+    helper.touchStart(0.5, 0.5)
+    await vi.advanceTimersByTimeAsync(MIN_CONTACT_MS)
+    const ended = helper.touchEndAfterMinContact()
+    expect(types(proc)).toEqual([1, 3])
+    await expect(ended).resolves.toBe(true)
+  })
+
+  it('writes a held-back up before the next touch goes down', async () => {
+    const { helper, proc } = await setupHelper()
+    vi.useFakeTimers()
+    helper.touchStart(0.2, 0.2)
+    const first = helper.touchEndAfterMinContact()
+    helper.touchStart(0.8, 0.8)
+    expect(types(proc)).toEqual([1, 3, 1])
+    await expect(first).resolves.toBe(true)
+    // and the timer it was waiting on writes nothing more
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(types(proc)).toEqual([1, 3, 1])
+  })
+
+  it('writes a held-back up with its own touch\'s position, not the next one\'s', async () => {
+    const { helper, proc } = await setupHelper()
+    vi.useFakeTimers()
+    helper.touchStart(0.2, 0.3)
+    void helper.touchEndAfterMinContact()
+    helper.touchStart(0.8, 0.9)
+    const up = proc.stdin.write.mock.calls.map((c) => c[0] as Buffer).find((b) => b[0] === 3)!
+    expect([up.readFloatBE(1), up.readFloatBE(5)].map((v) => Math.round(v * 10) / 10)).toEqual([0.2, 0.3])
+  })
+
+  it('writes a held-back up before a pinch opens', async () => {
+    const { helper, proc } = await setupHelper()
+    vi.useFakeTimers()
+    helper.touchStart(0.2, 0.2)
+    const first = helper.touchEndAfterMinContact()
+    helper.pinchStart(0.4, 0.4, 0.6, 0.6)
+    expect(types(proc)).toEqual([1, 3, 6])
+    await expect(first).resolves.toBe(true)
+  })
+
+  it('answers a held-back up as not sent when the helper stops, and writes nothing', async () => {
+    const { helper, proc } = await setupHelper()
+    vi.useFakeTimers()
+    helper.touchStart(0.5, 0.5)
+    const ended = helper.touchEndAfterMinContact()
+    helper.stop()
+    await expect(ended).resolves.toBe(false)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(types(proc)).toEqual([1])
+  })
+})

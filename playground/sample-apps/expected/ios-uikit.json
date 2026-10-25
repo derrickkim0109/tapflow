@@ -1,0 +1,209 @@
+{
+  "app": "dev.tapflow.sample.uikit",
+  "note": "UIKit target. Tab items carry identifiers.",
+  "matching": "An element is found when the tree has one with this identifier, or, when identifier is null, with this label (or any of labelAny). Role is recorded, not scored.",
+  "screens": [
+    {
+      "screen": "tabs",
+      "group": "basic",
+      "elements": [
+        {
+          "key": "tab.list",
+          "identifier": "tab.list",
+          "label": "List",
+          "role": "tab",
+          "tap": true
+        },
+        {
+          "key": "tab.hard",
+          "identifier": "tab.hard",
+          "label": "Hard",
+          "role": "tab",
+          "tap": true
+        },
+        {
+          "key": "tab.web",
+          "identifier": "tab.web",
+          "label": "Web",
+          "role": "tab",
+          "tap": true
+        },
+        {
+          "key": "tab.form",
+          "identifier": "tab.form",
+          "label": "Form",
+          "role": "tab",
+          "tap": true
+        }
+      ]
+    },
+    {
+      "screen": "form",
+      "group": "basic",
+      "navigate": "tab.form",
+      "elements": [
+        {
+          "key": "form.email",
+          "identifier": "form.email",
+          "label": "Email",
+          "role": "input",
+          "tap": true
+        },
+        {
+          "key": "form.password",
+          "identifier": "form.password",
+          "label": "Password",
+          "role": "input",
+          "tap": true
+        },
+        {
+          "key": "form.notify",
+          "identifier": "form.notify",
+          "label": "Notifications",
+          "role": "switch",
+          "tap": true
+        },
+        {
+          "key": "form.volume",
+          "identifier": "form.volume",
+          "label": "Volume",
+          "role": "slider",
+          "tap": true,
+          "gesture": "swipe",
+          "note": "Used by dragging; a tap on a slider is not a use of it."
+        },
+        {
+          "key": "form.submit",
+          "identifier": "form.submit",
+          "label": "Submit",
+          "role": "button",
+          "tap": true
+        }
+      ]
+    },
+    {
+      "screen": "list",
+      "group": "basic",
+      "navigate": "tab.list",
+      "elements": [
+        {
+          "key": "list.row.0",
+          "identifier": "list.row.0",
+          "label": "Row 0",
+          "role": "cell",
+          "tap": true
+        },
+        {
+          "key": "list.row.1",
+          "identifier": "list.row.1",
+          "label": "Row 1",
+          "role": "cell",
+          "tap": true
+        },
+        {
+          "key": "list.row.2",
+          "identifier": "list.row.2",
+          "label": "Row 2",
+          "role": "cell",
+          "tap": true
+        }
+      ]
+    },
+    {
+      "screen": "list-offscreen",
+      "group": "offscreen",
+      "navigate": "tab.list",
+      "elements": [
+        {
+          "key": "list.row.49",
+          "identifier": "list.row.49",
+          "label": "Row 49",
+          "role": "cell",
+          "tap": false,
+          "note": "Off screen until scrolled. Whether the tree reports it is recorded, not scored as a miss."
+        }
+      ]
+    },
+    {
+      "screen": "hard",
+      "group": "hard",
+      "navigate": "tab.hard",
+      "elements": [
+        {
+          "key": "hard.help",
+          "identifier": null,
+          "label": "Help",
+          "role": "button",
+          "tap": true,
+          "note": "label only"
+        },
+        {
+          "key": "hard.image",
+          "identifier": null,
+          "labelAny": [
+            "trash",
+            "Delete"
+          ],
+          "role": "button",
+          "tap": true,
+          "note": "image only; no label was set, so any label the platform derives from the symbol is accepted"
+        },
+        {
+          "key": "hard.custom",
+          "identifier": "hard.custom",
+          "label": null,
+          "role": "other",
+          "tap": true,
+          "note": "no accessibility traits"
+        },
+        {
+          "key": "hard.text",
+          "identifier": null,
+          "label": "Tap this text",
+          "role": "text",
+          "tap": true,
+          "note": "tappable plain text"
+        },
+        {
+          "key": "hard.field",
+          "identifier": null,
+          "labelAny": [
+            "Nickname"
+          ],
+          "role": "input",
+          "tap": true,
+          "note": "Placeholder only: no identifier, no label. Found through the element's placeholder, as `tapOn: \"Nickname\"` finds it."
+        }
+      ]
+    },
+    {
+      "screen": "web",
+      "group": "web",
+      "navigate": "tab.web",
+      "elements": [
+        {
+          "key": "web.button",
+          "identifier": null,
+          "label": "Web button",
+          "role": "button",
+          "tap": true
+        },
+        {
+          "key": "web.link",
+          "identifier": null,
+          "label": "Web link",
+          "role": "other",
+          "tap": true
+        },
+        {
+          "key": "web.input",
+          "identifier": null,
+          "role": "input",
+          "tap": true,
+          "note": "Named by aria-label; its placeholder differs on purpose, so a placeholder match cannot pass for a label match.",
+          "label": "Web input"
+        }
+      ]
+    }
+  ]
+}

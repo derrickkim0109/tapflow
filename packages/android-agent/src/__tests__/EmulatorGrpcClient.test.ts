@@ -273,4 +273,41 @@ describe('EmulatorGrpcClient — input readiness and deadline', () => {
       expect(opts.deadline! - Date.now()).toBeLessThan(2_000)
     }
   })
+
+  describe('touch order', () => {
+    // Callbacks held back so the test decides when the emulator answers each call.
+    function pending() {
+      const calls: Array<{ event: { touches: Array<{ pressure: number }> }; cb: (e: Error | null) => void }> = []
+      const sendTouch = vi.fn((event: never, _o: unknown, cb: (e: Error | null) => void) => { calls.push({ event, cb }) })
+      return { calls, client: new EmulatorGrpcClient('x', makeRaw({ sendTouch: sendTouch as never })) }
+    }
+    const flush = () => new Promise((r) => setTimeout(r, 0))
+
+    it('sends a touch only after the one before it has been answered', async () => {
+      const { calls, client } = pending()
+      const down = client.touchDown(0, 10, 10)
+      const up = client.touchUp(0, 10, 10)
+      await flush()
+      expect(calls.map((c) => c.event.touches[0]!.pressure)).toEqual([1])
+      calls[0]!.cb(null)
+      await down
+      await flush()
+      expect(calls.map((c) => c.event.touches[0]!.pressure)).toEqual([1, 0])
+      calls[1]!.cb(null)
+      await expect(up).resolves.toBeUndefined()
+    })
+
+    it('still sends the up when the down failed, and reports each on its own', async () => {
+      const { calls, client } = pending()
+      const down = client.touchDown(0, 10, 10)
+      const up = client.touchUp(0, 10, 10)
+      await flush()
+      calls[0]!.cb(new Error('DEADLINE_EXCEEDED'))
+      await expect(down).rejects.toThrow('DEADLINE_EXCEEDED')
+      await flush()
+      expect(calls).toHaveLength(2)
+      calls[1]!.cb(null)
+      await expect(up).resolves.toBeUndefined()
+    })
+  })
 })

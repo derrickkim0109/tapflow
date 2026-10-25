@@ -12,7 +12,7 @@ import { SimulatorNetwork } from '../SimulatorNetwork.js'
 // agent acks on that answer, so the mock has to state it — returning undefined would model a
 // helper that silently drops everything. `killHelper()` below flips one over to that state.
 vi.mock('../TouchHelper', () => ({
-  TouchHelper: vi.fn(function () { return ({
+  TouchHelper: vi.fn(function () { return withMinContact({
     start: vi.fn(),
     stop: vi.fn(),
     isReady: vi.fn(() => true),
@@ -36,6 +36,17 @@ vi.mock('../TouchHelper', () => ({
     sendKey: vi.fn(() => true),
   }) }),
 }))
+
+// The agent writes a terminal frame through `touchEndAfterMinContact`, whose answer is `touchEnd`'s once the
+// touch has lasted long enough. Mirrored here without the wait, and non-enumerable so `killHelper` (which
+// rewrites every mock) leaves it following `touchEnd` — a dead helper's dropped up is still answered false.
+function withMinContact<T extends { touchEnd: () => boolean }>(helper: T): T {
+  Object.defineProperty(helper, 'touchEndAfterMinContact', {
+    value: () => Promise.resolve(helper.touchEnd()),
+    enumerable: false,
+  })
+  return helper
+}
 
 // The #482 state: the helper object is still there and the stream is still running, but its
 // child process is gone, so every write is dropped.
@@ -101,7 +112,9 @@ import { ScreenCaptureStreamer } from '../ScreenCaptureStreamer'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
 import { launchAudioHelper } from '@tapflowio/audiotap-helper'
 import { SimctlWrapper } from '../SimctlWrapper'
-import { LeanStore } from '../LeanStore'
+import { LeanStore, parseDisabledStore } from '../LeanStore'
+import { labelsFor } from '../serviceTiers'
+import type { ServiceTier } from '@tapflowio/protocol'
 import { LEAN_LABELS } from '../leanLabels'
 import { TouchHelper } from '../TouchHelper'
 import { XCUITreeReader } from '../XCUITreeReader'
@@ -1401,6 +1414,39 @@ describe('IOSAgent', () => {
       const ready = await readyPromise
       expect((ready.payload as { deviceId: string }).deviceId).toBe('dev-1')
       expect(simctl.boot).toHaveBeenCalledWith('dev-1')
+
+      agent.disconnect()
+      browser.close()
+    })
+
+    // The relay's boot gate charges a boot by this (L2 admission plan, S2): a device found already
+    // running costs the host nothing, one this boot brings up costs it 30-90 s of memory pressure.
+    // `unknown` is a device mid-transition, which is paying that cost now; Full reset shuts the device
+    // down itself, so it is cold whatever the list said.
+    it.each([
+      { status: false, resetMode: undefined, cold: true },
+      { status: true, resetMode: undefined, cold: false },
+      { status: 'unknown', resetMode: undefined, cold: true },
+      { status: true, resetMode: 'full-erase', cold: true },
+      { status: true, resetMode: 'app-only', cold: false },
+    ] as const)('reports cold=$cold on device:ready for booted=$status, resetMode=$resetMode', async ({ status, resetMode, cold }) => {
+      const agent = new IOSAgent({ intervalMs: 50 }, mockSimctl(status))
+      await agent.connect(`ws://localhost:${port}`)
+
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+
+      const readyPromise = waitForType(browser, 'device:ready')
+      browser.send(JSON.stringify({
+        type: 'device:boot',
+        requestId: 'rq-cold',
+        sessionId: agent.sessionId,
+        payload: { deviceId: 'dev-1', ...(resetMode ? { resetMode } : {}) },
+      }))
+      const ready = await readyPromise
+      expect((ready.payload as { cold?: boolean }).cold).toBe(cold)
 
       agent.disconnect()
       browser.close()
@@ -4414,10 +4460,18 @@ describe('IOSAgent', () => {
       leanRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-lean-agent-'))
       store = new LeanStore(leanRoot)
       order = []
-      const apply = store.apply.bind(store)
+      lastReady = { promise: Promise.resolve({}), resolve: () => {} }
+      // `setTier` reverts before it applies; only the top-level calls are the agent's decisions, so a revert made
+      // inside one is not recorded on its own.
+      let inSetTier = false
+      const setTier = store.setTier.bind(store)
       const revert = store.revert.bind(store)
-      vi.spyOn(store, 'apply').mockImplementation((udid, labels) => { order.push('apply'); apply(udid, labels) })
-      vi.spyOn(store, 'revert').mockImplementation((udid) => { order.push('revert'); return revert(udid) })
+      vi.spyOn(store, 'setTier').mockImplementation((udid, tier, labels) => {
+        order.push(`tier:${tier.name}`)
+        inSetTier = true
+        try { setTier(udid, tier, labels) } finally { inSetTier = false }
+      })
+      vi.spyOn(store, 'revert').mockImplementation((udid) => { if (!inSetTier) order.push('revert'); return revert(udid) })
     })
     afterEach(() => fs.rmSync(leanRoot, { recursive: true, force: true }))
 
@@ -4442,14 +4496,23 @@ describe('IOSAgent', () => {
       browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
       await waitForType(browser, 'session:joined')
       browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-lean', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', ...payload } }))
-      await waitForType(browser, 'device:ready')
+      const ready = await waitForType(browser, 'device:ready')
+      lastReady.resolve(ready['payload'] as Record<string, unknown>)
       return { agent, browser }
+    }
+    /** The payload of the next boot's ready, read by `boot` from the frame it already waits for. */
+    let lastReady: { promise: Promise<Record<string, unknown>>; resolve: (p: Record<string, unknown>) => void }
+    function waitForReadyPayload(): Promise<Record<string, unknown>> {
+      let resolve!: (p: Record<string, unknown>) => void
+      const promise = new Promise<Record<string, unknown>>((r) => { resolve = r })
+      lastReady = { promise, resolve }
+      return promise
     }
 
     it('disables the labels before booting a device that is shut down', async () => {
       const { agent, browser } = await boot(simctlOn('shutdown'), true)
-      expect(order).toEqual(['apply', 'boot'])
-      expect(store.apply).toHaveBeenCalledWith('dev-1', LEAN_LABELS)
+      expect(order).toEqual(['tier:lean', 'boot'])
+      expect(store.setTier).toHaveBeenCalledWith('dev-1', { name: 'lean', keep: [] }, LEAN_LABELS)
       expect(store.isApplied('dev-1')).toBe(true)
       agent.disconnect(); browser.close()
     })
@@ -4462,9 +4525,25 @@ describe('IOSAgent', () => {
       agent.disconnect(); browser.close()
     })
 
-    it('applies after a full erase has shut the device down, before it boots again', async () => {
+    it('sets the tier after a full erase has succeeded, before the device boots again', async () => {
       const { agent, browser } = await boot(simctlOn('booted'), true, { resetMode: 'full-erase' })
-      expect(order).toEqual(['shutdown', 'apply', 'erase', 'boot'])
+      expect(order).toEqual(['shutdown', 'erase', 'tier:lean', 'boot'])
+      agent.disconnect(); browser.close()
+    })
+
+    it('leaves the tier alone when the erase fails, so the device comes back as it was found', async () => {
+      const simctl = simctlOn('booted')
+      ;(simctl.erase as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push('erase'); throw new Error('disk full') })
+      const agent = new IOSAgent({ intervalMs: 50, lean: true, leanStore: store }, simctl)
+      await agent.connect(`ws://localhost:${port}`)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-erase', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', resetMode: 'full-erase', serviceTier: { name: 'slim', keep: [] } } }))
+      await waitForType(browser, 'device:boot-error')
+      expect(order).toEqual(['shutdown', 'erase', 'boot'])
+      expect(store.isApplied('dev-1')).toBe(false)
       agent.disconnect(); browser.close()
     })
 
@@ -4484,10 +4563,10 @@ describe('IOSAgent', () => {
     })
 
     it('boots anyway when the store cannot be written', async () => {
-      vi.mocked(store.apply).mockImplementation(() => { order.push('apply'); throw new Error('EACCES') })
+      vi.mocked(store.setTier).mockImplementation(() => { order.push('tier:lean'); throw new Error('EACCES') })
       vi.spyOn(console, 'warn').mockImplementation(() => {})
       const { agent, browser } = await boot(simctlOn('shutdown'), true)
-      expect(order).toEqual(['apply', 'boot'])
+      expect(order).toEqual(['tier:lean', 'boot'])
       agent.disconnect(); browser.close()
     })
 
@@ -4496,7 +4575,7 @@ describe('IOSAgent', () => {
       const { agent, browser } = await boot(simctl, true)
       browser.send(JSON.stringify({ type: 'device:shutdown', requestId: 'rq-off', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
       await waitForType(browser, 'device:shutdown-done')
-      expect(order).toEqual(['apply', 'boot', 'shutdown', 'revert'])
+      expect(order).toEqual(['tier:lean', 'boot', 'shutdown', 'revert'])
       expect(store.isApplied('dev-1')).toBe(false)
       agent.disconnect(); browser.close()
     })
@@ -4508,24 +4587,91 @@ describe('IOSAgent', () => {
       vi.spyOn(console, 'warn').mockImplementation(() => {})
       browser.send(JSON.stringify({ type: 'device:shutdown', requestId: 'rq-off', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
       await waitForType(browser, 'device:shutdown-done')
-      expect(order).toEqual(['apply', 'boot', 'shutdown', 'revert'])
+      expect(order).toEqual(['tier:lean', 'boot', 'shutdown', 'revert'])
       agent.disconnect(); browser.close()
     })
 
     it('with Lean mode off, puts back a device it left lean before booting it', async () => {
       // Marked after connect, so it is the boot path doing this and not the sweep below.
       const { agent, browser } = await boot(simctlOn('shutdown'), false, {}, () => {
-        store.apply('dev-1', LEAN_LABELS)
+        store.setTier('dev-1', { name: 'lean', keep: [] }, LEAN_LABELS)
         order = []
       })
-      expect(order).toEqual(['revert', 'boot'])
+      expect(order).toEqual(['tier:stock', 'boot'])
       expect(store.isApplied('dev-1')).toBe(false)
       agent.disconnect(); browser.close()
     })
 
+    describe('service tiers', () => {
+      const SLIM: ServiceTier = { name: 'slim', keep: ['push'] }
+      const LEAN: ServiceTier = { name: 'lean', keep: [] }
+
+      it('boots a shut-down device onto the tier a run asked for, and says so on ready', async () => {
+        const ready = waitForReadyPayload()
+        const { agent, browser } = await boot(simctlOn('shutdown'), true, { serviceTier: SLIM })
+        expect(order).toEqual(['tier:slim', 'boot'])
+        expect(store.setTier).toHaveBeenCalledWith('dev-1', SLIM, labelsFor(SLIM))
+        expect(labelsFor(SLIM)).not.toContain('com.apple.apsd') // push kept on
+        // Wallet's passd crashes at start-up without financed, so keeping Wallet keeps both.
+        const wallet = labelsFor({ name: 'slim', keep: ['wallet'] })
+        expect(wallet).not.toContain('com.apple.passd')
+        expect(wallet).not.toContain('com.apple.financed')
+        expect(await ready).toMatchObject({ cold: true, serviceTier: SLIM })
+        agent.disconnect(); browser.close()
+      })
+
+      it('restarts a running device that is on another tier', async () => {
+        const ready = waitForReadyPayload()
+        const { agent, browser } = await boot(simctlOn('booted'), true, { serviceTier: SLIM }, () => {
+          store.setTier('dev-1', LEAN, labelsFor(LEAN))
+          order = []
+        })
+        expect(order).toEqual(['shutdown', 'tier:slim', 'boot'])
+        expect(await ready).toMatchObject({ cold: true, serviceTier: SLIM })
+        agent.disconnect(); browser.close()
+      })
+
+      it('leaves a running device that is already on the tier', async () => {
+        const ready = waitForReadyPayload()
+        const { agent, browser } = await boot(simctlOn('booted'), true, { serviceTier: SLIM }, () => {
+          store.setTier('dev-1', SLIM, labelsFor(SLIM))
+          order = []
+        })
+        expect(order).toEqual(['boot'])
+        expect(await ready).toMatchObject({ cold: false, serviceTier: SLIM })
+        agent.disconnect(); browser.close()
+      })
+
+      it('puts a device a run left slim back on exactly the default tier for a boot that asks for none', async () => {
+        // R4-S1: adding Lean mode's labels to slim's would leave slim's on, and hand a person a device without push.
+        const { agent, browser } = await boot(simctlOn('shutdown'), true, {}, () => {
+          store.setTier('dev-1', SLIM, labelsFor(SLIM))
+          order = []
+        })
+        expect(order).toEqual(['tier:lean', 'boot'])
+        expect(store.currentTier('dev-1')).toEqual(LEAN)
+        const disabled = parseDisabledStore(fs.readFileSync(path.join(leanRoot, 'com.apple.CoreSimulator.SimDevice.dev-1', 'disabled.plist'), 'utf8'))
+        expect(Object.keys(disabled).sort()).toEqual([...LEAN_LABELS].sort())
+        agent.disconnect(); browser.close()
+      })
+
+      it('reports each device\'s tier when it registers', async () => {
+        store.setTier('dev-1', SLIM, labelsFor(SLIM))
+        const agent = new IOSAgent({ intervalMs: 50, lean: true, leanStore: store }, simctlOn('booted'))
+        const listed = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(listed)
+        await agent.connect(`ws://localhost:${port}`)
+        listed.send(JSON.stringify({ type: 'agents:list' }))
+        const msg = await waitForType(listed, 'agents:listed')
+        const devices = (msg['sessions'] as Array<{ devices: Array<{ serviceTier?: unknown }> }>)[0]!.devices
+        expect(devices[0]!.serviceTier).toEqual(SLIM)
+        agent.disconnect(); listed.close()
+      })
+    })
+
     describe('on connect', () => {
       it('puts back a shut-down device an earlier run left lean', async () => {
-        store.apply('dev-1', LEAN_LABELS)
+        store.setTier('dev-1', { name: 'lean', keep: [] }, LEAN_LABELS)
         const agent = new IOSAgent({ intervalMs: 50, lean: true, leanStore: store }, simctlOn('shutdown'))
         await agent.connect(`ws://localhost:${port}`)
         expect(store.isApplied('dev-1')).toBe(false)
@@ -4534,14 +4680,117 @@ describe('IOSAgent', () => {
 
       it('leaves one that is still running, and one that no longer exists', async () => {
         // The twin of the case above.
-        store.apply('dev-1', LEAN_LABELS)
-        store.apply('gone-1', LEAN_LABELS)
+        store.setTier('dev-1', { name: 'lean', keep: [] }, LEAN_LABELS)
+        store.setTier('gone-1', { name: 'lean', keep: [] }, LEAN_LABELS)
         const agent = new IOSAgent({ intervalMs: 50, lean: true, leanStore: store }, simctlOn('booted'))
         await agent.connect(`ws://localhost:${port}`)
         expect(store.isApplied('dev-1')).toBe(true)
         expect(store.isApplied('gone-1')).toBe(true)
         agent.disconnect()
       })
+    })
+  })
+
+  describe('run reset (flow run)', () => {
+    const RESET = { uninstall: ['com.example.app'], clear: ['com.example.helper'] }
+    let calls: string[]
+
+    function resetSimctl(booted: boolean) {
+      calls = []
+      const simctl = mockSimctl(booted)
+      const record = (name: string) => vi.fn(async (_udid: string, id?: string) => { calls.push(id ? `${name}:${id}` : name) })
+      Object.assign(simctl, {
+        uninstallAppForReset: record('uninstall'),
+        clearAppDataIfInstalled: record('clear'),
+        waitForBootStatus: record('bootstatus'),
+        resetKeychain: record('keychain'),
+        resetPrivacy: record('privacy'),
+        clearLocation: record('location'),
+      })
+      return simctl
+    }
+
+    async function bootWith(simctl: SimctlWrapper, payload: Record<string, unknown>) {
+      const agent = new IOSAgent({ intervalMs: 50 }, simctl)
+      await agent.connect(`ws://localhost:${port}`)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-reset', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', ...payload } }))
+      return { agent, browser }
+    }
+
+    it('resets the apps and the device before ready, and reports each item', async () => {
+      const simctl = resetSimctl(true)
+      const { agent, browser } = await bootWith(simctl, { runReset: RESET })
+      const ready = await waitForType(browser, 'device:ready')
+      expect(calls).toEqual(['bootstatus', 'uninstall:com.example.app', 'clear:com.example.helper', 'keychain', 'privacy', 'location'])
+      expect(simctl.setPasteboard).toHaveBeenCalledWith('dev-1', '')
+      expect((ready['payload'] as Record<string, unknown>)['runReset']).toEqual({
+        done: ['app-uninstall', 'app-files', 'keychain', 'privacy-services', 'pasteboard', 'location'], failed: [],
+      })
+      agent.disconnect(); browser.close()
+    })
+
+    // Also when the device was already listed `Booted`: it may have been booted moments ago by someone else.
+    it('waits for the system services before resetting a device it just booted', async () => {
+      const simctl = resetSimctl(false)
+      const { agent, browser } = await bootWith(simctl, { runReset: { uninstall: [], clear: [] } })
+      await waitForType(browser, 'device:ready')
+      expect(calls).toEqual(['bootstatus', 'keychain', 'privacy', 'location'])
+      agent.disconnect(); browser.close()
+    })
+
+    it('goes on past an item that fails, and the boot still succeeds', async () => {
+      const simctl = resetSimctl(true)
+      vi.mocked(simctl.resetKeychain).mockRejectedValue(new Error('keychain busy'))
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const { agent, browser } = await bootWith(simctl, { runReset: { uninstall: [], clear: [] } })
+      const ready = await waitForType(browser, 'device:ready')
+      expect((ready['payload'] as Record<string, unknown>)['runReset']).toEqual({
+        done: ['privacy-services', 'pasteboard', 'location'], failed: ['keychain'],
+      })
+      agent.disconnect(); browser.close()
+    })
+
+    // On Android the same id reaches the device's shell, so neither platform passes one that is not an app id.
+    it('fails the app item for an id that is not an app id, and never passes it on', async () => {
+      const simctl = resetSimctl(true)
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const { agent, browser } = await bootWith(simctl, { runReset: { uninstall: [], clear: ['x;reboot', 'com.example.ok'] } })
+      const ready = await waitForType(browser, 'device:ready')
+      expect(calls).toContain('clear:com.example.ok')
+      expect(calls.some((c) => c.includes('reboot'))).toBe(false)
+      expect((ready['payload'] as { runReset: { failed: string[] } }).runReset.failed).toEqual(['app-files'])
+      agent.disconnect(); browser.close()
+    })
+
+    it('resets nothing for a boot that did not ask', async () => {
+      const simctl = resetSimctl(true)
+      const { agent, browser } = await bootWith(simctl, {})
+      const ready = await waitForType(browser, 'device:ready')
+      expect(calls).toEqual([])
+      expect(ready['payload']).not.toHaveProperty('runReset')
+      agent.disconnect(); browser.close()
+    })
+
+    it('answers the boot as abandoned when a shutdown arrives mid-reset', async () => {
+      const simctl = resetSimctl(true)
+      let release!: () => void
+      vi.mocked(simctl.resetKeychain).mockImplementation(() => new Promise<void>((r) => { release = r }))
+      const { agent, browser } = await bootWith(simctl, { runReset: { uninstall: [], clear: [] } })
+      await vi.waitFor(() => expect(simctl.resetKeychain).toHaveBeenCalled(), { timeout: 2000 })
+      const abandoned = waitForType(browser, 'device:boot-error')
+      browser.send(JSON.stringify({ type: 'device:shutdown', requestId: 'rq-off', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await vi.waitFor(() => expect(simctl.shutdown).toHaveBeenCalled(), { timeout: 2000 })
+      release()
+      const e = await abandoned
+      expect(e['requestId']).toBe('rq-reset')
+      // The steps after the shutdown did not run, and nothing past the reset touched the device being shut down.
+      expect(simctl.resetPrivacy).not.toHaveBeenCalled()
+      expect(simctl.rotate).not.toHaveBeenCalled()
+      agent.disconnect(); browser.close()
     })
   })
 })

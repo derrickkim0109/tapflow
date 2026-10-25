@@ -48,7 +48,7 @@ const passedFlow = {
 
 describe('TapflowClient run records', () => {
   it('lists runs with the filters as the relay names them, summarised', async () => {
-    const calls = stubRelay(() => Response.json({ items: [{ ...summary, flowsPassed: 1, flowsFailed: 1 }], nextCursor: '5', prevCursor: null }))
+    const calls = stubRelay(() => Response.json({ items: [{ ...summary, flowsPassed: 1, flowsFailed: 1, flowsSkipped: 0 }], nextCursor: '5', prevCursor: null }))
     const client = new TapflowClient(RELAY, TOKEN)
     const { runs, nextCursor } = await client.listRuns({ status: 'failed', buildId: 7, flow: 'pay', ci: true, limit: 5 })
     expect(nextCursor).toBe('5')
@@ -58,9 +58,15 @@ describe('TapflowClient run records', () => {
     expect(runs).toEqual([{
       id: 'run-1', status: 'failed', failureKind: 'product', errorMessage: null, exitCode: 1,
       build: 'Coffee 1.2.0 (42)', buildId: 7, ci: { branch: 'main', commit: 'abcdef1234567', jobUrl: 'https://ci.example.test/1' },
-      flows: { passed: 1, failed: 1, total: 2 }, createdAt: '2026-10-14 01:00:00', finishedAt: '2026-10-14 01:01:00',
+      flows: { passed: 1, failed: 1, skipped: 0, total: 2 }, createdAt: '2026-10-14 01:00:00', finishedAt: '2026-10-14 01:01:00',
       url: 'http://relay.example.test:4000/automation/runs/run-1',
     }])
+  })
+
+  it('counts the flows a run skipped, and reads none from a relay that does not report them', async () => {
+    stubRelay(() => Response.json({ items: [{ ...summary, flowsTotal: 3, flowsPassed: 1, flowsFailed: 0, flowsSkipped: 2 }, { ...summary, id: 'run-0', flowsPassed: 2, flowsFailed: 0 }], nextCursor: null, prevCursor: null }))
+    const { runs } = await new TapflowClient(RELAY, TOKEN).listRuns({})
+    expect(runs.map((r) => r.flows)).toEqual([{ passed: 1, failed: 0, skipped: 2, total: 3 }, { passed: 2, failed: 0, skipped: 0, total: 2 }])
   })
 
   it('sends no filter it was not given, and caps the limit at 50', async () => {

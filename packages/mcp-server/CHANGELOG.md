@@ -1,5 +1,36 @@
 # @tapflowio/mcp-server
 
+## 0.29.0
+
+### Minor Changes
+
+- 34287be: A run decides which flows apply before it touches a device. `isEligible` in flow-runner is the one place that decides, for `tapflow flow run` and MCP's `run_flow` alike. With a build, a flow whose `appId` differs from the build's bundle id is skipped and the line names both ids; until now `appId` was read only by `clearState`, so a flow for another app ran and failed on its first selector, which read as a regression. A flow can carry `tags`, and `flow run --include-tags` / `--exclude-tags` pick by them (include is any of, exclude wins). A skipped flow is not a failure, but a run where none ran exits 2 before choosing a device, so a CI job that tested nothing does not pass. The build's bundle id is read from `GET /api/v1/builds/:id`; only a 404 is an error, and a token without `builds:write`, no token or no answer leaves the app check out with one line. The run record keeps a skipped flow and why (`skipReason`), the runs page and `list_runs` count them, and JUnit lists them as `<skipped>`. The relay migrates `flow_run_flows` to allow it. A new CLI on an older relay warns once that skipped flows are not recorded and records the rest.
+- c9f1ff8: The relay caps how many devices automation keeps running on each Mac (`TAPFLOW_MAX_AUTOMATED_DEVICES`, default half the Mac's memory in GB, 1–8; an Android emulator counts as two). Each session remembers who cold-booted its device (`lastBoot`), past the holder leaving. An automated cold boot past the cap shuts down the longest-running idle device automation started, once the gate lets the boot through; with none idle it is refused with the new `BootRefusalReason` `host-at-capacity`, which flow-runner and MCP wait out. An automated boot refused for `host-memory-critical` also shuts down one idle automation device, one at a time per Mac. An automation client that joined a device during a person's idle countdown restarts the countdown when it leaves.
+- 1e41b29: The relay boots one device at a time per Mac. A boot holds the Mac's slot from the moment it is let through until the device has settled — its CPU flat across three reports, or a cap — because the boot is what slows the other sessions on that Mac. An automated boot (flow runner, MCP) that finds the slot taken is answered with `device:boot-error` carrying `reason: 'host-booting'`. A person's boot is never refused: it waits in the Mac's one reservation, ahead of any automated retry, for at most 60 s. While a boot holds the slot, the `session:start` CPU check is paused for that Mac. `tapflow flow run` waits out a refusal with backoff, letting go of the session while it waits, for up to `--admission-timeout` (600 s). flow-runner exports `retryAdmission`, `admissionRefusalOf` and `AdmissionRefusedError`; MCP's `boot_device` says the Mac is busy and to call it again.
+- 64a7bc0: The boot gate refuses new devices on a Mac whose kernel reports critical memory pressure. Agents report `kern.memorystatus_vm_pressure_level` as `agent:resources.resources.memoryPressure` (`normal`, `warn`, `critical`; macOS only, absent elsewhere). While an agent on a Mac reports `critical`, the relay refuses automated cold boots there with `device:boot-error` `reason: 'host-memory-critical'`, and holds a person's cold boot in the reservation as it does behind another boot; the reading lapses 15 s after the last report that said so. `device:boot-waiting` carries an optional `reason` and is sent again when the wait's reason changes. flow-runner and MCP treat any `reason` on a refused boot as a busy Mac, including one they do not know (`AdmissionReason`, `'unrecognised-refusal'`), so a newer relay's reason is waited out instead of failing the run.
+- 2374db5: The MCP server now tells the coding agent how to use tapflow and how to test with it. Server `instructions`, sent once at connect (about 400 tokens), cover the order of the tools, reading the screen with `query_ui_tree` rather than screenshots, releasing the device when done, and what a refused boot or an unconfirmed input means. The new `get_testing_guide` tool returns a testing method on demand (about 1,200 tokens, spent only when called): the cases to cover, what these tools cannot test, how to check a finding before calling it a bug, how to save the verified path as a flow, and the report format. `connect_device`'s description repeats the two rules that matter most for clients that ignore instructions.
+
+  The server also reports its package version to the client; it had reported `0.2.2`. `boot_device` and `install_app` now state the waits they actually allow (3 and 2 minutes), not 30 and 60 seconds.
+
+- 486b1d3: The UI tree carries a text field's placeholder as its own field, `placeholder`, and a bare-text selector falls back to it after label. A field with no label and no identifier could not be found by any selector before; `tapOn: "Nickname"` now finds it. The placeholder is the last stage, after a partial label, so a step that found an element before finds the same one now, and it never matches in part. A step that found nothing because the field had only a placeholder now sees it: `assertNotVisible` on that text, which always passed before, now fails while the field is on screen. iOS reads it from `placeholderValue`, which it keeps after a value is typed. The relay's inbound schema lists the field, so it reaches clients. Android is unchanged for now.
+
+### Patch Changes
+
+- Updated dependencies [1445649]
+- Updated dependencies [fe644c9]
+- Updated dependencies [c5acd02]
+- Updated dependencies [34287be]
+- Updated dependencies [00b8d3f]
+- Updated dependencies [c9f1ff8]
+- Updated dependencies [1e41b29]
+- Updated dependencies [64a7bc0]
+- Updated dependencies [d310508]
+- Updated dependencies [0e18ee1]
+- Updated dependencies [d4055b4]
+- Updated dependencies [486b1d3]
+  - @tapflowio/protocol@0.29.0
+  - @tapflowio/flow-runner@0.29.0
+
 ## 0.28.1
 
 ### Patch Changes

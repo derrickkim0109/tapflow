@@ -29,7 +29,7 @@ vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: v
 const { QASession } = await import('../pages/QASession')
 
 const AGENTS: SessionInfo[] = [{
-  agentName: 'studio-mac', platform: 'ios', capabilities: [],
+  agentName: 'studio-mac', platform: 'ios', capabilities: [], admission: { booting: false, overloaded: false, memoryRefuses: [] },
   devices: [
     { id: 'dev-a', name: 'iPhone 15', platform: 'ios', status: 'booted', osVersion: 'iOS 18.3', sessionId: 'sess-a', busy: true, holder: { kind: 'mcp', user: 'qa@example.test' } },
     { id: 'dev-b', name: 'iPhone SE', platform: 'ios', status: 'booted', osVersion: 'iOS 18.3', sessionId: 'sess-b', busy: true },

@@ -16,7 +16,7 @@
 
 ## Get started
 
-- [Introduction](https://www.tapflow.dev/get-started/introduction): What tapflow is, who does what (an operator sets up a Mac; teammates only open a browser), the key concepts (relay, agent, dashboard, App Center, build, QA Session, roles), architecture diagrams, and the manual-first vs experimental MCP paths.
+- [Introduction](https://www.tapflow.dev/get-started/introduction): What tapflow is, who does what (an operator sets up a Mac; teammates only open a browser), the key concepts (relay, agent, dashboard, App Center, build, QA Session, roles), architecture diagrams, and the three ways to use tapflow (manual QA, plus experimental AI agents and automation).
 - [Quick Start](https://www.tapflow.dev/get-started/quick-start): Operator tutorial from install to the first tap: prerequisites, tapflow setup, optional tapflow init, tapflow start and its banner, the admin account, uploading your build, Start QA, picking a Mac and device, Launch app, and inviting a teammate with the dashboard's LAN address.
 - [For teammates](https://www.tapflow.dev/get-started/teammates): For a teammate who received an invite link: accept it, save the dashboard address, pick a build in App Center, start a QA Session, leave comments, what each role (Viewer / QA / Developer / Admin) may do, and profile settings.
 
@@ -64,7 +64,7 @@
 - [Build Distribution](https://www.tapflow.dev/operate/ci-distribution): Connect your CI pipeline to upload builds automatically. Includes Personal Access Token setup, curl examples, GitHub Actions full example with branch/commit metadata, and build status reference.
 - [Webhooks](https://www.tapflow.dev/operate/webhooks): Register a URL that tapflow POSTs to when someone moves a build to Done or Rejected — the review verdict, not a build completion. Payload shape, signature verification, and when it fires.
 
-### AI automation (MCP and flows — experimental)
+### AI agents and automation (MCP and flows — experimental)
 
 - [MCP Server](https://www.tapflow.dev/automation/mcp-server): Install and configure @tapflowio/mcp-server. Supports Claude Code, Codex, Cursor, and any MCP-compatible client. Available tools: list_builds, list_devices, connect_device, disconnect_device, boot_device, shutdown_device, screenshot, query_ui_tree, tap, swipe, type_text, press_key, press_button, install_app, launch_app, run_flow, list_runs, get_run. connect_device returns a dashboard link for watching the device live.
 - [Flow Reference](https://www.tapflow.dev/automation/flows): The YAML flow format replayed deterministically by `tapflow flow run` with no LLM calls — file structure, every step type, selectors, running in CI, the link for watching a run, and how it relates to the `run_flow` MCP tool.

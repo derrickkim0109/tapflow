@@ -18,7 +18,7 @@ import { cmdTokenSet, cmdTokenStatus } from './commands/token.js'
 import { cmdReset } from './commands/reset.js'
 import { cmdStatus } from './commands/status.js'
 import { cmdLogs } from './commands/logs.js'
-import { cmdFlowRun, type FlowRunOptions } from './commands/flow-run.js'
+import { cmdFlowRun, tagsArg, type FlowRunOptions, type TagsArg } from './commands/flow-run.js'
 import { cmdMigrate, cmdMigrateDataDir, cmdMigrateNetFilter } from './commands/migrate.js'
 
 /**
@@ -133,8 +133,19 @@ export function createCli(): CAC {
     .option('--junit <path>', 'Write a JUnit XML report')
     .option('--artifacts <dir>', 'Failure screenshot directory (default: .tapflow/artifacts)')
     .option('--timeout <seconds>', 'Default per-selector wait (default: 10)')
+    .option('--service-tier <tier>', 'Services the device boots with: stock, lean or slim (iOS 18.5+; default: the agent\'s setting)')
+    .option('--keep <features>', 'Features to keep on under --service-tier (comma-separated, e.g. push,photos)')
+    .option('--admission-timeout <seconds>', 'How long to wait while another device boots on the same Mac, or the Mac is over its CPU or memory limit (default: 600)')
     .option('--no-record', 'Do not record this run on the relay')
-    .action((subcommand: string, files: string[], opts: FlowRunOptions & { build?: string | number; timeout?: string | number }) => {
+    .option('--no-reset', 'Keep what earlier runs left on the device (by default the run resets app data, keychain, privacy grants, pasteboard and location)')
+    .option('--include-tags <tags>', 'Run only flows tagged with at least one of these (comma-separated)')
+    .option('--exclude-tags <tags>', 'Skip flows tagged with any of these (comma-separated); wins over --include-tags')
+    .option('--parallel <n>', 'Share the flows across up to n devices the relay chooses and boots (1-16)')
+    .option('--platform <platform>', 'ios or android: the platform of a --parallel run without --build')
+    .action((subcommand: string, files: string[], opts: Omit<FlowRunOptions, 'includeTags' | 'excludeTags'> & {
+      build?: string | number; timeout?: string | number; admissionTimeout?: string | number; includeTags?: TagsArg; excludeTags?: TagsArg
+      parallel?: string | number
+    }) => {
       if (subcommand !== 'run') {
         console.error(`unknown flow subcommand: ${subcommand} (expected: run)`)
         process.exit(2)
@@ -143,6 +154,10 @@ export function createCli(): CAC {
         ...opts,
         build: opts.build !== undefined ? Number(opts.build) : undefined,
         timeout: opts.timeout !== undefined ? Number(opts.timeout) : undefined,
+        admissionTimeout: opts.admissionTimeout !== undefined ? Number(opts.admissionTimeout) : undefined,
+        parallel: opts.parallel !== undefined ? Number(opts.parallel) : undefined,
+        includeTags: tagsArg(opts.includeTags),
+        excludeTags: tagsArg(opts.excludeTags),
       })
     })
 

@@ -73,8 +73,13 @@ function forwardedToBrowser(src) {
  *
  * Anchored on `raw` rather than accepting either, so a forward that goes back to the product fails
  * here instead of shipping a compatibility break nothing else would report.
+ *
+ * One named exception: `device:boot-error` sends `fromAgent`, which is `raw` minus `reason`. That key is the
+ * relay's own word that a Mac is busy, and clients wait out any frame carrying one, so an agent may not set
+ * it. Everything else a newer agent adds still rides through — the test below holds that `fromAgent` is
+ * built from `raw` by removing exactly that key.
  */
-const FORWARD_TO_BROWSER = /browserSocket\.send\(JSON\.stringify\(raw\)\)/
+const FORWARD_TO_BROWSER = /browserSocket\.send\(JSON\.stringify\((?:raw|fromAgent)\)\)/
 
 /** `export interface Name { … }` bodies, by name. L1 moved every message out of its union and into one
  *  of these, so a parser that reads only union bodies now finds nothing — it did, and this file's
@@ -208,7 +213,13 @@ describe('browser-inbound routing matches the protocol union', () => {
   it('the parser reached every forward site', () => {
     expect(forwarded.size).toBe(26)
     const sends = (relaySrc.match(/browserSocket\.send\(JSON\.stringify\(raw\)\)/g) ?? []).length
-    expect(sends).toBe(10) // 8 single-label blocks + the 13-label block + the owner-gated block
+    expect(sends).toBe(9) // 7 single-label blocks + the 13-label block + the owner-gated block
+  })
+
+  it('forwards an agent\'s boot error as it arrived, less only the relay-owned reason', () => {
+    const builds = relaySrc.match(/const \{ ([^}]*)\} = raw\n\s*session\.browserSocket\.send\(JSON\.stringify\(fromAgent\)\)/g) ?? []
+    expect(builds).toHaveLength(1)
+    expect(builds[0]).toMatch(/const \{ reason: _\w+, \.\.\.fromAgent \} = raw/)
   })
 
   // Same anti-vacuity for the union parser: it must read through the
@@ -312,7 +323,7 @@ describe('browser-inbound routing matches the protocol union', () => {
       'device:ready': 'payload requestId? sessionId?',
       'app:install-error': 'message requestId sessionId',
       'app:launch-error': 'message requestId sessionId',
-      'device:boot-error': 'message requestId? sessionId',
+      'device:boot-error': 'message reason? requestId? sessionId',
       'open-url:error': 'message requestId sessionId',
       'app:clear-state-error': 'message requestId sessionId',
       // #491 inverted this pair: `reason` is the closed union a consumer branches on and is now
@@ -336,6 +347,7 @@ describe('browser-inbound routing matches the protocol union', () => {
       'session:end': 'sessionId',
       'session:leave': 'sessionId',
       'device:boot': 'payload requestId sessionId',
+      'device:lease': 'payload requestId',
       'device:shutdown': 'payload requestId? sessionId',
       'app:install': 'buildId requestId sessionId',
       'app:launch': 'buildId requestId sessionId',
@@ -372,7 +384,11 @@ describe('browser-inbound routing matches the protocol union', () => {
       'ui:tree:request': 'requestId sessionId',
     },
     RelayToBrowser: {
-      'agents:listed': 'sessions',
+      'agents:listed': 'features? sessions',
+      // L2: a person's boot held behind another on the same Mac. Strictly correlated — no unsolicited producer.
+      'device:boot-waiting': 'reason? requestId sessionId until',
+      'device:leased': 'deviceId deviceName platform requestId sessionId source',
+      'device:lease-refused': 'message reason requestId retryable',
       // `watchUrl` only for a holder that declared an AI client kind, and absent from an older relay.
       'session:joined': 'capabilities sessionId watchUrl?',
       'session:terminated': 'reason sessionId',

@@ -27,6 +27,15 @@ const ELEMENTS: UIElement[] = [
     enabled: true,
     rawRole: 'android.widget.Button',
   },
+  // A field's placeholder has to survive the relay's inbound schema, which drops keys it does not list.
+  {
+    role: 'input',
+    label: '',
+    placeholder: 'Email',
+    frame: { x: 0.1, y: 0.2, width: 0.8, height: 0.05 },
+    enabled: true,
+    rawRole: 'TextField',
+  },
 ]
 
 

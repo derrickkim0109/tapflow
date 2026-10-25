@@ -48,6 +48,11 @@
  * - whole categories: contacts and calendars, Spotlight and Settings search, and web services
  *   including universal links (swcd).
  *
+ * `com.apple.financed` is in simslim's list and not here: Wallet's `passd` needs it, and with it off `passd` crashed
+ * at start-up (`swift_unexpectedError` in `dispatch_once`) in 3 of 7 lean boots on iOS 26.5 against none of 3 with it
+ * on and none of 2 stock. Suggestive rather than settled — the samples are small — but keeping one daemon costs
+ * little next to a Wallet or StoreKit test failing for a reason nobody can see.
+ *
  * `com.apple.siri.context.service` is in simslim's list and not here: it is not a launchd daemon,
  * so the override store cannot stop it — measured still running with its override set.
  *
@@ -93,7 +98,6 @@ export const LEAN_LABELS: readonly string[] = [
   'com.apple.familycircled',
   'com.apple.familynotification',
   'com.apple.feedbackd',
-  'com.apple.financed',
   'com.apple.findmy.findmylocated',
   'com.apple.finhealthd',
   'com.apple.fitcore',

@@ -32,8 +32,60 @@ function fakeClient(calls: string[]): TapflowClient {
     reconnectIfRotated: vi.fn(async () => {}),
     releasedByReconnect: vi.fn(() => undefined),
     activity: vi.fn(),
+    lookupBuild: vi.fn(async () => ({ kind: 'unknown', reason: 'no token' })),
   } as unknown as TapflowClient
 }
+
+describe('run_flow — runs only a flow for the build\'s app', () => {
+  const runFlowHandler = (client: TapflowClient) => captureTools(client).get('run_flow') as Handler
+  const text = (res: ToolResult) => (res.content[0] as { text: string }).text
+  const flow = 'appId: com.a\nsteps:\n  - clearState\n'
+
+  it('refuses a flow for another app without installing or touching the device', async () => {
+    const calls: string[] = []
+    const client = fakeClient(calls)
+    vi.mocked(client.lookupBuild).mockResolvedValue({ kind: 'found', bundleId: 'com.a.debug' })
+    const res = await runFlowHandler(client)({ sessionId: 's1', flow, buildId: 5 })
+    expect(res.isError).toBe(true)
+    expect(text(res)).toContain('flow is for com.a, build 5 is com.a.debug')
+    expect(calls).toEqual([])
+  })
+
+  it('runs a flow whose appId matches the build', async () => {
+    const calls: string[] = []
+    const client = fakeClient(calls)
+    vi.mocked(client.lookupBuild).mockResolvedValue({ kind: 'found', bundleId: 'com.a' })
+    const res = await runFlowHandler(client)({ sessionId: 's1', flow, buildId: 5 })
+    expect(res.isError).toBeFalsy()
+    expect(calls).toEqual(['install', 'clearState'])
+  })
+
+  it('says a build the relay does not have is not found', async () => {
+    const calls: string[] = []
+    const client = fakeClient(calls)
+    vi.mocked(client.lookupBuild).mockResolvedValue({ kind: 'not-found' })
+    const res = await runFlowHandler(client)({ sessionId: 's1', flow, buildId: 5 })
+    expect(res.isError).toBe(true)
+    expect(text(res)).toContain('build 5 not found')
+    expect(calls).toEqual([])
+  })
+
+  // MCP reaches the device on loopback with no token; the build route needs one. That must not stop a run.
+  it('runs the flow and says the app check was left out when the build cannot be looked up', async () => {
+    const calls: string[] = []
+    const client = fakeClient(calls)
+    const res = await runFlowHandler(client)({ sessionId: 's1', flow, buildId: 5 })
+    expect(res.isError).toBeFalsy()
+    expect(calls).toEqual(['install', 'clearState'])
+    expect(JSON.parse(text(res))).toMatchObject({ status: 'passed', appCheckSkipped: 'no token' })
+  })
+
+  it('does not look the build up without a buildId', async () => {
+    const client = fakeClient([])
+    await runFlowHandler(client)({ sessionId: 's1', flow })
+    expect(client.lookupBuild).not.toHaveBeenCalled()
+  })
+})
 
 // A2: whoever watches the session sees each step as it starts, named without anything it types.
 describe('run_flow — tells watchers each step', () => {

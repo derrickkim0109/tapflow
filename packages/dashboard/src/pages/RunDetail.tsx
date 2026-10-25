@@ -10,10 +10,10 @@ import { TechLabel } from '@/components/ui/tech-label'
 import { useBreadcrumb } from '@/hooks/useBreadcrumb'
 import { getRun, queryKeys, runScreenshotUrl } from '@/lib/queries'
 import {
-  UNREPORTED_FLOW_LABEL, failureBadge, formatAgo, formatDuration, runBuildLabel,
+  SKIP_REASON_LABEL, UNREPORTED_FLOW_LABEL, failureBadge, formatAgo, formatDuration, runBuildLabel,
   pollWhileRunning, runDuration, runOutcomeText, runSourceLabel, shortCommit,
 } from '@/lib/runs'
-import type { RunDetail as Run, RunFlow, RunStep } from '@/lib/types'
+import type { RunDetail as Run, RunDevice, RunFlow, RunStep, ServiceTier } from '@/lib/types'
 import { RunVideo } from '@/components/runs/RunVideo'
 
 /**
@@ -62,6 +62,10 @@ export function RunDetail() {
 function RunBody({ run }: { run: Run }) {
   const outcome = runOutcomeText(run)
   const badge = failureBadge(run.status, run.failureKind)
+  // A run on several devices says each one's reset and watch link in a list of its own, as a CI page lists its jobs;
+  // one device keeps them in the header, where a run has always said them.
+  const devices = run.deviceReset?.devices ?? []
+  const several = devices.length > 1
   return (
     <>
       {/* Grouped by what each part answers: which run and how it ended, where it came from, why, what to do. */}
@@ -74,6 +78,11 @@ function RunBody({ run }: { run: Run }) {
           <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground">
             <span>{runSourceLabel(run)}</span>
             {run.ci?.commit && <TechLabel>{shortCommit(run.ci.commit)}</TechLabel>}
+            {/* A flow failing under slim for want of a service is not the app's regression: say what it ran on. */}
+            {run.serviceTier && <span>Services <TechLabel>{serviceTierLabel(run.serviceTier)}</TechLabel></span>}
+            {/* A run on a device that kept an earlier run's state is not the run it claims to be. */}
+            {/* A run that never reached a device has nothing to say about it. */}
+            {!several && run.deviceReset?.booted && <span>Device <TechLabel>{deviceResetLabel(run.deviceReset)}</TechLabel></span>}
             <span>Started {formatAgo(run.createdAt)}</span>
             <span>{run.finishedAt ? 'Took' : 'Running for'} <TechLabel>{runDuration(run)}</TechLabel></span>
             {run.exitCode !== null && <span>Exit code <TechLabel>{run.exitCode}</TechLabel></span>}
@@ -82,7 +91,7 @@ function RunBody({ run }: { run: Run }) {
         {/* Announced: on a running run this is where the outcome appears when the poll brings it. */}
         <p role="status" className="text-sm">{outcome ?? (run.status === 'running' ? 'Running. This page follows the run.' : '')}</p>
         <div className="flex flex-wrap gap-2">
-          {run.watchSessionId && (
+          {!several && run.watchSessionId && (
             <Button asChild size="sm">
               <Link to={`/automation/sessions/${encodeURIComponent(run.watchSessionId)}`}>
                 <Eye className="mr-1.5 h-3.5 w-3.5" aria-hidden />Watch the device
@@ -104,10 +113,42 @@ function RunBody({ run }: { run: Run }) {
         </div>
       </div>
 
+      {several && <RunDevices run={run} devices={devices} />}
+
       <ol className="flex flex-col gap-3" aria-label="Flows">
         {run.flows.map((flow) => <FlowItem key={flow.idx} runId={run.id} flow={flow} />)}
       </ol>
     </>
+  )
+}
+
+/** Each device of a parallel run: what was reset on it, the flow it is on now, and a link to watch it while it runs. */
+function RunDevices({ run, devices }: { run: Run; devices: RunDevice[] }) {
+  const watchable = new Set(run.watchSessionIds ?? [])
+  return (
+    <ul className="flex flex-col divide-y rounded-md border bg-card" aria-label="Devices">
+      {devices.map((d, i) => {
+        // Numbered when the runner named nothing, so two such devices are not two links read as the same "Watch Device".
+        const name = d.deviceName ?? d.deviceId ?? `Device ${i + 1}`
+        const on = run.flows.find((f) => f.status === 'running' && f.device?.sessionId === d.sessionId)
+        return (
+          <li key={d.sessionId} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 text-sm">
+            <span className="font-medium">{name}</span>
+            <TechLabel className="text-muted-foreground">
+              {deviceResetLabel({ requested: run.deviceReset?.requested ?? false, cold: d.cold, report: d.report })}
+            </TechLabel>
+            {on && <span className="text-muted-foreground">Running {on.name}</span>}
+            {watchable.has(d.sessionId) && (
+              <Button asChild size="sm" variant="outline" className="ml-auto h-7">
+                <Link to={`/automation/sessions/${encodeURIComponent(d.sessionId)}`} aria-label={`Watch ${name}`}>
+                  <Eye className="mr-1.5 h-3.5 w-3.5" aria-hidden />Watch
+                </Link>
+              </Button>
+            )}
+          </li>
+        )
+      })}
+    </ul>
   )
 }
 
@@ -126,18 +167,23 @@ function FlowItem({ runId, flow }: { runId: string; flow: RunFlow }) {
       <div className="flex flex-col gap-1">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium">{flow.name}</span>
-          {isReported(flow) ? (
+          {flow.status === 'skipped' ? (
+            <Badge tone="backlog" className="text-xs">{SKIP_REASON_LABEL[flow.skipReason] ?? 'Skipped'}</Badge>
+          ) : isReported(flow) ? (
             <>
               <Badge tone={badge?.tone} className="text-xs">{badge?.label}</Badge>
               <TechLabel className="text-muted-foreground">{formatDuration(flow.durationMs)}</TechLabel>
               {flow.device?.name && <span className="text-xs text-muted-foreground">{flow.device.name}</span>}
             </>
           ) : (
-            <Badge tone={flow.status === 'running' ? 'progress' : 'backlog'} className="text-xs">{UNREPORTED_FLOW_LABEL[flow.status]}</Badge>
+            <Badge tone={flow.status === 'running' ? 'progress' : 'backlog'} className="text-xs">
+              {flow.status === 'running' && flow.device?.name ? `Running on ${flow.device.name}` : UNREPORTED_FLOW_LABEL[flow.status]}
+            </Badge>
           )}
         </div>
         {flow.file && <TechLabel className="block text-muted-foreground">{flow.file}</TechLabel>}
       </div>
+      {flow.status === 'skipped' && flow.failureMessage && <p className="text-sm text-muted-foreground">{flow.failureMessage}</p>}
       {isReported(flow) && flow.status === 'failed' && (
         <>
           {flow.failureMessage && <p className="text-sm text-destructive">{flow.failureMessage}</p>}
@@ -220,4 +266,20 @@ function LastScreen({ runId, flow }: { runId: string; flow: ReportedFlow }) {
       />
     </a>
   )
+}
+
+/** `reset`, `reset except location`, `reset failed: keychain`, `nothing reset`, `reset not confirmed` or `not reset`, then `, already running`
+ *  for a device the run found up. */
+function deviceResetLabel(reset: Pick<NonNullable<Run['deviceReset']>, 'requested' | 'cold' | 'report'>): string {
+  const failed = reset.report?.failed ?? []
+  const state = !reset.requested ? 'not reset'
+    : !reset.report ? 'reset not confirmed'
+    : reset.report.done.length === 0 ? (failed.length > 0 ? `reset failed: ${failed.join(', ')}` : 'nothing reset')
+    : failed.length > 0 ? `reset except ${failed.join(', ')}` : 'reset'
+  return reset.cold === false ? `${state}, already running` : state
+}
+
+/** `slim`, or `slim, keeping push, photos`. */
+function serviceTierLabel(tier: ServiceTier): string {
+  return tier.keep.length > 0 ? `${tier.name}, keeping ${tier.keep.join(', ')}` : tier.name
 }

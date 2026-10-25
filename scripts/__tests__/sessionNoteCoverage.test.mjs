@@ -60,6 +60,10 @@ const root = join(import.meta.dirname, '../..')
  */
 const SELF_DESCRIBING = new Set([
   'SessionEndedError', 'SessionLeftError', 'SessionJoinError', 'TransientQueryError', 'RelayHttpError',
+  // The relay's boot gate refused the boot because the Mac is busy; nothing about the session is the cause.
+  'AdmissionRefusedError',
+  // A lease refused before any session was chosen: there is no session whose record could explain it.
+  'LeaseRefusedError',
 ])
 
 /** What counts as reaching the cause. `failed()` appends the note; the other two *are* the record. */

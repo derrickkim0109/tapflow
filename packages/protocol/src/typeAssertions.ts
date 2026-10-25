@@ -12,7 +12,7 @@ import type {
   AppInstallToRelay, AppLaunchDone, AppLaunchError, AppLaunchToAgent, AppLaunchToRelay, BrowserInbound,
   BrowserToRelay, ClipboardData, ClipboardError, ClipboardRead, ClipboardWrite, ClipboardWriteDone,
   NetworkError, NetworkSet, NetworkState, NetworkStatePayload,
-  DeviceBoot, DeviceBootError, DeviceBooting, DeviceReady, DeviceShutdown, DeviceShutdownDone,
+  DeviceBoot, DeviceBootError, DeviceBootWaiting, DeviceBooting, DeviceLease, DeviceLeased, DeviceLeaseRefused, DeviceReady, DeviceShutdown, DeviceShutdownDone,
   DeviceShutdownError, GenericError,
   InputButton, InputDone, InputError, InputKey, InputKeyboardToggle, InputPinchEnd, InputPinchMove,
   InputPinchStart, InputRotate, InputTouchEnd, InputTouchMove, InputTouchStart, InputType, InputTypeDone,
@@ -165,6 +165,10 @@ export const _ClipboardRead: ClipboardRead['type'] = 'clipboard:read'
 export const _ClipboardWrite: ClipboardWrite['type'] = 'clipboard:write'
 export const _ClipboardWriteDone: ClipboardWriteDone['type'] = 'clipboard:write-done'
 export const _DeviceBoot: DeviceBoot['type'] = 'device:boot'
+export const _DeviceBootWaiting: DeviceBootWaiting['type'] = 'device:boot-waiting'
+export const _DeviceLease: DeviceLease['type'] = 'device:lease'
+export const _DeviceLeased: DeviceLeased['type'] = 'device:leased'
+export const _DeviceLeaseRefused: DeviceLeaseRefused['type'] = 'device:lease-refused'
 export const _DeviceBootError: DeviceBootError['type'] = 'device:boot-error'
 export const _DeviceBooting: DeviceBooting['type'] = 'device:booting'
 export const _DeviceReady: DeviceReady['type'] = 'device:ready'

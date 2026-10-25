@@ -78,6 +78,14 @@ describe('suggestSelectors', () => {
     expect(suggestSelectors(tree, { text: 'Pay nw', timeoutMs: 20_000 })[0]!.yaml).toBe('tapOn: { label: "Pay now", timeout: 20 }')
   })
 
+  it('offers a placeholder-only field by its placeholder', () => {
+    const nickname = el('', { role: 'input', placeholder: 'Nickname' })
+    const tree = [el('Help'), nickname]
+    const out = suggestSelectors(tree, { text: 'Nicknam' })
+    expect(out.map((s) => s.yaml)).toEqual(['tapOn: "Nickname"'])
+    expect(resolvesTo(tree, out[0]!.yaml)).toEqual([nickname])
+  })
+
   it('suggests nothing when nothing on screen is close', () => {
     expect(suggestSelectors([el('Settings'), el('Profile')], { text: 'Checkout' })).toEqual([])
   })

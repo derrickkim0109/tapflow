@@ -71,6 +71,46 @@ describe('parseUiAutomatorDump', () => {
     expect(els[1].role).toBe('other')
   })
 
+  it('keeps a node that has an id even when it is neither clickable nor labelled', () => {
+    // As a Compose app dumped them (Android 14): a Slider, and the selected item of a navigation bar, which
+    // reports `selected` and drops `clickable`.
+    const xml = wrap(
+      [
+        `<node ${attrs({ class: 'android.widget.SeekBar', 'resource-id': 'form.volume', focusable: 'true', bounds: '[27,1089][1053,1205]' })} />`,
+        `<node ${attrs({ class: 'android.view.View', 'resource-id': 'tab.form', selected: 'true', focusable: 'true', bounds: '[0,2127][255,2337]' })} />`,
+        `<node ${attrs({ class: 'android.widget.LinearLayout', bounds: '[0,0][1080,2400]' })} />`,
+        // The window's decor carries ids too, and is left out.
+        `<node ${attrs({ class: 'android.widget.FrameLayout', 'resource-id': 'android:id/content', bounds: '[0,0][1080,2337]' })} />`,
+        `<node ${attrs({ class: 'android.view.View', 'resource-id': 'android:id/navigationBarBackground', bounds: '[0,2337][1080,2400]' })} />`,
+        // A framework id that names a real target is kept.
+        `<node ${attrs({ class: 'android.widget.ProgressBar', 'resource-id': 'android:id/progress', bounds: '[500,1000][580,1080]' })} />`,
+      ].join('\n'),
+    )
+    const els = parseUiAutomatorDump(xml)
+    expect(els.map((e) => [e.identifier, e.role])).toEqual([
+      ['form.volume', 'slider'], ['tab.form', 'other'], ['android:id/progress', 'other'],
+    ])
+  })
+
+  it('never lets a frame reach past the screen by rounding', () => {
+    // Flush with the bottom edge at the bounds an Android 14 emulator's navigation bar had: rounding y and height
+    // apart gave y + height = 1.0001 and the whole tree was refused. Any clickable bottom bar reached it.
+    const xml = wrap(`<node ${attrs({ class: 'android.widget.Button', text: 'Bottom bar', clickable: 'true', bounds: '[0,2337][1080,2400]' })} />`)
+    const [el] = parseUiAutomatorDump(xml)
+    expect(el.frame.y + el.frame.height).toBeLessThanOrEqual(1)
+    let seed = 7
+    const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 }
+    const rows = Array.from({ length: 400 }, () => {
+      const x1 = Math.floor(rnd() * 1079), y1 = Math.floor(rnd() * 2399)
+      const x2 = x1 + 1 + Math.floor(rnd() * (1080 - x1)), y2 = y1 + 1 + Math.floor(rnd() * (2400 - y1))
+      return `<node ${attrs({ class: 'android.widget.Button', text: 'b', clickable: 'true', bounds: `[${x1},${y1}][${x2},${y2}]` })} />`
+    })
+    for (const e of parseUiAutomatorDump(wrap(rows.join('\n')))) {
+      expect(e.frame.x + e.frame.width).toBeLessThanOrEqual(1)
+      expect(e.frame.y + e.frame.height).toBeLessThanOrEqual(1)
+    }
+  })
+
   it('maps the closed role vocabulary from widget classes', () => {
     const cases: Array<[string, string]> = [
       ['android.widget.EditText', 'input'],
@@ -113,8 +153,10 @@ describe('parseUiAutomatorDump', () => {
     )
     const els = parseUiAutomatorDump(xml)
     expect(els.map((e) => e.label)).toEqual(['Top', 'Bottom'])
-    expect(els[0].frame).toEqual({ x: 0, y: 0, width: 1, height: round(100 / 2400) })
-    expect(els[1].frame).toEqual({ x: 0, y: round(2300 / 2400), width: 1, height: round(100 / 2400) })
+    // The far edge is rounded down (see "never lets a frame reach past the screen"), so a height that rounds up
+    // on its own comes out a step lower: 100/2400 is 0.0417 rounded, 0.0416 as the parser writes it.
+    expect(els[0].frame).toEqual({ x: 0, y: 0, width: 1, height: 0.0416 })
+    expect(els[1].frame).toEqual({ x: 0, y: round(2300 / 2400), width: 1, height: 0.0417 })
   })
 
   it('falls back to content-desc when text is empty and omits empty identifiers', () => {

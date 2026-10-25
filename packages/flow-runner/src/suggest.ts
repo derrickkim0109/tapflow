@@ -64,13 +64,19 @@ function firstVerifiedForm(tree: UIElement[], target: UIElement, sel: Selector):
   const byLabel: Form[] = named
     ? [...(timeout === undefined ? [{ text: target.label }] : []), { label: target.label }, { label: target.label, role: target.role }]
     : []
+  // A placeholder is offered where an input's label is not: the label can be what was typed into the field,
+  // the placeholder never is. Bare text only, so it resolves through the same placeholder fallback.
+  const placeholder = target.placeholder && target.placeholder.length <= MAX_NAME ? target.placeholder : undefined
+  const byPlaceholder: Form[] = placeholder && timeout === undefined ? [{ text: placeholder }] : []
   const byId: Form[] = id ? [{ id }, { id, role: target.role }] : []
   const byIndex: Form[] = [
     ...(named ? [indexed(tree, target, { label: target.label, role: target.role })] : []),
     ...(id ? [indexed(tree, target, { id, role: target.role })] : []),
   ].filter((f): f is Form => f !== null)
 
-  const order = sel.id !== undefined ? [...byId, ...byLabel, ...byIndex] : [...byLabel, ...byId, ...byIndex]
+  const order = sel.id !== undefined
+    ? [...byId, ...byLabel, ...byPlaceholder, ...byIndex]
+    : [...byLabel, ...byId, ...byPlaceholder, ...byIndex]
   for (const form of order) {
     const yaml = emit(form, timeout)
     if (resolvesTo(tree, yaml) === target) return yaml
@@ -116,7 +122,9 @@ function onScreen(e: UIElement): boolean {
 
 function scoreElement(e: UIElement, wanted: { text?: string; id?: string; label?: string }): number {
   const scores: number[] = []
-  if (wanted.text !== undefined) scores.push(similarity(wanted.text, e.label), similarity(wanted.text, e.identifier ?? ''))
+  if (wanted.text !== undefined) {
+    scores.push(similarity(wanted.text, e.label), similarity(wanted.text, e.identifier ?? ''), similarity(wanted.text, e.placeholder ?? ''))
+  }
   if (wanted.label !== undefined) scores.push(similarity(wanted.label, e.label))
   if (wanted.id !== undefined) scores.push(similarity(wanted.id, e.identifier ?? ''))
   return Math.max(0, ...scores)

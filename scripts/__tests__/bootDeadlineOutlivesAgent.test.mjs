@@ -55,7 +55,9 @@ const DEADLINES = [
     what: 'flow-runner bootDevice',
     file: 'packages/flow-runner/src/RelayClient.ts',
     pattern: /BOOT_DEADLINE_MS = ([\d_]+)/,
-    usedBy: /'device:boot-error'[\s\S]{0,240}?\n\s+BOOT_DEADLINE_MS,/,
+    // Two waiters share one predicate (`bootDevice` and `lease`), so every waiter on it is read, not the first:
+    // each capture is the deadline that waiter passes.
+    usedBy: /waitFor\(this\.bootAnswers\([^)]*\), ([^,]+),/g,
   },
 ]
 
@@ -91,10 +93,14 @@ describe('a relay client outlives the agent boot it is waiting on', () => {
     // relationship they describe is broken. `contributing/test-and-guard-coverage.md` calls this aiming the
     // mutation at the path that already worked.
     for (const d of DEADLINES) {
-      expect(
-        read(d.file),
-        `${d.what}: the boot waiter does not pass BOOT_DEADLINE_MS — a literal there defeats this check`,
-      ).toMatch(d.usedBy)
+      const message = `${d.what}: the boot waiter does not pass BOOT_DEADLINE_MS — a literal there defeats this check`
+      if (!d.usedBy.global) {
+        expect(read(d.file), message).toMatch(d.usedBy)
+        continue
+      }
+      const passed = [...read(d.file).matchAll(d.usedBy)].map((m) => m[1])
+      expect(passed.length, `${d.what}: no boot waiter found`).toBeGreaterThan(0)
+      for (const arg of passed) expect(arg, message).toBe('BOOT_DEADLINE_MS')
     }
   })
 
@@ -108,6 +114,24 @@ describe('a relay client outlives the agent boot it is waiting on', () => {
           `stages that have no ceiling (list, shutdown, erase, boot, open stream). Raise it, or lower the poll.`,
       ).toBeGreaterThanOrEqual(MIN_MARGIN_MS)
     }
+  })
+
+  // A boot from `flow run` can carry a run reset, which the agent carries out before `device:ready`: its budget, the one
+  // step that may be in flight when it runs out, and Android's wait for a `pm clear` that step timed out on (one more
+  // step's time) come after the poll. Only flow-runner sends one; MCP never does.
+  it('the client that asks for a run reset also clears the reset it asked for', () => {
+    const budget = valueOf({ file: 'packages/agent-core/src/utils/runReset.ts', pattern: /RUN_RESET_BUDGET_MS = ([\d_]+)/ })
+    const steps = [
+      valueOf({ file: 'packages/ios-agent/src/SimctlWrapper.ts', pattern: /RESET_CMD_TIMEOUT_MS = ([\d_]+)/ }),
+      valueOf({ file: 'packages/android-agent/src/AndroidAgent.ts', pattern: /RUN_RESET_CMD_TIMEOUT_MS = ([\d_]+)/ }),
+    ]
+    for (const v of [budget, ...steps]) expect(v).toBeGreaterThan(0)
+    const ceiling = Math.max(...CEILINGS.map(valueOf)) + budget + 2 * Math.max(...steps)
+    const deadline = valueOf(DEADLINES.find((d) => d.what === 'flow-runner bootDevice'))
+    expect(
+      deadline - ceiling,
+      `flow-runner bootDevice is ${deadline}ms against ${ceiling}ms of poll, reset budget and two reset steps`,
+    ).toBeGreaterThanOrEqual(MIN_MARGIN_MS)
   })
 
   it('the rule rejects the state that motivated it, not just states far from it', () => {

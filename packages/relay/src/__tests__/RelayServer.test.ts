@@ -1379,6 +1379,91 @@ describe('RelayServer', () => {
       browser.close()
     })
 
+    async function setupBootedSession(p: number) {
+      const { agent, sessionId } = await setupAgentWithSession(p)
+      const first = new WebSocket(`ws://localhost:${p}`)
+      await waitForOpen(first)
+      first.send(JSON.stringify({ type: 'session:start', sessionId }))
+      expect((await waitForMessage(first)).type).toBe('session:joined')
+      agent.send(JSON.stringify({ type: 'device:ready', sessionId }))
+      await waitForType(first, 'device:ready')
+      return { agent, sessionId, first }
+    }
+
+    async function rejoin(p: number, sessionId: string, clientKind?: string) {
+      const ws = new WebSocket(`ws://localhost:${p}`)
+      await waitForOpen(ws)
+      ws.send(JSON.stringify({ type: 'session:start', sessionId, ...(clientKind ? { clientKind } : {}) }))
+      return { ws, msg: await waitForMessage(ws) }
+    }
+
+    const memFull = { cpuPercent: 30, memUsedMB: 15500, memTotalMB: 16000, slotsAvailable: 0, slotsTotal: 4 }
+
+    it('lets the holder back in over the memory threshold after its socket drops, once the device is up', async () => {
+      // The dashboard re-sends session:start on reconnect, and the close cleared the owner: refusing here lost
+      // a tester the device they were using.
+      const { agent, sessionId, first } = await setupBootedSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { ...memFull, reportedAt: Date.now() } }))
+      first.close()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws, msg } = await rejoin(port, sessionId, 'dashboard')
+      expect(msg.type).toBe('session:joined')
+
+      agent.close()
+      ws.close()
+    })
+
+    it('still rejects an AI client over the memory threshold on a device that is up', async () => {
+      // Its boot warms the UI-tree runner, which costs memory on a device already running.
+      const { agent, sessionId, first } = await setupBootedSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { ...memFull, reportedAt: Date.now() } }))
+      first.close()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws, msg } = await rejoin(port, sessionId, 'flow-runner')
+      expect(msg.type).toBe('error')
+      expect(msg.message).toBe('Agent resources exhausted')
+
+      agent.close()
+      ws.close()
+    })
+
+    it('still rejects over the memory threshold when the device reports booted but this relay never brought it up', async () => {
+      // A simulator booted before the agent registered (#440), or one that died outside tapflow, says `booted`
+      // with nothing streaming; the viewer's next device:boot would be a full boot.
+      const devices = [{ id: 'devA', name: 'iPhone A', platform: 'ios', status: 'booted' }]
+      const agent = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(agent)
+      agent.send(JSON.stringify({ type: 'agent:register', platform: 'ios', agentName: 'RelayServer-30d', devices }))
+      const { registeredSessions } = await waitForMessage<AgentRegistered>(agent)
+      const sessionId = registeredSessions[0]!.sessionId
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { ...memFull, reportedAt: Date.now() } }))
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws, msg } = await rejoin(port, sessionId)
+      expect(msg.type).toBe('error')
+      expect(msg.message).toBe('Agent resources exhausted')
+
+      agent.close()
+      ws.close()
+    })
+
+    it('still rejects a rejoin to a device that is up when CPU exceeds threshold', async () => {
+      // A join starts a stream, and a stream's encoding is the load the gate exists for (#107).
+      const { agent, sessionId, first } = await setupBootedSession(port)
+      agent.send(JSON.stringify({ type: 'agent:resources', resources: { cpuPercent: 95, memUsedMB: 4000, memTotalMB: 16000, slotsAvailable: 0, slotsTotal: 4, reportedAt: Date.now() } }))
+      first.close()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws, msg } = await rejoin(port, sessionId)
+      expect(msg.type).toBe('error')
+      expect(msg.message).toBe('Agent resources exhausted')
+
+      agent.close()
+      ws.close()
+    })
+
     it('allows session:start (fail-open) when no resource data reported yet', async () => {
       const { agent, sessionId } = await setupAgentWithSession(port)
 

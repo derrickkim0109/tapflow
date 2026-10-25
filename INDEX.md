@@ -24,7 +24,7 @@ Common rules are in the root [AGENTS.md](./AGENTS.md).
 | dashboard | [packages/dashboard/AGENTS.md](./packages/dashboard/AGENTS.md) | Vite + React SPA UI rules |
 | cli | [packages/cli/AGENTS.md](./packages/cli/AGENTS.md) | CLI UX rules |
 | mcp-server | [packages/mcp-server/AGENTS.md](./packages/mcp-server/AGENTS.md) | MCP server bridging tapflow to LLM agents |
-| flow-runner | [packages/flow-runner/AGENTS.md](./packages/flow-runner/AGENTS.md) | Deterministic YAML flow engine (automated QA axis) |
+| flow-runner | [packages/flow-runner/AGENTS.md](./packages/flow-runner/AGENTS.md) | Deterministic YAML flow engine (Automation) |
 | test-utils | [packages/test-utils/AGENTS.md](./packages/test-utils/AGENTS.md) | Test-only helpers shared across packages (private, never published) |
 
 ## Local Only
@@ -77,6 +77,7 @@ Committed *why* behind non-obvious decisions. Read the relevant one **before** c
 | [android-video-streaming-diagnosis.md](./contributing/android-video-streaming-diagnosis.md) | diagnosis | Android emulator streaming issues traced to root cause, one section per issue |
 | [awdl-wifi-latency-diagnosis.md](./contributing/awdl-wifi-latency-diagnosis.md) | diagnosis | Periodic Wi-Fi stream hitch traced to AWDL via ICMP ping — method and evidence |
 | [macos-settings-deep-link-diagnosis.md](./contributing/macos-settings-deep-link-diagnosis.md) | diagnosis | Which `x-apple.systempreferences:` URL opens the Network Extensions **approval sheet** on macOS 27 — the three that do not, why `open`'s exit code proves nothing, and why an already-open window invalidates the reading |
+| [simulator-boot-contention.md](./contributing/simulator-boot-contention.md) | diagnosis | What a simulator boot does to other sessions on the same Mac — the harm is the boot, not a memory percentage; priority demotion stalls the boot; fewer services at boot shrinks it |
 | [workshop-lab-fork-observations.md](./contributing/workshop-lab-fork-observations.md) | reference | Third-party workshop-lab fork: independent iOS-sim capacity data (~4 seats/32GB) + where our extension seams stop |
 | [adversarial-review.md](./contributing/adversarial-review.md) | rules | How to run the pre-PR review and the cross-cutting design pass — channel design, prompt skeleton, why a cleared list ages with the diff, why a fix falsifies the prose beside it, why the same review costs 4 minutes or 106 |
 | [test-and-guard-coverage.md](./contributing/test-and-guard-coverage.md) | rules | What a test or a static check must **execute** to hold its claim — absence assertions verified only by the mutation that creates the absence, four ways a guard gets bypassed, why the success path gets the first mutation, and the three ways a probe passes for the wrong reason — including the one no mutation can find |

@@ -112,6 +112,12 @@ function loadController(): EmulatorControllerCtor {
 export class EmulatorGrpcClient {
   private readonly raw: RawEmulatorController
   private closed = false
+  // Every touch call waits for the one before it to settle. Each `sendTouch` is its own unary call, and the
+  // emulator does not take concurrent calls in the order they were sent: measured on Android 14, a tap's up
+  // overtook its down while the emulator was busy right after an install — the kernel dropped the up (the
+  // touch was already up), then applied the down, and the touch stayed pressed until the next one. iOS
+  // writes its frames down one pipe and cannot reorder; this is that, for gRPC.
+  private touchQueue: Promise<void> = Promise.resolve()
 
   /** `raw` is injectable so tests can drive it without a live emulator. */
   constructor(addr: string, raw?: RawEmulatorController) {
@@ -196,13 +202,20 @@ export class EmulatorGrpcClient {
   // --- input (coords are display-resolution px, top-left origin; pressure 0 = up) ---
 
   private touch(touches: TouchMsg[], display = 0): Promise<void> {
-    return new Promise((resolve, reject) => {
+    // The deadline starts when the call is sent, not when it was queued. A failed call still lets the next one
+    // go — the queue only ever holds settled-and-swallowed promises — because holding an up back behind a
+    // failed down would leave the touch pressed, the defect this queue fixes. So the order holds for calls the
+    // emulator answered; one our deadline abandoned may still be applied after the next (AGENTS.md).
+    const send = (): Promise<void> => new Promise((resolve, reject) => {
       this.raw.sendTouch(
         { touches, display },
         { deadline: Date.now() + INPUT_DEADLINE_MS },
         (err) => (err ? reject(err) : resolve()),
       )
     })
+    const call = this.touchQueue.then(send)
+    this.touchQueue = call.catch(() => {})
+    return call
   }
 
   touchDown(pointerId: number, x: number, y: number): Promise<void> {

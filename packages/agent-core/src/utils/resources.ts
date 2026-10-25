@@ -1,5 +1,12 @@
 import os from 'os'
 import { spawnSync } from 'child_process'
+import type { MemoryPressure } from '@tapflowio/protocol'
+
+// Both reads are synchronous on the agent's event loop, and fork is slowest under exactly the memory pressure they
+// report. A read that times out is no reading.
+const SPAWN_TIMEOUT_MS = 1_000
+
+const PRESSURE_LEVELS: Record<string, MemoryPressure> = { '1': 'normal', '2': 'warn', '4': 'critical' }
 
 export function createResourceSampler() {
   let lastCpuTimes: { idle: number; total: number } | null = null
@@ -26,7 +33,7 @@ export function createResourceSampler() {
   function getMemoryUsage(): { memUsedMB: number; memTotalMB: number } {
     const memTotalMB = Math.round(os.totalmem() / 1024 / 1024)
     try {
-      const { stdout, status } = spawnSync('vm_stat', [], { encoding: 'utf8' })
+      const { stdout, status } = spawnSync('vm_stat', [], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS })
       if (status !== 0 || !stdout) throw new Error('vm_stat failed')
       const lines = (stdout as string).split('\n')
       const pageSize = parseInt(lines[0]?.match(/page size of (\d+)/)?.[1] ?? '16384')
@@ -41,5 +48,14 @@ export function createResourceSampler() {
     }
   }
 
-  return { getCpuPercent, getMemoryUsage }
+  // The kernel's verdict rather than a percentage of ours: an 8 GB Mac runs near-full and compressing all the
+  // time, and only the kernel knows when that has stopped keeping up. macOS only; elsewhere there is no answer.
+  function getMemoryPressure(): MemoryPressure | undefined {
+    if (os.platform() !== 'darwin') return undefined
+    const { stdout, status } = spawnSync('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS })
+    if (status !== 0 || typeof stdout !== 'string') return undefined
+    return PRESSURE_LEVELS[stdout.trim()]
+  }
+
+  return { getCpuPercent, getMemoryUsage, getMemoryPressure }
 }

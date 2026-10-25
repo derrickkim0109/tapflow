@@ -103,6 +103,75 @@ describe('parseTreeText field-boundary edge cases', () => {
     expect(btn?.label).toBe("Don't tap")
   })
 
+  // Lines as the runner served them for the tree measurement sample apps (iOS 26.5, Xcode 26.6).
+  const sample = (...rows: string[]) => parseTreeText([
+    'Element subtree:',
+    " →Application, 0x1, pid: 1, label: 'Sample'",
+    '    Window (Main), 0x2, {{0.0, 0.0}, {402.0, 874.0}}',
+    ...rows,
+  ].join('\n'))
+
+  it('ends an identifier at a placeholder field', () => {
+    const els = sample(
+      "      TextField, 0x3, {{20.0, 120.0}, {362.0, 34.0}}, identifier: 'form.email', placeholderValue: 'Email'",
+      "      SecureTextField, 0x4, {{20.0, 170.0}, {362.0, 34.0}}, identifier: 'form.password', placeholderValue: 'Password'",
+    )
+    expect(els.map((e) => e.identifier)).toEqual(['form.email', 'form.password'])
+  })
+
+  it('ends a label at a placeholder field', () => {
+    const els = sample("      TextField, 0x3, {{20.0, 120.0}, {362.0, 34.0}}, identifier: 'q', label: 'Search', placeholderValue: 'Type here', value: abc")
+    expect(els[0]).toMatchObject({ identifier: 'q', label: 'Search' })
+  })
+
+  it('reads the label of a selected element', () => {
+    const els = sample(
+      "      Button, 0x3, {{25.0, 795.0}, {98.0, 54.0}}, identifier: 'tab.form', label: 'Form'",
+      "      Button, 0x4, {{279.0, 795.0}, {98.0, 54.0}}, identifier: 'tab.web', label: 'Web', Selected",
+    )
+    expect(els.map((e) => [e.identifier, e.label])).toEqual([['tab.form', 'Form'], ['tab.web', 'Web']])
+  })
+
+  it('reads an identifier followed only by state flags', () => {
+    const els = sample("      Button, 0x3, {{25.0, 795.0}, {98.0, 54.0}}, identifier: 'tab.web', Selected, Focused")
+    expect(els[0]?.identifier).toBe('tab.web')
+  })
+
+  it('still keeps an apostrophe inside a label that ends in a flag', () => {
+    const els = sample("      Button, 0x3, {{0.0, 0.0}, {50.0, 20.0}}, label: 'Don't tap', Selected")
+    expect(els[0]?.label).toBe("Don't tap")
+  })
+
+  it('reads a placeholder, and leaves the label empty when there is none', () => {
+    const els = sample("      TextField, 0x3, {{20.0, 120.0}, {362.0, 34.0}}, placeholderValue: 'Nickname'")
+    expect(els[0]).toMatchObject({ role: 'input', label: '', placeholder: 'Nickname' })
+    expect(els[0]?.identifier).toBeUndefined()
+  })
+
+  it('keeps a typed field\'s placeholder and ignores the value', () => {
+    // As the runner printed it for a field holding "abc" (iOS 26.5): the placeholder stays.
+    const els = sample("      TextField, 0x3, {{20.0, 122.0}, {362.0, 34.0}}, identifier: 'form.email', placeholderValue: 'Email', value: abc, Keyboard Focused")
+    expect(els[0]).toMatchObject({ identifier: 'form.email', label: '', placeholder: 'Email' })
+  })
+
+  it('reads every field of a line ending in a two-word flag', () => {
+    const els = sample(
+      "      TextField, 0x3, {{24.0, 269.0}, {226.0, 41.0}}, label: 'Web input', placeholderValue: 'Type here', value: Type here, Keyboard Focused, Focused",
+      "      TextField, 0x4, {{24.0, 320.0}, {226.0, 41.0}}, identifier: 'q', label: 'Search', Keyboard Focused",
+      "      TextField, 0x5, {{24.0, 370.0}, {226.0, 41.0}}, identifier: 'r', Keyboard Focused",
+    )
+    expect(els.map((e) => [e.identifier ?? null, e.label, e.placeholder ?? null])).toEqual([
+      [null, 'Web input', 'Type here'],
+      ['q', 'Search', null],
+      ['r', '', null],
+    ])
+  })
+
+  it('leaves no placeholder on an element without one', () => {
+    const els = sample("      Button, 0x3, {{0.0, 0.0}, {50.0, 20.0}}, identifier: 'ok', label: 'OK'")
+    expect(els[0] && 'placeholder' in els[0]).toBe(false)
+  })
+
   it('returns empty when there is no usable frame basis', () => {
     expect(parseTreeText('Element subtree:\n →Application, 0x1, pid: 1, label: \'App\'')).toEqual([])
   })

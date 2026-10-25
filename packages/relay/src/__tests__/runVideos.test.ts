@@ -17,7 +17,7 @@ const PAT_SOMEONE = 'tflw_pat_video_someone'
 const PAT_VIEW = 'tflw_pat_video_view'
 const bearer = (pat: string) => ({ Authorization: `Bearer ${pat}` })
 const adminCookie = () => ({ cookie: `tapflow_token=${signJwt({ userId: 1, email: 'admin@example.test', role: 'Admin' })}` })
-const noHolders: RunHolders = { connectedKeys: () => new Set(), heldSession: () => null }
+const noHolders: RunHolders = { connectedKeys: () => new Set(), heldSessions: () => [] }
 
 interface Index {
   meta: { formatVersion: number }

@@ -1,4 +1,6 @@
 import http from 'http'
+import { readRunResetReport, readServiceTier } from '@tapflowio/protocol/validate'
+import type { RunResetReport, ServiceTier } from '@tapflowio/protocol'
 import fs from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
@@ -40,8 +42,36 @@ const ORPHAN_GRACE_SECONDS = 60
 export interface RunHolders {
   /** The owner keys of every open socket, built once per pass so a check costs a lookup, not a scan. */
   connectedKeys(): Set<string>
-  /** The session a socket with one of these keys holds now — the one a watch link should open — or null. */
-  heldSession(keys: string[]): string | null
+  /** The sessions the sockets with these keys hold now — the ones a watch link should open. A parallel run holds one
+   *  per device. */
+  heldSessions(keys: string[]): string[]
+}
+
+/** A flow the runner said it started, on which device. */
+interface StartedFlow { sessionId: string; deviceId: string | null; deviceName: string | null }
+
+/**
+ * The flows each running run has started and not yet reported, by run id. **Memory, not the database**: which flow is
+ * on a device right now means something only while the runner's socket is open, and a relay restart drops that socket,
+ * so the run is closed as `holder-lost` within `ORPHAN_GRACE_SECONDS` anyway. A run is present from its first start
+ * report, even with nothing in flight, so the page can tell a runner that reports starts from one that predates them.
+ */
+const startedFlows = new Map<string, Map<number, StartedFlow>>()
+
+/**
+ * Drop the started flows of every run that is no longer running. The paths in this file forget a run as it ends, but a
+ * run's row can also be deleted under it — its build or app deleted, its expiry passed — by code that never calls in
+ * here; the daily purge sweeps those, whichever path took them.
+ */
+export function forgetStartedFlowsOfStoppedRuns(): void {
+  if (startedFlows.size === 0) return
+  const running = getDb().prepare(`SELECT 1 FROM flow_runs WHERE id = ? AND status = 'running'`)
+  for (const id of startedFlows.keys()) if (!running.get(id)) startedFlows.delete(id)
+}
+
+/** How many runs have started flows held in memory, for tests of when they are let go. */
+export function startedFlowRunCount(): number {
+  return startedFlows.size
 }
 
 /**
@@ -136,6 +166,8 @@ export interface RunRow {
   ci_branch: string | null
   ci_commit: string | null
   ci_job_url: string | null
+  service_tier_json: string | null
+  device_reset_json: string | null
   status: 'running' | 'passed' | 'failed' | 'aborted'
   finished_by: 'client' | 'relay' | null
   failure_kind: string | null
@@ -155,7 +187,8 @@ interface FlowRow {
   device_id: string | null
   device_name: string | null
   platform: string | null
-  status: 'passed' | 'failed'
+  status: 'passed' | 'failed' | 'skipped'
+  skip_reason: string | null
   failure_kind: string | null
   failure_message: string | null
   duration_ms: number
@@ -189,14 +222,16 @@ export function abandonRunsOf(socketKey: string, holders: RunHolders): void {
   const client = socketKey.slice(colon + 1)
   const db = getDb()
   const runs = (user === 'anon'
-    ? db.prepare(`SELECT seq, created_by, holder_client FROM flow_runs WHERE status = 'running' AND holder_client = ?`).all(client)
-    : db.prepare(`SELECT seq, created_by, holder_client FROM flow_runs WHERE status = 'running' AND holder_client = ? AND created_by = ?`).all(client, Number(user))
-  ) as { seq: number; created_by: number | null; holder_client: string }[]
+    ? db.prepare(`SELECT seq, id, created_by, holder_client FROM flow_runs WHERE status = 'running' AND holder_client = ?`).all(client)
+    : db.prepare(`SELECT seq, id, created_by, holder_client FROM flow_runs WHERE status = 'running' AND holder_client = ? AND created_by = ?`).all(client, Number(user))
+  ) as { seq: number; id: string; created_by: number | null; holder_client: string }[]
   if (runs.length === 0) return
   const open = holders.connectedKeys()
   const stmt = db.prepare(`${ABANDON} AND seq = ?`)
   for (const r of runs) {
-    if (!holderKeys(r.created_by, r.holder_client).some((k) => open.has(k))) stmt.run(r.seq)
+    if (holderKeys(r.created_by, r.holder_client).some((k) => open.has(k))) continue
+    stmt.run(r.seq)
+    startedFlows.delete(r.id)
   }
 }
 
@@ -206,14 +241,16 @@ export function abandonRunsOf(socketKey: string, holders: RunHolders): void {
  */
 export function settleOrphanedRuns(holders: RunHolders): void {
   const running = getDb().prepare(`
-    SELECT seq, created_by, holder_client FROM flow_runs
+    SELECT seq, id, created_by, holder_client FROM flow_runs
      WHERE status = 'running' AND last_activity_at < datetime('now', ?)
-  `).all(`-${ORPHAN_GRACE_SECONDS} seconds`) as { seq: number; created_by: number | null; holder_client: string }[]
+  `).all(`-${ORPHAN_GRACE_SECONDS} seconds`) as { seq: number; id: string; created_by: number | null; holder_client: string }[]
   if (running.length === 0) return
   const open = holders.connectedKeys()
   const stmt = getDb().prepare(`${ABANDON} AND seq = ?`)
   for (const r of running) {
-    if (!holderKeys(r.created_by, r.holder_client).some((k) => open.has(k))) stmt.run(r.seq)
+    if (holderKeys(r.created_by, r.holder_client).some((k) => open.has(k))) continue
+    stmt.run(r.seq)
+    startedFlows.delete(r.id)
   }
 }
 
@@ -286,11 +323,14 @@ export async function handleCreateRun(req: http.IncomingMessage, res: http.Serve
   }
 
   const ci = isObj(body.ci) ? body.ci : null
+  // Dropped rather than refused when it is not a tier, as `ci`'s fields are: recording never fails a run.
+  const serviceTier = readServiceTier(body.serviceTier)
+  const deviceReset: DeviceReset | null = typeof body.resetRequested === 'boolean' ? { requested: body.resetRequested } : null
   const id = randomUUID()
   getDb().prepare(`
     INSERT INTO flow_runs (id, build_id, holder_client, created_by, pat_id, is_ci, ci_provider, ci_branch, ci_commit,
-                           ci_job_url, flows_json, flows_total, delete_after)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN datetime('now', ?) END)
+                           ci_job_url, service_tier_json, device_reset_json, flows_json, flows_total, delete_after)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN datetime('now', ?) END)
   `).run(
     id, buildId, client,
     auth.userId, auth.patId ?? null,
@@ -299,13 +339,17 @@ export async function handleCreateRun(req: http.IncomingMessage, res: http.Serve
     ci ? str(ci.branch, MAX_NAME) : null,
     ci ? str(ci.commit, 100) : null,
     ci ? httpUrl(ci.jobUrl) : null,
+    serviceTier ? JSON.stringify(serviceTier) : null,
+    deviceReset ? JSON.stringify(deviceReset) : null,
     JSON.stringify(flows), flows.length,
     buildId, `+${BUILDLESS_TTL_DAYS} days`,
   )
   json(res, 201, { id })
 }
 
-const FLOW_STATUSES = new Set(['passed', 'failed'])
+const FLOW_STATUSES = new Set(['passed', 'failed', 'skipped'])
+/** Why the runner did not replay a flow — flow-runner's `SkipReason`. */
+const SKIP_REASONS = new Set(['app-mismatch', 'tag-filter'])
 const STEP_STATUSES = new Set(['passed', 'failed', 'skipped'])
 
 export async function handleReportFlow(
@@ -321,7 +365,15 @@ export async function handleReportFlow(
   if (!body) return
 
   if (typeof body.status !== 'string' || !FLOW_STATUSES.has(body.status)) {
-    return json(res, 400, { error: 'status must be passed or failed' })
+    return json(res, 400, { error: 'status must be passed, failed or skipped' })
+  }
+  // The reason comes with a skip and with nothing else, so a row cannot say "passed" and give a reason it was not run.
+  const skipReason = body.status === 'skipped' ? body.skipReason : undefined
+  if (body.status === 'skipped' && (typeof skipReason !== 'string' || !SKIP_REASONS.has(skipReason))) {
+    return json(res, 400, { error: 'a skipped flow needs a skipReason of app-mismatch or tag-filter' })
+  }
+  if (body.status !== 'skipped' && body.skipReason != null) {
+    return json(res, 400, { error: 'skipReason is only for a skipped flow' })
   }
   const durationMs = nonNegInt(body.durationMs)
   if (durationMs === null) return json(res, 400, { error: 'durationMs must be a non-negative integer' })
@@ -351,23 +403,29 @@ export async function handleReportFlow(
   // The run can go while the body arrives — its build purged, its app deleted — and the insert would then
   // fail its foreign key as a 500 with a stack in the log, for an answer that is just "not found".
   // `ownRun` judged the run before the body arrived; it is judged again here, where nothing can interleave.
-  const refusal = db.transaction((): 'gone' | 'finished' | null => {
+  const refusal = db.transaction((): 'gone' | 'finished' | 'ran' | null => {
     const now = db.prepare('SELECT finished_by FROM flow_runs WHERE seq = ?').get(run.seq) as { finished_by: string | null } | undefined
     if (!now) return 'gone'
     if (now.finished_by === 'client') return 'finished'
+    // A flow that ran cannot become one that was skipped: its screenshot would stay behind a row that says nothing
+    // was on screen. The runner decides skips before any flow runs, so only a confused client gets here.
+    if (body.status === 'skipped') {
+      const was = db.prepare('SELECT status FROM flow_run_flows WHERE run_seq = ? AND idx = ?').get(run.seq, idx) as { status: string } | undefined
+      if (was && was.status !== 'skipped') return 'ran'
+    }
     // An upsert that keeps the screenshot: the CLI may retry a report, and the screenshot arrives separately.
     db.prepare(`
-      INSERT INTO flow_run_flows (run_seq, idx, name, file, device_id, device_name, platform, status, failure_kind,
-                                  failure_message, duration_ms, steps_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO flow_run_flows (run_seq, idx, name, file, device_id, device_name, platform, status, skip_reason,
+                                  failure_kind, failure_message, duration_ms, steps_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (run_seq, idx) DO UPDATE SET
         device_id = excluded.device_id, device_name = excluded.device_name, platform = excluded.platform,
-        status = excluded.status, failure_kind = excluded.failure_kind, failure_message = excluded.failure_message,
-        duration_ms = excluded.duration_ms, steps_json = excluded.steps_json
+        status = excluded.status, skip_reason = excluded.skip_reason, failure_kind = excluded.failure_kind,
+        failure_message = excluded.failure_message, duration_ms = excluded.duration_ms, steps_json = excluded.steps_json
     `).run(
       run.seq, idx, planned.name, planned.file,
       str(body.deviceId, MAX_NAME), str(body.deviceName, MAX_NAME), str(body.platform, 50),
-      body.status, str(body.failureKind, 50), str(body.failureMessage, MAX_MESSAGE),
+      body.status, skipReason ?? null, body.status === 'skipped' ? null : str(body.failureKind, 50), str(body.failureMessage, MAX_MESSAGE),
       durationMs, JSON.stringify(steps),
     )
     db.prepare(`UPDATE flow_runs SET last_activity_at = datetime('now') WHERE seq = ?`).run(run.seq)
@@ -375,6 +433,41 @@ export async function handleReportFlow(
   })()
   if (refusal === 'gone') return json(res, 404, { error: 'Run not found' })
   if (refusal === 'finished') return json(res, 409, { error: 'Run already finished' })
+  if (refusal === 'ran') return json(res, 409, { error: 'This flow already ran; it cannot be reported as skipped' })
+  json(res, 200, { ok: true })
+}
+
+/**
+ * The runner started flow `idx` on a device. Without it the page could only guess the first unreported flow, which a
+ * run on several devices makes wrong: several flows run at once, and not in order. A start for a flow already
+ * reported changes nothing on the page, which reads a reported flow's row before this, so nothing here checks for one
+ * or forgets an entry when its flow reports; entries go with the run, and there are at most `flows_total`.
+ */
+export async function handleStartFlow(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: Record<string, string>,
+): Promise<void> {
+  const run = ownRun(req, res, params.id)
+  if (!run) return
+  const idx = Number(params.idx)
+  if (!Number.isInteger(idx) || idx < 0 || idx >= run.flows_total) return json(res, 404, { error: 'No such flow in this run' })
+  const body = await readJsonBody(req, res)
+  if (!body) return
+  const sessionId = str(body.sessionId, MAX_NAME)
+  if (sessionId === null) return json(res, 400, { error: 'sessionId is required' })
+  const db = getDb()
+  // Judged after the body, as the flow report is: the run may have finished or gone while it arrived.
+  const now = db.prepare('SELECT status FROM flow_runs WHERE seq = ?').get(run.seq) as { status: string } | undefined
+  if (!now) return json(res, 404, { error: 'Run not found' })
+  // A run the relay closed (`holder-lost`) still takes the runner's reports, as `ownRun` allows, but has nothing
+  // running to show; `ownRun` already refused one the runner finished itself.
+  if (now.status === 'running') {
+    let started = startedFlows.get(run.id)
+    if (!started) { started = new Map(); startedFlows.set(run.id, started) }
+    started.set(idx, { sessionId, deviceId: str(body.deviceId, MAX_NAME), deviceName: str(body.deviceName, MAX_NAME) })
+  }
+  db.prepare(`UPDATE flow_runs SET last_activity_at = datetime('now') WHERE seq = ?`).run(run.seq)
   json(res, 200, { ok: true })
 }
 
@@ -396,8 +489,11 @@ export async function handleUploadFlowScreenshot(
 ): Promise<void> {
   const run = ownRun(req, res, params.id)
   if (!run) return
-  const current = getDb().prepare('SELECT screenshot_file FROM flow_run_flows WHERE run_seq = ? AND idx = ?')
-  if (!current.get(run.seq, Number(params.idx))) return json(res, 404, { error: 'Report the flow before its screenshot' })
+  const current = getDb().prepare('SELECT screenshot_file, status FROM flow_run_flows WHERE run_seq = ? AND idx = ?')
+  const row = current.get(run.seq, Number(params.idx)) as { status: string } | undefined
+  if (!row) return json(res, 404, { error: 'Report the flow before its screenshot' })
+  // Nothing was on a screen for a flow that never ran.
+  if (row.status === 'skipped') return json(res, 409, { error: 'A skipped flow has no screenshot' })
 
   const buf = await readBodyLimited(req, MAX_SCREENSHOT_BYTES)
   if (buf === null) return json(res, 413, { error: `Screenshot larger than ${MAX_SCREENSHOT_BYTES} bytes` })
@@ -419,6 +515,72 @@ export async function handleUploadFlowScreenshot(
     return json(res, 404, { error: 'Run not found' })
   }
   if (before?.screenshot_file) unlinkSafe(path.join(screenshotsDir, before.screenshot_file), 'run screenshot')
+  json(res, 200, { ok: true })
+}
+
+/**
+ * What the run's device was reset of. `requested` is what the run asked at creation; `cold` and `report` are what its
+ * boot answered, sent right after the boot so a run that fails to install, is cancelled or loses its runner keeps it.
+ */
+interface DeviceReset {
+  requested: boolean
+  /** The boot answered and the runner said so. Absent: the run never reached a device (every flow skipped, no device,
+   *  a boot that failed or timed out), which is not the same as a reset nobody confirmed. */
+  booted?: true
+  cold?: boolean
+  report?: RunResetReport
+  /** Each device the run booted, from a runner that names its session. The fields above stay the first device's, so a
+   *  reader that knows only them reads one real device rather than a mix of several. */
+  devices?: RunDevice[]
+}
+
+interface RunDevice {
+  sessionId: string
+  deviceId?: string
+  deviceName?: string
+  cold?: boolean
+  report?: RunResetReport
+}
+
+export async function handleReportDevice(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  params: Record<string, string>,
+): Promise<void> {
+  const run = ownRun(req, res, params.id)
+  if (!run) return
+  const body = await readJsonBody(req, res)
+  if (!body) return
+  // A field that cannot be read is dropped rather than refused, as the create's are: recording never fails a run.
+  const report = readRunResetReport(body.runReset)
+  const cold = typeof body.cold === 'boolean' ? { cold: body.cold } : {}
+  const sessionId = str(body.sessionId, MAX_NAME)
+  const deviceId = str(body.deviceId, MAX_NAME)
+  const deviceName = str(body.deviceName, MAX_NAME)
+  const db = getDb()
+  // **Read inside the write, not from `run`**: that row was read before the body arrived, and the devices of a parallel
+  // run report at once, so merging into it would keep whichever report wrote last and lose the others.
+  const gone = db.transaction((): boolean => {
+    const row = db.prepare('SELECT device_reset_json FROM flow_runs WHERE seq = ?').get(run.seq) as { device_reset_json: string | null } | undefined
+    if (!row) return true
+    const before = row.device_reset_json ? JSON.parse(row.device_reset_json) as DeviceReset : null
+    const devices = [...(before?.devices ?? [])]
+    if (sessionId !== null) {
+      const device: RunDevice = {
+        sessionId, ...(deviceId !== null ? { deviceId } : {}), ...(deviceName !== null ? { deviceName } : {}), ...cold, ...(report ? { report } : {}),
+      }
+      const at = devices.findIndex((d) => d.sessionId === sessionId)
+      if (at >= 0) devices[at] = device
+      else devices.push(device)
+    }
+    const first = sessionId === null || devices[0]?.sessionId === sessionId
+    const next: DeviceReset = first
+      ? { requested: before?.requested ?? false, booted: true, ...cold, ...(report ? { report } : {}), ...(devices.length > 0 ? { devices } : {}) }
+      : { ...before!, devices }
+    db.prepare(`UPDATE flow_runs SET device_reset_json = ?, last_activity_at = datetime('now') WHERE seq = ?`).run(JSON.stringify(next), run.seq)
+    return false
+  })()
+  if (gone) return json(res, 404, { error: 'Run not found' })
   json(res, 200, { ok: true })
 }
 
@@ -454,6 +616,7 @@ export async function handleFinishRun(
       ? json(res, 409, { error: 'Run already finished' })
       : json(res, 404, { error: 'Run not found' })
   }
+  startedFlows.delete(run.id)
   json(res, 200, { ok: true })
 }
 
@@ -491,6 +654,8 @@ function runSummary(run: RunRow) {
     ci: run.is_ci === 1
       ? { provider: run.ci_provider, branch: run.ci_branch, commit: run.ci_commit, jobUrl: run.ci_job_url }
       : null,
+    serviceTier: run.service_tier_json ? JSON.parse(run.service_tier_json) as ServiceTier : null,
+    deviceReset: run.device_reset_json ? JSON.parse(run.device_reset_json) as DeviceReset : null,
     build: buildSummary(run.build_id),
     createdBy: creatorName(run.created_by),
     flowsTotal: run.flows_total,
@@ -541,12 +706,13 @@ export function handleListRuns(req: http.IncomingMessage, res: http.ServerRespon
   const sql = (conds: string[], order: 'ASC' | 'DESC') => `
     SELECT r.*,
            (SELECT COUNT(*) FROM flow_run_flows f WHERE f.run_seq = r.seq AND f.status = 'passed') AS flows_passed,
-           (SELECT COUNT(*) FROM flow_run_flows f WHERE f.run_seq = r.seq AND f.status = 'failed') AS flows_failed
+           (SELECT COUNT(*) FROM flow_run_flows f WHERE f.run_seq = r.seq AND f.status = 'failed') AS flows_failed,
+           (SELECT COUNT(*) FROM flow_run_flows f WHERE f.run_seq = r.seq AND f.status = 'skipped') AS flows_skipped
       FROM flow_runs r
      ${conds.length ? `WHERE ${conds.join(' AND ')}` : ''}
      ORDER BY r.seq ${order}
      LIMIT ?`
-  type Row = RunRow & { flows_passed: number; flows_failed: number }
+  type Row = RunRow & { flows_passed: number; flows_failed: number; flows_skipped: number }
   const db = getDb()
   const { before, after } = ids
   const page = after !== undefined
@@ -562,7 +728,7 @@ export function handleListRuns(req: http.IncomingMessage, res: http.ServerRespon
   const first = page[0]
   const last = page[page.length - 1]
   json(res, 200, {
-    items: page.map((r) => ({ ...runSummary(r), flowsPassed: r.flows_passed, flowsFailed: r.flows_failed })),
+    items: page.map((r) => ({ ...runSummary(r), flowsPassed: r.flows_passed, flowsFailed: r.flows_failed, flowsSkipped: r.flows_skipped })),
     nextCursor: last && exists('r.seq < ?', last.seq) ? String(last.seq) : null,
     prevCursor: first && exists('r.seq > ?', first.seq) ? String(first.seq) : null,
   })
@@ -587,12 +753,25 @@ export function handleGetRun(
   )
   const planned = JSON.parse(run.flows_json) as { name: string; file: string | null }[]
   const firstUnreported = planned.findIndex((_, i) => !reported.has(i))
+  if (run.status !== 'running') startedFlows.delete(run.id)
+  const started = startedFlows.get(run.id)
   const flows = planned.map((p, idx) => {
     const f = reported.get(idx)
     if (!f) {
-      // Not reported yet: the first is the one running now, the rest are waiting — unless the run is over.
-      const status = run.status !== 'running' ? 'not-run' : idx === firstUnreported ? 'running' : 'pending'
+      if (run.status !== 'running') return { idx, name: p.name, file: p.file, status: 'not-run', video: videos.get(idx) ?? null }
+      // A runner that reports starts says which flows are on a device. One that predates them leaves a guess: the
+      // first unreported flow is the one running, which holds while a run replays its flows one at a time.
+      const on = started?.get(idx)
+      if (on) {
+        const device = { id: on.deviceId, name: on.deviceName, sessionId: on.sessionId }
+        return { idx, name: p.name, file: p.file, status: 'running', device, video: videos.get(idx) ?? null }
+      }
+      const status = !started && idx === firstUnreported ? 'running' : 'pending'
       return { idx, name: p.name, file: p.file, status, video: videos.get(idx) ?? null }
+    }
+    // A skipped flow never ran, so it has no device, steps, duration or screen to report.
+    if (f.status === 'skipped') {
+      return { idx, name: f.name, file: f.file, status: f.status, skipReason: f.skip_reason, failureMessage: f.failure_message, video: videos.get(idx) ?? null }
     }
     return {
       idx, name: f.name, file: f.file, status: f.status,
@@ -606,8 +785,8 @@ export function handleGetRun(
 
   // The session to watch is the one the holder holds **now**, never a stored one: session ids outlive runs,
   // so a stored id would open whoever took the device next.
-  const watchSessionId = run.status === 'running' ? holders.heldSession(holderKeys(run.created_by, run.holder_client)) : null
-  json(res, 200, { ...runSummary(run), flows, watchSessionId })
+  const watchSessionIds = run.status === 'running' ? holders.heldSessions(holderKeys(run.created_by, run.holder_client)) : []
+  json(res, 200, { ...runSummary(run), flows, watchSessionId: watchSessionIds[0] ?? null, watchSessionIds })
 }
 
 export function handleGetFlowScreenshot(
@@ -643,6 +822,7 @@ export function handleGetFlowScreenshot(
 export function purgeExpiredRuns(screenshotsDir: string, videosDir: string, holders: RunHolders): void {
   settleOrphanedRuns(holders)
   const db = getDb()
+  forgetStartedFlowsOfStoppedRuns()
   const expired = db.prepare(`
     SELECT seq FROM flow_runs WHERE build_id IS NULL AND delete_after IS NOT NULL AND delete_after < datetime('now')
   `).all() as { seq: number }[]

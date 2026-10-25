@@ -8,7 +8,7 @@ import type {
 import { formFactorOf } from './avdConfig.js'
 import type {
   AgentControlOutbound, ClipboardReplyBody, OpenUrlReplyBody,
-  AppInstallReplyBody, AppLaunchReplyBody, AppClearStateReplyBody, DevicePosture, FormFactor,
+  AppInstallReplyBody, AppLaunchReplyBody, AppClearStateReplyBody, DevicePosture, FormFactor, RunResetReport, RunResetRequest,
 } from '@tapflowio/protocol'
 import fs from 'fs'
 import path from 'path'
@@ -43,6 +43,10 @@ import {
   CODEC_H264,
   CODEC_AUDIO,
   sendAudioYieldingToVideo,
+  resetApps,
+  runResetSteps,
+  RUN_RESET_BUDGET_MS,
+  type RunResetStep,
 } from '@tapflowio/agent-core/utils'
 import { execFile } from 'child_process'
 import { AdbWrapper } from './AdbWrapper.js'
@@ -366,7 +370,12 @@ export interface AndroidAgentOptions {
   lean?: boolean
   /** An AVD's form factor by name, for `agent:register`. Defaults to reading its config.ini (`avdConfig`). */
   avdFormFactor?: (avdName: string) => FormFactor | undefined
+  /** Each run reset command's bound, in ms. `RUN_RESET_CMD_TIMEOUT_MS` by default; injectable for tests. */
+  runResetCmdTimeoutMs?: number
 }
+
+/** One `pm clear` or clipboard write of a run reset. */
+const RUN_RESET_CMD_TIMEOUT_MS = 10_000
 
 // Everything inside the per-device clipboard section must be bounded, or one stuck call wedges
 // every later copy/paste on that device. gRPC carries its own deadline; adb does not (and a
@@ -478,6 +487,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   private readonly reconnectDelays: number[]
   private readonly token?: string
   private readonly handshakeTimeoutMs: number
+  private readonly runResetCmdTimeoutMs: number
   private readonly lean: boolean
   private readonly avdFormFactor: (avdName: string) => FormFactor | undefined
   /** How long a shutdown whose kill failed watches for the emulator to finish exiting. A field so tests can
@@ -490,6 +500,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     this.deviceFilter = options.deviceFilter
     this.token = options.token
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000
+    this.runResetCmdTimeoutMs = options.runResetCmdTimeoutMs ?? RUN_RESET_CMD_TIMEOUT_MS
     this.lean = options.lean ?? false
     this.avdFormFactor = options.avdFormFactor ?? ((name) => formFactorOf(name))
     this.reconnectDelays = options.reconnectDelays ?? [1000, 2000, 4000, 8000, 16000, 30000]
@@ -739,6 +750,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         slotsAvailable: Math.max(0, slotsTotal - bootedCount),
         slotsTotal,
         reportedAt: Date.now(),
+        memoryPressure: this.resources.getMemoryPressure(),
       },
     })
   }
@@ -1837,7 +1849,82 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   // `requestId` is a parameter, never a field on `state`: `bootSeq` exists because two boots overlap,
   // and a correlator hoisted onto shared state would answer the first request with the second's id.
   // Optional because the relay's idle timer boots nothing — but every *browser* boot carries one.
-  private async handleDeviceBoot(sessionId: string, avdId: string, fullErase = false, tier?: { secureContext: boolean; external: boolean }, requestId?: string): Promise<void> {
+  /**
+   * What `flow run` asks reset before a run. `pm clear` takes the app's files, its runtime permissions and its process
+   * together, and an install after it keeps the now-empty data — so both lists get it. The keychain, privacy and
+   * location items have no Android counterpart here and are never reported.
+   */
+  private async resetForRun(state: DeviceState, request: RunResetRequest, isStale: () => boolean): Promise<RunResetReport> {
+    const deadline = Date.now() + RUN_RESET_BUDGET_MS
+    const stop = () => isStale() || Date.now() >= deadline
+    const serial = this.adb.getSerial(state.deviceId)
+    const apps = [...new Set([...request.uninstall, ...request.clear])]
+    const steps: RunResetStep[] = []
+    const ms = this.runResetCmdTimeoutMs
+    if (apps.length > 0 && serial) {
+      const clear = (id: string) => {
+        const work = this.adb.clearAppDataIfInstalled(serial, id)
+        this.trackClear(state.deviceId, work)
+        return bounded(work, ms, `pm clear ${id}`)
+      }
+      steps.push({ item: 'app-data', run: () => resetApps(apps, clear, stop) })
+    }
+    const client = state.grpcClient
+    if (client) {
+      // Through the clipboard queue: a clipboard read in flight parks a sentinel on this clipboard. Read back, because
+      // `setClipboard` resolves when the change is scheduled, not when it is applied — the write path does the same.
+      const clearClipboard = async () => {
+        await client.setClipboard('')
+        const applied = Date.now() + CLIPBOARD_WRITE_DEADLINE_MS
+        while ((await client.getClipboard().catch(() => null)) !== '') {
+          if (Date.now() >= applied) throw new PlatformError('the device clipboard did not take the clear')
+          await new Promise((r) => setTimeout(r, CLIPBOARD_POLL_MS))
+        }
+      }
+      // The bound covers the wait for the queue too. A clear that reaches the front after the step gave up does nothing:
+      // by then the run may have put something of its own on the clipboard.
+      let abandoned = false
+      const queued = () => this.clipboardQueue(state.deviceId, async () => {
+        if (abandoned || stop()) throw new PlatformError('the clipboard was busy for the whole reset')
+        await clearClipboard()
+      })
+      steps.push({ item: 'pasteboard', run: () => bounded(queued(), ms, 'clipboard clear').catch((e: unknown) => { abandoned = true; throw e }) })
+    }
+    return runResetSteps(steps, isStale, (item, e) => logger.warn(`run reset: ${item} failed: ${(e as Error).message}`), deadline)
+  }
+
+  /**
+   * `bounded` releases the wait, not the adb child: a `pm clear` that timed out, or whose boot a newer one replaced, may
+   * still land, and wipe an app a run installed after the ready. So every `pm clear` a reset starts is kept here by
+   * device until it settles, and every boot of that device waits for them before its ready (`awaitPendingClears`) —
+   * a boot that asked for no reset too.
+   */
+  private readonly pendingClears = new Map<string, Set<Promise<unknown>>>()
+
+  private trackClear(deviceId: string, work: Promise<unknown>): void {
+    let pending = this.pendingClears.get(deviceId)
+    if (!pending) { pending = new Set(); this.pendingClears.set(deviceId, pending) }
+    const settled = work.catch(() => {})
+    pending.add(settled)
+    void settled.then(() => {
+      pending.delete(settled)
+      if (pending.size === 0 && this.pendingClears.get(deviceId) === pending) this.pendingClears.delete(deviceId)
+    })
+  }
+
+  /** One more step's time at most. A clear still running past that fails the boot rather than announcing a device the
+   *  run's install could lose its data on: failing the step does not stop the clear, and nothing else orders the two. */
+  private async awaitPendingClears(deviceId: string): Promise<void> {
+    const pending = this.pendingClears.get(deviceId)
+    if (!pending || pending.size === 0) return
+    try {
+      await bounded(Promise.all(pending), this.runResetCmdTimeoutMs, 'waiting for a late pm clear')
+    } catch {
+      throw new PlatformError('a pm clear from a run reset is still running on the device, so it is not ready for an install')
+    }
+  }
+
+  private async handleDeviceBoot(sessionId: string, avdId: string, fullErase = false, tier?: { secureContext: boolean; external: boolean }, requestId?: string, runReset?: RunResetRequest): Promise<void> {
     const state = this.deviceStates.get(sessionId)
     // Split, because the two halves are not the same kind of nothing. No open control channel means the
     // answer itself has nowhere to go, so this is the one abandonment that stays silent — and the caller
@@ -1964,10 +2051,16 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
 
       await this.startVideoStream(state, streamWs, () => seq === state.bootSeq)
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+      // After the stream, which is what opens the gRPC client the clipboard goes through; before the ready, since the
+      // run installs its app after it and the report rides on it.
+      const runResetReport = runReset ? await this.resetForRun(state, runReset, () => seq !== state.bootSeq) : undefined
+      if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+      await this.awaitPendingClears(state.deviceId)
+      if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
       this.sendChrome(state)
       void this.sendPostures(state)
       state.booted = true
-      this.sendMsg({ type: 'device:ready', sessionId, requestId, payload: { deviceId: avdId } })
+      this.sendMsg({ type: 'device:ready', sessionId, requestId, payload: { deviceId: avdId, cold: launched, ...(runResetReport ? { runReset: runResetReport } : {}) } })
       // Clear a network condition the last session left behind, then report (#607).
       //
       // **At boot rather than at teardown**, because airplane mode lives in the AVD's userdata and
@@ -2449,7 +2542,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     // pointer is down is the emulator's state, and it outlives the client a restart replaced — left
     // alone, the next tap's press arrives on a pointer already down and reads as a drag from here.
     // Best effort, on whatever channel serves now; on scrcpy an unmatched release is harmless. With no
-    // channel up yet there is nothing to send it on.
+    // channel up yet there is nothing to send it on. It goes on the new client's queue, which cannot order it
+    // after a press still in flight on the replaced one — a restart in mid-tap is the window.
     const pc = this.pointerControl(state)
     if (opened?.via === 'channel' && pc) {
       this.fire(kind === 'touch' ? pc.touchUp(0, state.lastTouchPx.x, state.lastTouchPx.y) : pc.pinchEnd())
@@ -2509,8 +2603,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   private handleRelayMessage(msg: { type: string; sessionId: string; requestId?: string; payload?: unknown }): void {
     switch (msg.type) {
       case 'device:boot': {
-        const { deviceId, resetMode, secureContext, external } = msg.payload as { deviceId: string; resetMode?: 'app-only' | 'full-erase'; secureContext?: boolean; external?: boolean }
-        this.handleDeviceBoot(msg.sessionId, deviceId, resetMode === 'full-erase', { secureContext: !!secureContext, external: !!external }, msg.requestId)
+        const { deviceId, resetMode, secureContext, external, runReset } = msg.payload as { deviceId: string; resetMode?: 'app-only' | 'full-erase'; secureContext?: boolean; external?: boolean; runReset?: RunResetRequest }
+        this.handleDeviceBoot(msg.sessionId, deviceId, resetMode === 'full-erase', { secureContext: !!secureContext, external: !!external }, msg.requestId, runReset)
           .catch((e) => logger.error('handleDeviceBoot failed:', e))
         break
       }
@@ -2552,6 +2646,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           break
         }
         const doInstall = async () => {
+          // Not past a run reset's `pm clear` still running: it would land on the app installed here. A client that
+          // joined without booting (MCP's `connect_device`) reaches this without the boot's own wait.
+          await this.awaitPendingClears(state.deviceId)
           // The relay's own path only opens where the relay's disk is. A ticket means it can hand
           // us the bytes instead; without one, this is a relay that predates downloading and the
           // old behaviour is all there is.
@@ -2601,7 +2698,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           respond({ type: 'app:launch-error', message: 'No booted device' })
           break
         }
-        this.adb.launchApp(serial, bundleId)
+        // Same reason as `app:install`: a launched app writes data a late `pm clear` would take.
+        this.awaitPendingClears(state!.deviceId)
+          .then(() => this.adb.launchApp(serial, bundleId))
           .then(() => respond({ type: 'app:launch-done' }))
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e)
@@ -2835,7 +2934,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           respond({ type: 'open-url:error', message: 'No booted device' })
           break
         }
-        this.adb.openUrl(serial, url)
+        // Same reason as `app:install`: the URL can start the app.
+        this.awaitPendingClears(state!.deviceId)
+          .then(() => this.adb.openUrl(serial, url))
           .then(() => respond({ type: 'open-url:done' }))
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e)

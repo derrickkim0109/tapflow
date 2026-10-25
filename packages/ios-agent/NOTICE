@@ -9,4 +9,4 @@ licensed under the Apache License, Version 2.0 (see LICENSE-APACHE-2.0).
 It includes a list of launchd labels selected from simslim
 (https://github.com/MobAI-App/simslim),
 licensed under the MIT License. Copyright (c) 2026 Interlap.
-The full notice is in dist/leanLabels.js.
+The full notice is in dist/leanLabels.js and dist/serviceTiers.js.

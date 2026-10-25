@@ -409,9 +409,13 @@ session moves under the watcher.
 
 **Who is an AI client is declared, not inferred.** `session:start` carries `clientKind`. Reading it off the
 credential (a PAT means a tool, a cookie means a person) was the first design and was dropped: a new auth
-method would silently reclassify every session. The declaration is safe to trust because of what it grants
-— it opens the *declarer's own* session to watchers and nothing else, so a false one can only expose
-oneself. **Who may watch is decided by authentication instead** (a cookie, or a remote PAT with `view`),
+method would silently reclassify every session. The declaration was safe to trust because of what it
+granted — it opened the *declarer's own* session to watchers, so a false one could only expose oneself.
+**It now also buys admission**: the relay's resource gate lets a non-AI join to a device it has up past the
+memory check (#1043), and an AI kind does not get that pass because its boot warms the UI-tree runner. So
+omitting the kind, as every client before 0.28 does, is treated as a person. That is accepted, not
+overlooked: what a false claim gains is admission on a Mac short of memory, and joining at all already
+needs authentication. **Who may watch is decided by authentication instead** (a cookie, or a remote PAT with `view`),
 never by anything a client says about itself. An absent `clientKind` — any client predating the field — is
 not watchable, deliberately with no fallback.
 

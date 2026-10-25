@@ -3,7 +3,7 @@
 import { skeletonSize } from '@/lib/deviceSkeleton';
 import { framelessChrome } from '@/lib/framelessChrome';
 
-import type { BrowserToRelay, FormFactor, SessionTerminatedReason } from '@tapflowio/protocol'
+import type { BootRefusalReason, BrowserToRelay, FormFactor, SessionTerminatedReason } from '@tapflowio/protocol'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useRelay } from '@/hooks/useRelay';
 import { usePerfMode } from '@/hooks/usePerfMode';
@@ -103,6 +103,12 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
   const [installed, setInstalled] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
+  // Set while the relay holds this viewer's boot behind another on the same Mac; cleared by anything that
+  // ends the wait — the boot starting, finishing or failing.
+  const [bootWaiting, setBootWaiting] = useState<BootRefusalReason | null>(null);
+  // The tier the device came up with, from `device:ready`: a person who picks a device a run left slim is told how to
+  // get its services back (a restart boots it on the agent's own tier).
+  const [servicesOff, setServicesOff] = useState(false);
   const [launching, setLaunching] = useState(false);
   // What the agent on the other end implements. Absent ⇒ an agent predating the capability,
   // so the viewer degrades on purpose rather than inferring anything from a timeout.
@@ -271,6 +277,7 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       setInstalling(false);
       setInstallError(null);
       setBootError(null);
+      setBootWaiting(null);
       setLaunching(false);
       setSwKeyboardPending(false);
       if (kbdDeadlineRef.current) clearTimeout(kbdDeadlineRef.current);
@@ -318,7 +325,19 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       // Release the rebind: without this a failed re-boot would suppress every later install for
       // the life of the mount.
       rebindRef.current = { pending: 0, appInstalled: false };
+      setBootWaiting(null);
       setBootError(msg.message);
+    }
+    // Only for the boot this viewer is waiting on: a reconnect re-sends its boot, and the relay answers the one it
+    // replaced as well as the new one.
+    // Not-ready too: a restart reaches this with the last boot's chrome still up and `deviceReady` still true, and
+    // the device is off until the held boot goes ahead. And a failure from the last cycle (an Android stream that
+    // died) is not this boot's: left set, it outranks the wait and the tester reads "Boot failed" throughout.
+    if (msg.type === 'device:boot-waiting' && msg.requestId === latestBootIdRef.current) {
+      // A relay that predates `reason` held boots only behind another boot.
+      setBootWaiting(msg.reason ?? 'host-booting');
+      setDeviceReady(false);
+      setBootError(null);
     }
     // An input the device never got. Deliberately no session-level state behind this: the acks are
     // per-input, unordered (a dispatch is awaited before its ack while a refusal is not) and do not
@@ -369,6 +388,8 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
     // and there is no latch.
 
     if (msg.type === 'device:booting') {
+      setBootWaiting(null);
+      setServicesOff(false);
       setDeviceReady(false);
       setInstalling(false);
       setInstalled(false);
@@ -408,6 +429,7 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       // clearing the spinner is exactly what it is for (#440). Gating this line on the correlator would
       // reinstate the defect the replay exists to prevent.
       setDeviceReady(true);
+      setBootWaiting(null);
       // Everything below is a reaction to *our* boot, so it is gated. Absent is accepted, so what this
       // rejects is exactly one thing: a ready **carrying** an id that is not one this mount is waiting
       // for. That is a straggler from an earlier boot cycle, which would otherwise release the current
@@ -419,6 +441,10 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       // Telling them apart needs the replay to be identifiable in its own right, which is the deferred
       // `sessionId` tightening; until then that case is unchanged rather than fixed.
       if (msg.requestId !== undefined && !bootIdsRef.current.delete(msg.requestId)) return;
+      // After the gate: a superseded boot's late ready must not put back a tier the current boot replaced. And only
+      // when the ready says so: the relay's replay carries no tier, and must not clear one an earlier ready set.
+      const tier = msg.payload?.serviceTier;
+      if (tier !== undefined) setServicesOff(tier !== 'unsupported' && tier.name === 'slim');
       if (rebindRef.current.pending > 0) {
         const { appInstalled } = rebindRef.current;
         rebindRef.current = { pending: rebindRef.current.pending - 1, appInstalled };
@@ -686,7 +712,7 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
 
   const commonProps = {
     sessionId, buildId, send, openUrl, launchApp, connected, joined,
-    deviceReady, installing, installed, installError, bootError,
+    deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
     launching,
     binaryFrameHandlerRef,
     clipboardHandlerRef,
@@ -747,7 +773,7 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
           </div>
           <SimulatorInfoCard
             joined={joined} fps={0} connected={connected}
-            deviceReady={deviceReady} bootError={bootError}
+            deviceReady={deviceReady} bootError={bootError} bootWaiting={bootWaiting} servicesOff={servicesOff}
             installing={installing} installError={installError}
             decoderUnsupported={false}
             keyboardActive={false} agentAway={agentAway}
