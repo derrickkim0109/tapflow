@@ -67,6 +67,39 @@
           "maxProperties": 1,
           "properties": {
             "clearState": { "type": "string", "minLength": 1, "description": "Reset the app data of this bundle id." },
+            "launchApp": {
+              "description": "Launch the build under test with launch arguments, and on iOS environment variables. A running app is restarted so it reads them.",
+              "oneOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "arguments": {
+                      "type": "object",
+                      "description": "iOS: passed as -key value (read with UserDefaults). Android: intent extras typed by value (read with getIntent().getExtras()). Quote a number to pass it as a string.",
+                      "maxProperties": 32,
+                      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$" },
+                      "additionalProperties": {
+                        "oneOf": [
+                          { "type": "string" },
+                          { "type": "boolean" },
+                          { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
+                          { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^([^,]*[^,\\\\])?$" } }
+                        ]
+                      }
+                    },
+                    "env": {
+                      "type": "object",
+                      "description": "iOS only: environment variables for the app's process. Refused on Android.",
+                      "maxProperties": 32,
+                      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$" },
+                      "additionalProperties": { "type": "string" }
+                    }
+                  }
+                }
+              ]
+            },
             "tapOn": { "$ref": "#/definitions/selector" },
             "inputText": { "type": "string", "description": "Type into the focused input." },
             "pressKey": { "type": "string", "minLength": 1, "description": "KeyboardEvent.code name: Enter, Backspace, Escape, Tab, ArrowDown, …" },

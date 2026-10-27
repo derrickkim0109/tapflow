@@ -302,6 +302,96 @@ describe('AdbWrapper', () => {
       expect(i).toBeLessThan(args.indexOf('-p'))
       expect(args[i + 1]).toBe('0')
     })
+
+    // #1047. A launch carrying arguments restarts the app in the same command and never falls back to monkey, which
+    // cannot carry extras; both warnings the plain launch counts as launched mean the extras were not delivered.
+    describe('with launch arguments', () => {
+      const ARGS = { FIRDebugEnabled: true, port: 8080, big: 3_000_000_000, host: "a'b; echo x", langs: ['en', 'ko'] }
+
+      it('stops and starts the launcher activity with typed, shell-quoted extras', async () => {
+        const runner = launcher({ resolve: RESOLVED, start: STARTED })
+        await new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: ARGS })
+        expect(ran(runner, 'am')).toEqual([[
+          '-s', 'emulator-5554', 'shell', 'timeout', '10', 'am', 'start', '-S', '-W', ...START_FIELDS, '-n', 'com.example.app/.MainActivity',
+          '--ez', "'FIRDebugEnabled'", 'true', '--ei', "'port'", '8080', '--el', "'big'", '3000000000',
+          '--es', "'host'", "'a'\\''b; echo x'", '--esa', "'langs'", "'en,ko'", '2>&1',
+        ]])
+        expect(ran(runner, 'monkey')).toHaveLength(0)
+      })
+
+      it.each([
+        ['the app was already running', 'Warning: Activity not started, its current task has been brought to the front\n'],
+        ['the intent went to a running instance', 'Warning: Activity not started, intent has been delivered to currently running top-most instance.\n'],
+        ['am start reports an error', 'Starting: Intent { cmp=com.example.app/.MainActivity }\nError: Activity class {com.example.app/.MainActivity} does not exist.\n'],
+        ['am cannot parse an extra', '\nException occurred while executing \'start\':\njava.lang.NumberFormatException: For input string: "x"\n'],
+      ])('fails when %s', async (_, start) => {
+        const runner = launcher({ resolve: RESOLVED, start })
+        await expect(new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: ARGS })).rejects.toThrow(/Activity not started|Error|Exception/)
+        expect(ran(runner, 'monkey')).toHaveLength(0)
+      })
+
+      // The cause is what the agent logs. Node's exec error carries the whole argv in its message and `cmd`, and an
+      // argument value can be a token.
+      it('keeps argument values out of the cause when adb fails before the intent went out', async () => {
+        const failed = Object.assign(new Error("Command failed: adb -s emulator-5554 shell … --es 'token' 'sekrit'"), { cmd: "adb … 'sekrit'", stderr: 'error: closed\n', stdout: '' })
+        const runner = launcher({ resolve: RESOLVED, start: failed })
+        const e = await new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: { token: 'sekrit' } }).catch((x: unknown) => x) as Error
+        expect(e.message).toBe('adb did not finish the launch')
+        expect(String((e.cause as Error).message)).toBe('error: closed')
+        expect(JSON.stringify({ m: e.message, c: (e.cause as Error).message, k: (e.cause as { cmd?: string }).cmd })).not.toContain('sekrit')
+      })
+
+      it('fails instead of falling back to monkey when no single launcher activity resolves', async () => {
+        const runner = launcher({ resolve: 'No activity found\n' })
+        await expect(new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: ARGS })).rejects.toThrow(/launcher activity/)
+        expect(ran(runner, 'monkey')).toHaveLength(0)
+      })
+
+      it('refuses env before running anything', async () => {
+        const runner = launcher({ resolve: RESOLVED, start: STARTED })
+        await expect(new AdbWrapper(runner).launchApp('emulator-5554', PKG, { env: { API_HOST: 'x' } })).rejects.toThrow(/env is iOS-only/)
+        expect(runner.exec).not.toHaveBeenCalled()
+      })
+
+      // The relay's per-app defaults with no caller options (#1047, PR 2): a default written for automation must not
+      // break the plain Launch on an app it does not fit, so what cannot be delivered is left out instead.
+      describe('defaults only', () => {
+        it('delivers them like a caller\'s, resolving the launcher activity once', async () => {
+          const runner = launcher({ resolve: RESOLVED, start: STARTED })
+          const applied = await new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: { flag: true } }, true)
+          expect(applied).toEqual({ arguments: { flag: true } })
+          expect(ran(runner, 'am')[0]).toContain('-S')
+          expect(ran(runner, 'resolve-activity')).toHaveLength(1)
+        })
+
+        it('launches without them through monkey when no single launcher activity resolves', async () => {
+          const runner = launcher({ resolve: 'android/com.android.internal.app.ResolverActivity\n' })
+          const applied = await new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: { flag: true } }, true)
+          expect(applied).toBeUndefined()
+          expect(ran(runner, 'monkey')).toHaveLength(1)
+          expect(ran(runner, 'resolve-activity')).toHaveLength(1)
+        })
+
+        it('leaves env out instead of refusing, and launches plainly when nothing else is left', async () => {
+          const runner = launcher({ resolve: RESOLVED, start: STARTED })
+          const applied = await new AdbWrapper(runner).launchApp('emulator-5554', PKG, { env: { A: '1' } }, true)
+          expect(applied).toBeUndefined()
+          expect(ran(runner, 'am')[0]).not.toContain('-S')
+          expect(ran(runner, 'resolve-activity')).toHaveLength(1)
+        })
+
+        it('still fails when the app itself does not start', async () => {
+          const runner = launcher({ resolve: RESOLVED, start: 'Starting: Intent { cmp=com.example.app/.MainActivity }\nError: Activity class {com.example.app/.MainActivity} does not exist.\n' })
+          await expect(new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: { flag: true } }, true)).rejects.toThrow(/Error/)
+        })
+      })
+
+      it('treats empty option maps as a plain launch', async () => {
+        const runner = launcher({ resolve: RESOLVED, start: STARTED })
+        await new AdbWrapper(runner).launchApp('emulator-5554', PKG, { arguments: {}, env: {} })
+        expect(ran(runner, 'am')[0]).not.toContain('-S')
+      })
+    })
   })
 
   // The launch failure reaches a dashboard toast, and node's message for a failed adb call leads with the

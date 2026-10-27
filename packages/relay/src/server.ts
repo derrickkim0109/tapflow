@@ -1,7 +1,7 @@
 import path from 'path'
 import { initDb } from './db.js'
 import { RelayServer } from './RelayServer.js'
-import { config, loadedEnvPath, assertInstallDir } from './lib/config.js'
+import { config, loadedEnvPath, assertInstallDir, loadLaunchDefaults } from './lib/config.js'
 import { buildCorsOrigins, containerWithoutPublicUrlWarning, proxyWithoutPublicUrlWarning } from './lib/proxyConfig.js'
 import { runningInContainer } from './lib/lanAddress.js'
 import { bootstrapAdminFromEnv, AdminBootstrapError } from './lib/adminBootstrap.js'
@@ -69,7 +69,7 @@ async function main(): Promise<void> {
   // relay trusts config — an operator may run the tunnel alongside. See lib/publicUrl.ts.
   // The tunnel listener opens only when its port is named: it is loopback-only, so inside a container only
   // something sharing the relay's network namespace (a sidecar, host networking) could reach it at all.
-  const server = new RelayServer({ port, uploadsDir, wsBackpressureBytes: config.local.wsBackpressureBytes, trustedProxies: config.local.trustedProxies, corsOrigins, tls, tunnelPort: config.local.tunnelPort ?? undefined })
+  const server = new RelayServer({ port, uploadsDir, wsBackpressureBytes: config.local.wsBackpressureBytes, trustedProxies: config.local.trustedProxies, corsOrigins, tls, tunnelPort: config.local.tunnelPort ?? undefined, launchDefaults: loadLaunchDefaults() })
   await server.start()
   logger.info(`tapflow relay running at ${tls ? 'https' : 'http'}://${displayHost}:${port}`)
 

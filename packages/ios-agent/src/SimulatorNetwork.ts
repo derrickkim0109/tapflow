@@ -449,8 +449,9 @@ export class SimulatorNetwork {
    * launch failed outright, so a launch that never happened reported the hooks as broken ten seconds
    * later.
    *
-   * **Only for a pid that is new.** `simctl launch` is issued without `--terminate-running-process`,
-   * so launching a bundle that is already running returns the existing pid and starts nothing. That
+   * **Only for a pid that is new.** A launch with no arguments is issued without `--terminate-running-process`,
+   * so launching a bundle that is already running returns the existing pid and starts nothing. (One that carries
+   * arguments terminates it first and gets a new pid, which is the case the next paragraph covers.) That
    * process has already written its verdict, once, from a dyld constructor; it stays the answer, and a
    * new deadline would only re-run a window the same process has used.
    *

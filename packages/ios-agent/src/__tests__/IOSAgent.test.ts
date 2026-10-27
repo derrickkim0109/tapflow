@@ -100,7 +100,7 @@ vi.mock('@tapflowio/audiotap-helper', () => ({
   isAudioSupported: vi.fn(() => true),
 }))
 vi.mock('../SimProcessTree', () => ({
-  enumerateSimPids: vi.fn(() => [101, 102, 103]),
+  enumerateSimPids: vi.fn(() => Promise.resolve([101, 102, 103])),
 }))
 
 import crypto from 'crypto'
@@ -110,6 +110,7 @@ import { IOSAgent, leanSupported, streamRestartPlan } from '../IOSAgent'
 import type { DeviceChromeLoader, ChromeData } from '../DeviceChromeLoader'
 import { ScreenCaptureStreamer } from '../ScreenCaptureStreamer'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
+import { enumerateSimPids } from '../SimProcessTree'
 import { launchAudioHelper } from '@tapflowio/audiotap-helper'
 import { SimctlWrapper } from '../SimctlWrapper'
 import { LeanStore, parseDisabledStore } from '../LeanStore'
@@ -2326,7 +2327,50 @@ describe('IOSAgent', () => {
         })
         await vi.waitFor(() => expect(simctl.launchApp).toHaveBeenCalled())
 
-        expect(simctl.launchApp).toHaveBeenCalledWith('dev-1', 'com.example.app')
+        expect(simctl.launchApp).toHaveBeenCalledWith('dev-1', 'com.example.app', undefined)
+
+        agent.disconnect(); browser.close()
+      })
+
+      // #1047. The wire handler calls simctl itself rather than `DeviceAgent.launchApp`, so the frame is what is tested.
+      it('launch passes arguments and env through and reports their names, never their values', async () => {
+        const { simctl, agent, browser } = await bootedAgent()
+
+        const done = waitForType(browser, 'app:launch-done')
+        deliver(agent, {
+          type: 'app:launch', requestId: 'rq-opt', sessionId: agent.sessionId,
+          payload: { bundleId: 'com.example.app', arguments: { FIRDebugEnabled: true }, env: { API_TOKEN: 'secret' } },
+        })
+        const msg = await done
+        expect(simctl.launchApp).toHaveBeenCalledWith('dev-1', 'com.example.app', { arguments: { FIRDebugEnabled: true }, env: { API_TOKEN: 'secret' } })
+        expect(msg['applied']).toEqual({ arguments: ['FIRDebugEnabled'], env: ['API_TOKEN'] })
+        expect(JSON.stringify(msg)).not.toContain('secret')
+
+        agent.disconnect(); browser.close()
+      })
+
+      it('launch with empty option maps is a plain launch, with no applied keys', async () => {
+        const { simctl, agent, browser } = await bootedAgent()
+
+        const done = waitForType(browser, 'app:launch-done')
+        deliver(agent, { type: 'app:launch', requestId: 'rq-empty', sessionId: agent.sessionId, payload: { bundleId: 'com.example.app', arguments: {}, env: {} } })
+        expect((await done)['applied']).toBeUndefined()
+        expect(simctl.launchApp).toHaveBeenCalledWith('dev-1', 'com.example.app', undefined)
+
+        agent.disconnect(); browser.close()
+      })
+
+      // The relay checks with the same function, but a relay of another version may check less, and this is the last
+      // door before a command line.
+      it('launch refuses options the shared check refuses, without launching', async () => {
+        const { simctl, agent, browser } = await bootedAgent()
+
+        const err = waitForType(browser, 'app:launch-error')
+        deliver(agent, { type: 'app:launch', requestId: 'rq-bad', sessionId: agent.sessionId, payload: { bundleId: 'com.example.app', env: { TAPFLOW_TARGET_BUNDLE: '' } } })
+        const msg = await err
+        expect(msg['requestId']).toBe('rq-bad')
+        expect(msg['message']).toMatch(/reserved/)
+        expect(simctl.launchApp).not.toHaveBeenCalled()
 
         agent.disconnect(); browser.close()
       })
@@ -3868,6 +3912,137 @@ describe('IOSAgent', () => {
         setSpy.mockRestore()
         clearSpy.mockRestore()
       }
+    })
+
+    // The sim's process tree and volume are read asynchronously now (`ps` held the event loop ~40 ms every
+    // 1.5 s, which a drag showed as a hitch), so a read can land after the capture it was for has stopped.
+    describe('reads that land after the capture stopped', () => {
+      const mockEnumerate = vi.mocked(enumerateSimPids)
+      const held = () => {
+        let release!: (pids: number[]) => void
+        const promise = new Promise<number[]>((r) => { release = r })
+        return { promise, release }
+      }
+      beforeEach(() => mockEnumerate.mockClear())
+      afterEach(() => { mockEnumerate.mockReset(); mockEnumerate.mockImplementation(() => Promise.resolve([101, 102, 103])) })
+
+      it('launches no helper for a capture stopped while its first read was in flight', async () => {
+        const first = held()
+        mockEnumerate.mockImplementationOnce(() => first.promise)
+        const { agent, browser } = await bootSession()
+        await vi.waitFor(() => expect(mockEnumerate).toHaveBeenCalledTimes(1))
+        agent.disconnect()
+        first.release([101, 102, 103])
+        await new Promise((r) => setTimeout(r, 30))
+        expect(mockLaunchAudioHelper).not.toHaveBeenCalled()
+        browser.close()
+      })
+
+      it('polls one read at a time, and hands a live capture the new pids when the read lands', async () => {
+        const poll = held()
+        mockEnumerate
+          .mockImplementationOnce(() => Promise.resolve([101, 102, 103]))
+          .mockImplementationOnce(() => poll.promise)
+        const { agent, browser } = await bootSession()
+        await vi.waitFor(() => expect(mockLaunchAudioHelper).toHaveBeenCalledTimes(1))
+        await vi.waitFor(() => expect(mockEnumerate).toHaveBeenCalledTimes(2), { timeout: 3_000 })
+        // A whole poll interval passes with that read still out: no second read is stacked on it.
+        await new Promise((r) => setTimeout(r, 1_700))
+        expect(mockEnumerate).toHaveBeenCalledTimes(2)
+        const capture = MockAudioStreamer.mock.results[0].value as { updatePids: ReturnType<typeof vi.fn> }
+        poll.release([101, 102, 103, 104])
+        await vi.waitFor(() => expect(capture.updatePids).toHaveBeenCalledWith([101, 102, 103, 104]))
+        // And the poll after it runs again.
+        await vi.waitFor(() => expect(mockEnumerate).toHaveBeenCalledTimes(3), { timeout: 3_000 })
+        agent.disconnect(); browser.close()
+      }, 10_000)
+
+      it('does not hand a stopped capture the pids of a poll that was in flight', async () => {
+        const poll = held()
+        mockEnumerate
+          .mockImplementationOnce(() => Promise.resolve([101, 102, 103]))
+          .mockImplementationOnce(() => poll.promise)
+        const { agent, browser } = await bootSession()
+        await vi.waitFor(() => expect(mockEnumerate).toHaveBeenCalledTimes(2), { timeout: 3_000 })
+        const capture = MockAudioStreamer.mock.results[0].value as { updatePids: ReturnType<typeof vi.fn> }
+        agent.disconnect()
+        poll.release([101, 102, 103, 104])
+        await new Promise((r) => setTimeout(r, 30))
+        expect(capture.updatePids).not.toHaveBeenCalled()
+        browser.close()
+      }, 10_000)
+    })
+  })
+
+  // The two memory reads run off the event loop now (they held it 4 ms in a built agent and ~200 ms under tsx,
+  // every 5 s), so a sample can land after its socket closed, or while the next tick is due.
+  describe('resource reports (agent:resources)', () => {
+    type Sampler = { getMemoryUsage: () => Promise<{ memUsedMB: number; memTotalMB: number }>; getMemoryPressure: () => Promise<undefined> }
+    type Internals = { resources: Sampler; reportResources: () => Promise<void>; sendOn: (ws: unknown, msg: { type: string }) => void }
+    function holdSamples(agent: IOSAgent) {
+      const internals = agent as unknown as Internals
+      const releases: Array<() => void> = []
+      internals.resources.getMemoryUsage = () => new Promise((r) => { releases.push(() => r({ memUsedMB: 1, memTotalMB: 2 })) })
+      internals.resources.getMemoryPressure = () => Promise.resolve(undefined)
+      const sendOn = vi.spyOn(internals, 'sendOn')
+      const reports = () => sendOn.mock.calls.filter(([, msg]) => msg.type === 'agent:resources').length
+      return { internals, releases, reports }
+    }
+
+    it('sends nothing for a sample that lands after its socket closed', async () => {
+      const agent = new IOSAgent({ intervalMs: 50 }, mockSimctl())
+      const { releases, reports } = holdSamples(agent)
+      await agent.connect(`ws://localhost:${port}`)
+      await vi.waitFor(() => expect(releases).toHaveLength(1))
+      agent.disconnect()
+      releases[0]()
+      await new Promise((r) => setTimeout(r, 30))
+      expect(reports()).toBe(0)
+    })
+
+    it('sends a sample that lands while its socket is open', async () => {
+      const agent = new IOSAgent({ intervalMs: 50 }, mockSimctl())
+      const { releases, reports } = holdSamples(agent)
+      await agent.connect(`ws://localhost:${port}`)
+      await vi.waitFor(() => expect(releases).toHaveLength(1))
+      releases[0]()
+      await vi.waitFor(() => expect(reports()).toBe(1))
+      agent.disconnect()
+    })
+
+    it('takes one sample at a time, and the next once it lands', async () => {
+      const agent = new IOSAgent({ intervalMs: 50 }, mockSimctl())
+      const { internals, releases, reports } = holdSamples(agent)
+      await agent.connect(`ws://localhost:${port}`) // its own report is the one in flight
+      await vi.waitFor(() => expect(releases).toHaveLength(1))
+      await internals.reportResources()
+      expect(releases).toHaveLength(1)
+      releases[0]()
+      await vi.waitFor(() => expect(reports()).toBe(1))
+      void internals.reportResources()
+      expect(releases).toHaveLength(2)
+      releases[1]()
+      await vi.waitFor(() => expect(reports()).toBe(2))
+      agent.disconnect()
+    })
+
+    it('reports on a new socket while the old socket\'s sample is still out, and leaves the new one in charge', async () => {
+      const agent = new IOSAgent({ intervalMs: 50 }, mockSimctl())
+      const { internals, releases, reports } = holdSamples(agent)
+      await agent.connect(`ws://localhost:${port}`)
+      await vi.waitFor(() => expect(releases).toHaveLength(1))
+      agent.disconnect()
+      await agent.connect(`ws://localhost:${port}`)
+      // The reconnect's own report starts at once: the old socket's sample is not the new socket's.
+      await vi.waitFor(() => expect(releases).toHaveLength(2))
+      // The old sample landing must not clear the flag the new one holds.
+      releases[0]()
+      await new Promise((r) => setTimeout(r, 10))
+      void internals.reportResources()
+      expect(releases).toHaveLength(2)
+      releases[1]()
+      await vi.waitFor(() => expect(reports()).toBe(1))
+      agent.disconnect()
     })
   })
 

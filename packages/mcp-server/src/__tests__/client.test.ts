@@ -3,7 +3,7 @@ import type { IncomingMessage } from 'node:http'
 import { WebSocketServer, WebSocket } from 'ws'
 import { TapflowClient, REASON_ADVICE, SessionEndedError, SessionLeftError, reasonAdvice } from '../client.js'
 import { makeFlowDriver } from '../tools.js'
-import { EnvironmentStepError, TransientQueryError } from '@tapflowio/flow-runner'
+import { EnvironmentStepError, TransientQueryError, isEnvironmentStepFailure } from '@tapflowio/flow-runner'
 
 // inputAck models the agent's terminal-input ack: 'done' = new agent (booted), 'error' = rejects with prose only, 'error-with-reason' = rejects with the machine-readable reason too, 'none' = older agent that never acks (degradation).
 function createMockRelay(): {
@@ -866,6 +866,43 @@ describe('TapflowClient', () => {
     it('throws on app:launch-error', async () => {
       echoReply(relay, 'app:launch', { type: 'app:launch-error', sessionId: 'sess-1', message: 'Bundle ID not available' })
       await expect(client.launchApp('sess-1', 99)).rejects.toThrow('Bundle ID not available')
+    })
+
+    // #1047. An older relay strips the options and an older agent ignores them, and both still answer done.
+    it('refuses a malformed applied as an environment failure', async () => {
+      echoReply(relay, 'app:launch', { type: 'app:launch-done', sessionId: 'sess-1', applied: { arguments: ['a'] } })
+      const err = await client.launchApp('sess-1', 42).catch((e: unknown) => e)
+      expect((err as Error).message).toMatch(/malformed list of applied options/)
+    })
+
+    it('sends options to a relay that carries them and accepts the applied keys', async () => {
+      echoReply(relay, 'agents:list', { type: 'agents:listed', sessions: [], features: ['launch-options'] })
+      echoReply(relay, 'app:launch', { type: 'app:launch-done', sessionId: 'sess-1', applied: { arguments: ['flag'], env: [] } })
+      const sent = waitForMessage(relay, 'app:launch')
+      await expect(client.launchApp('sess-1', 42, { arguments: { flag: true } })).resolves.toEqual({ arguments: ['flag'], env: [] })
+      expect(await sent).toMatchObject({ buildId: 42, arguments: { flag: true } })
+    })
+
+    it('refuses options before sending when the relay does not carry them', async () => {
+      echoReply(relay, 'agents:list', { type: 'agents:listed', sessions: [] })
+      const err = await client.launchApp('sess-1', 42, { arguments: { flag: true } }).catch((e: unknown) => e)
+      expect((err as Error).message).toMatch(/relay is too old/)
+      // run_flow reports it as an environment failure, as the CLI does.
+      expect(isEnvironmentStepFailure(err)).toBe(true)
+    })
+
+    it('counts an agent-outdated refusal as an environment failure', async () => {
+      echoReply(relay, 'agents:list', { type: 'agents:listed', sessions: [], features: ['launch-options'] })
+      echoReply(relay, 'app:launch', { type: 'app:launch-error', sessionId: 'sess-1', message: 'agent too old', reason: 'agent-outdated' })
+      const err = await client.launchApp('sess-1', 42, { arguments: { flag: true } }).catch((e: unknown) => e)
+      expect((err as Error).message).toMatch(/agent too old/)
+      expect(isEnvironmentStepFailure(err)).toBe(true)
+    })
+
+    it('fails a launch answered without the applied keys', async () => {
+      echoReply(relay, 'agents:list', { type: 'agents:listed', sessions: [], features: ['launch-options'] })
+      echoReply(relay, 'app:launch', { type: 'app:launch-done', sessionId: 'sess-1' })
+      await expect(client.launchApp('sess-1', 42, { arguments: { flag: true } })).rejects.toThrow(/without the launch arguments/)
     })
   })
 

@@ -127,12 +127,15 @@ export function loadVideo(index: VideoIndex, file: ArrayBuffer): LoadedVideo {
   const steps = records.flatMap((r) => (r.kind === 'event' && r.event.type === 'step' && r.event.phase === 'start'
     ? [{ index: r.event.index, name: r.event.name, ms: r.ms }]
     : []))
-  const ends = new Map(records.flatMap((r) => (r.kind === 'event' && r.event.type === 'step' && r.event.phase === 'end' ? [[r.event.index, r.event.status]] : [])))
+  const ends = new Map(records.flatMap((r) => (r.kind === 'event' && r.event.type === 'step' && r.event.phase === 'end' ? [[r.event.index, r.event]] : [])))
   return {
     meta: index.meta, records, chunkStarts, chunks, durationMs, gaps,
+    // The end mark's name, when there is one: a launch learns which of the relay's defaults it applied only once it
+    // answers, so its end mark is the one that matches the run record.
     steps: steps.map((s) => {
-      const status = ends.get(s.index)
-      return status ? { ...s, status } : s
+      const end = ends.get(s.index)
+      if (!end) return s
+      return { ...s, name: end.name || s.name, ...(end.status ? { status: end.status } : {}) }
     }),
   }
 }

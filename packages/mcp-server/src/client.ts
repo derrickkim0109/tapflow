@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type {
-  BootRefusalReason, BrowserToRelay, DeviceSummary, InputErrorReason, SessionTerminatedReason, UIElement,
+  BootRefusalReason, BrowserToRelay, DeviceSummary, InputErrorReason, LaunchApplied, LaunchOptions, SessionTerminatedReason, UIElement,
 } from '@tapflowio/protocol'
-import { AdmissionRefusedError, EnvironmentStepError, TransientQueryError, authHeader, fetchWithToken, fixedToken, lookupBuild, tokenRefusal, type BuildLookup, type TokenSource } from '@tapflowio/flow-runner'
+import { AdmissionRefusedError, EnvironmentStepError, TransientQueryError, markEnvironmentFailure, authHeader, fetchWithToken, fixedToken, lookupBuild, tokenRefusal, type BuildLookup, type TokenSource } from '@tapflowio/flow-runner'
 
 // Protocol owns the wire shape; this file used to declare an identical copy under a name the
 // relay uses for a *different* shape. Kept exported as `DeviceInfo` because that is this
@@ -781,6 +781,14 @@ export class TapflowClient {
     })
   }
 
+  /** What the relay says it understands beyond the base protocol. An older relay omits the list. */
+  private async relayFeatures(): Promise<string[]> {
+    this.send({ type: 'agents:list' })
+    const msg = await this.waitFor((m) => m['type'] === 'agents:listed', 5_000)
+    const features = msg['features']
+    return Array.isArray(features) ? features.filter((f): f is string => typeof f === 'string') : []
+  }
+
   async listDevices(): Promise<AgentSession[]> {
     this.send({ type: 'agents:list' })
     const msg = await this.waitFor((m) => m['type'] === 'agents:listed', 5_000)
@@ -1204,9 +1212,13 @@ export class TapflowClient {
     }
   }
 
-  async launchApp(sessionId: string, buildId: number): Promise<void> {
+  async launchApp(sessionId: string, buildId: number, options?: LaunchOptions): Promise<LaunchApplied | undefined> {
+    // An older relay's validator strips both fields and still answers done. Same check as flow-runner's client.
+    if (options && !(await this.relayFeatures()).includes('launch-options')) {
+      throw markEnvironmentFailure(this.failed(sessionId, 'This tapflow relay is too old to pass launch arguments — update the relay'))
+    }
     const requestId = randomUUID()
-    this.send({ type: 'app:launch', sessionId, requestId, buildId })
+    this.send({ type: 'app:launch', sessionId, requestId, buildId, ...options })
     const msg = await this.waitFor(
       (m) =>
         (m['type'] === 'app:launch-done' || m['type'] === 'app:launch-error') &&
@@ -1215,8 +1227,21 @@ export class TapflowClient {
       sessionId,
     )
     if (msg['type'] === 'app:launch-error') {
-      throw this.failed(sessionId, (msg['message'] as string) ?? 'Launch failed')
+      const err = this.failed(sessionId, (msg['message'] as string) ?? 'Launch failed')
+      throw msg['reason'] === 'agent-outdated' ? markEnvironmentFailure(err) : err
     }
+    // The agent names the keys it applied; an agent that predates them launched without them.
+    if (options && msg['applied'] === undefined) {
+      throw markEnvironmentFailure(this.failed(sessionId, 'The device\'s tapflow agent launched the app without the launch arguments — update tapflow on that Mac'))
+    }
+    const applied = msg['applied']
+    if (applied === undefined) return undefined
+    // Read off an agent's reply, which nothing on the way validates; a malformed one would throw later, after the
+    // app is up, and be counted as the app failing.
+    if (!isLaunchApplied(applied)) {
+      throw markEnvironmentFailure(this.failed(sessionId, 'The device\'s tapflow agent answered the launch with a malformed list of applied options — update tapflow on that Mac'))
+    }
+    return applied
   }
 
   async screenshot(sessionId: string, format: 'png' | 'jpeg' = 'png', signal?: AbortSignal): Promise<Buffer> {
@@ -1443,4 +1468,9 @@ export class TapflowClient {
         })),
     }))
   }
+}
+
+function isLaunchApplied(v: unknown): v is LaunchApplied {
+  const names = (x: unknown) => Array.isArray(x) && x.every((s) => typeof s === 'string')
+  return typeof v === 'object' && v !== null && names((v as Record<string, unknown>)['arguments']) && names((v as Record<string, unknown>)['env'])
 }

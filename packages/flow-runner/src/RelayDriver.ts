@@ -1,4 +1,5 @@
 import type { FlowDriver } from './engine.js'
+import type { LaunchApplied, LaunchOptions } from '@tapflowio/protocol'
 import {
   ENVIRONMENTAL_INPUT_REASONS,
   InputRefusedError,
@@ -85,12 +86,12 @@ export class RelayDriver implements FlowDriver {
 
   openUrl(url: string) { return this.guard(() => this.client.openUrl(this.sessionId, url)) }
 
-  async launchApp(): Promise<void> {
+  async launchApp(options?: LaunchOptions): Promise<LaunchApplied | undefined> {
     const buildId = this.buildId
     if (buildId === undefined) {
       throw new EnvironmentStepError('launchApp needs a build under test — pass --build <id> (CLI) or buildId (run_flow)')
     }
-    await this.guard(() => this.client.launchApp(this.sessionId, buildId))
+    return this.guard(() => this.client.launchApp(this.sessionId, buildId, options))
   }
 
   clearState(appId: string) { return this.guard(() => this.client.clearState(this.sessionId, appId)) }

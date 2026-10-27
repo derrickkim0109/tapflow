@@ -17,6 +17,7 @@ import { classifyBoot } from './admission/classifyBoot.js'
 import { hostKeyOf } from './admission/hostKey.js'
 import { chooseLease, type LeaseCandidate, type LeaseHost } from './admission/leaseChoice.js'
 import { directionOf, parseInbound, readyFacts } from '@tapflowio/protocol/validate'
+import { compactLaunchOptions, launchOptionsProblem } from '@tapflowio/protocol/launch'
 import type { ParsedInbound, ParseFailure, ParseResult } from '@tapflowio/protocol/validate'
 import { Router, json } from './router.js'
 import { requireViewAuth, requireAuth, getAuth, verifyPat, touchPat, findPat, findUser } from './middleware/auth.js'
@@ -27,7 +28,8 @@ import { resolveBuildFile } from './lib/buildFiles.js'
 import { resolveCorsHeaders } from './lib/cors.js'
 import { isCsrfBlocked } from './lib/csrf.js'
 import { pickLanAddress, runningInContainer } from './lib/lanAddress.js'
-import { config, getJwtSecret } from './lib/config.js'
+import { config, getJwtSecret, type LaunchDefaults } from './lib/config.js'
+import { mergeLaunch, unmatchedLaunchKeys } from './lib/launchDefaults.js'
 import { forTeammates, resolveAgentRelayUrl, resolvePublicBaseUrl, type TunnelRuntime } from './lib/publicUrl.js'
 import { createTrailingRequester, systemTimerScheduler, type TrailingRequester } from './lib/trailingRequester.js'
 import { getDb } from './db.js'
@@ -392,6 +394,8 @@ export class RelayServer {
   private warnedTrustedProxyWithoutXff = false
   /** Agent identities already warned about a missing `build-download`. See `warnLegacyInstaller`. */
   private readonly warnedLegacyInstaller = new Set<string>()
+  /** `<bundle id>:<what was left out>` already warned about. Bounded by the config's keys, two reasons each. */
+  private readonly warnedDroppedDefaults = new Set<string>()
   private readonly buildTickets = new BuildTicketStore()
   private pendingScreenshots = new Map<string, {
     sessionId: string
@@ -451,7 +455,7 @@ export class RelayServer {
     timer: ReturnType<typeof setTimeout>
   }>()
 
-  constructor(private readonly options: { port: number; publicDir?: string; uploadsDir?: string; idleTimeoutMs?: number; wsBackpressureBytes?: number; screenshotTimeoutMs?: number; uiTreeTimeoutMs?: number; trustedProxies?: string[]; corsOrigins?: string[]; tls?: { cert: string; key: string }; agentGraceMs?: number; pendingBootTtlMs?: number; bootGate?: Partial<GateTiming>; evictionGraceMs?: number; tunnel?: TunnelRuntime; tunnelPort?: number }) {
+  constructor(private readonly options: { port: number; publicDir?: string; uploadsDir?: string; idleTimeoutMs?: number; wsBackpressureBytes?: number; screenshotTimeoutMs?: number; uiTreeTimeoutMs?: number; trustedProxies?: string[]; corsOrigins?: string[]; tls?: { cert: string; key: string }; agentGraceMs?: number; pendingBootTtlMs?: number; bootGate?: Partial<GateTiming>; evictionGraceMs?: number; tunnel?: TunnelRuntime; tunnelPort?: number; launchDefaults?: LaunchDefaults }) {
     // 0 on both sides is two ephemeral ports, which is what the tests ask for.
     if (options.tunnelPort !== undefined && options.tunnelPort !== 0 && options.tunnelPort === options.port) {
       throw new Error(`The tunnel port (${options.tunnelPort}) must differ from the relay port. Set TAPFLOW_TUNNEL_PORT to another port.`)
@@ -681,6 +685,7 @@ export class RelayServer {
     getJwtSecret()
     this.warnOrphanedAgentTokens()
     this.warnDuplicateEmails()
+    this.warnUnmatchedLaunchDefaults()
     purgeExpiredRecordings(this.recordingsDir)
     this.purgeRecordingsTimer = setInterval(() => purgeExpiredRecordings(this.recordingsDir), 24 * 60 * 60 * 1000)
     this.purgeRecordingsTimer.unref()
@@ -807,6 +812,24 @@ export class RelayServer {
   /** The tunnel listener's address, or null when this relay was given no `tunnelPort`. */
   tunnelAddress() {
     return this.tunnelServer?.address() ?? null
+  }
+
+  // Once per app and reason: an app shared by iOS and Android with an env default would otherwise warn on every
+  // Android launch.
+  private warnDroppedDefaults(bundleId: string, dropped: 'all' | 'env'): void {
+    const key = `${bundleId}:${dropped}`
+    if (this.warnedDroppedDefaults.has(key)) return
+    this.warnedDroppedDefaults.add(key)
+    logger.warn(dropped === 'all'
+      ? `${bundleId}: launched without its launch defaults — the device's tapflow agent is too old to pass them`
+      : `${bundleId}: launched without its env defaults — the device's tapflow agent cannot set an app's environment (Android, or an older agent)`)
+  }
+
+  private warnUnmatchedLaunchDefaults(): void {
+    const keys = this.options.launchDefaults?.keys()
+    if (!keys) return
+    const uploaded = (getDb().prepare('SELECT DISTINCT bundle_id FROM builds WHERE bundle_id IS NOT NULL').all() as { bundle_id: string }[]).map((r) => r.bundle_id)
+    for (const warning of unmatchedLaunchKeys(keys, uploaded)) logger.warn(warning)
   }
 
   /**
@@ -1583,7 +1606,7 @@ export class RelayServer {
         this.sendTo(ws, {
           type: 'agents:listed',
           sessions: this.sessions.list(this.ownerOf(ws), (holder) => this.isAlive(holder), (group) => this.macAdmission(group)),
-          features: ['device-lease'],
+          features: ['device-lease', 'launch-options'],
         })
         break
       }
@@ -3486,7 +3509,8 @@ export class RelayServer {
     // fifth: a throw out of `getDb().prepare(…).get(…)` — SQLITE_BUSY, a closed db, I/O — unwinds to the
     // message-loop catch and answers nothing at all. Pre-existing and unchanged here, but "every exit
     // carries the request's id" would be false.
-    const fail = (message: string) => this.sendTo(ws, { type: 'app:launch-error', sessionId, requestId, message })
+    const fail = (message: string, reason?: 'agent-outdated') =>
+      this.sendTo(ws, { type: 'app:launch-error', sessionId, requestId, message, ...(reason ? { reason } : {}) })
 
     const session = this.sessions.get(sessionId)
     if (!session) return fail('Session not found')
@@ -3505,13 +3529,32 @@ export class RelayServer {
 
     if (session.agentSocket.readyState !== WebSocket.OPEN) return fail('agent offline')
 
+    // The door checked the shape; this is the same rule every producer applies, answered with the key and the reason.
+    const problem = launchOptionsProblem({ arguments: msg.arguments, env: msg.env })
+    if (problem) return fail(problem)
+    const caller = compactLaunchOptions({ arguments: msg.arguments, env: msg.env })
+    // An agent that predates the options ignores both fields and launches without them, then answers done.
+    if (caller && !hasCapability(session.agentCapabilities, 'launch-options')) {
+      return fail('This device\'s tapflow agent is too old to pass launch arguments. Update tapflow on the Mac running it', 'agent-outdated')
+    }
+    // `Object.hasOwn` is not needed: a Map holds only what the config named, whatever the uploaded id is called.
+    const merged = mergeLaunch(this.options.launchDefaults?.get(build.bundle_id), caller, {
+      options: hasCapability(session.agentCapabilities, 'launch-options'),
+      env: hasCapability(session.agentCapabilities, 'launch-env'),
+    })
+    if (merged.dropped) this.warnDroppedDefaults(build.bundle_id, merged.dropped)
+    // Each side passed on its own; together they can exceed the limits.
+    const together = merged.options && caller ? launchOptionsProblem(merged.options) : null
+    if (together) return fail(`${together}, counting this app's launch defaults in tapflow.config.json`)
+    const options = merged.options
+
     // See `handleBrowserAppInstall` — the correlator rides across the rebuild, and only a test says the
     // value is the request's.
     this.sendTo(session.agentSocket, {
       type: 'app:launch',
       sessionId,
       requestId,
-      payload: { bundleId: build.bundle_id },
+      payload: { bundleId: build.bundle_id, ...options, ...(merged.defaultsOnly ? { defaultsOnly: true } : {}) },
     })
     this.tellWatchersAction(sessionId, { kind: 'launch' })
   }

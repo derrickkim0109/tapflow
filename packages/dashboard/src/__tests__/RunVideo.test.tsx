@@ -54,6 +54,16 @@ function fixture() {
 }
 
 describe('runVideo', () => {
+  // #1047: a launch learns which of the relay's defaults it applied only when it answers, so its end mark names them
+  // and its start mark cannot. The timeline shows the name the run record shows.
+  it('names a step by its end mark when the two differ', () => {
+    const file = concat([record(1, 0, frame(true)),
+      event(100, { type: 'step', index: 0, name: 'launchApp', phase: 'start' }),
+      event(900, { type: 'step', index: 0, name: 'launchApp(config: a)', phase: 'end', status: 'passed' })])
+    const index: VideoIndex = { ...fixture().index, bytes: file.length, chunks: [{ seq: 0, offset: 0, length: file.length, startMs: 0, keyframe: true }], gaps: [] }
+    expect(loadVideo(index, file.buffer).steps).toEqual([{ index: 0, name: 'launchApp(config: a)', ms: 100, status: 'passed' }])
+  })
+
   it('reads records, the steps with their outcome, the duration and where frames are missing', () => {
     const { index, file } = fixture()
     const v = loadVideo(index, file)

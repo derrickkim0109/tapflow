@@ -361,6 +361,27 @@ describe('SimctlWrapper', () => {
       const wrapper = new SimctlWrapper(runner)
       await expect(wrapper.launchApp('dev-1', 'com.example.app')).resolves.toBeNull()
     })
+
+    // Without options a running app is only brought forward, as before #1047; with them it is restarted, because a
+    // running process has already read its arguments.
+    it('restarts the app and passes arguments as argv and env as SIMCTL_CHILD_ when given options', async () => {
+      const runner = mockRunner({ launch: 'com.example.app: 4242\n' })
+      const wrapper = new SimctlWrapper(runner)
+      await expect(wrapper.launchApp('dev-1', 'com.example.app', { arguments: { FIRDebugEnabled: true, offset: -1 }, env: { API_HOST: 's.example.com' } })).resolves.toBe(4242)
+      expect(runner.exec).not.toHaveBeenCalled()
+      expect(runner.execWithOpts).toHaveBeenCalledWith(
+        { env: { SIMCTL_CHILD_API_HOST: 's.example.com' } },
+        'launch', '--terminate-running-process', 'dev-1', 'com.example.app', '-FIRDebugEnabled', '"true"', '-offset', '"-1"',
+      )
+    })
+
+    it('treats empty option maps as a plain launch', async () => {
+      const runner = mockRunner()
+      const wrapper = new SimctlWrapper(runner)
+      await wrapper.launchApp('dev-1', 'com.example.app', { arguments: {}, env: {} })
+      expect(runner.exec).toHaveBeenCalledWith('launch', 'dev-1', 'com.example.app')
+      expect(runner.execWithOpts).not.toHaveBeenCalled()
+    })
   })
 
   describe('openUrl', () => {

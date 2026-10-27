@@ -196,6 +196,47 @@ steps:
     })
   })
 
+  // #1047. The rules themselves are tested in protocol; this is that the flow loader applies them, at load time.
+  describe('launchApp with options', () => {
+    it('carries arguments and env', () => {
+      const flow = parseFlow('steps:\n  - launchApp:\n      arguments:\n        FIRDebugEnabled: true\n        port: "8080"\n        AppleLanguages: [en]\n      env:\n        API_HOST: s.example.com\n', 'x.yaml')
+      expect(flow.steps[0]).toEqual({ type: 'launchApp', options: { arguments: { FIRDebugEnabled: true, port: '8080', AppleLanguages: ['en'] }, env: { API_HOST: 's.example.com' } } })
+    })
+
+    it('reads an empty mapping or a null value as the bare step', () => {
+      expect(parseFlow('steps:\n  - launchApp:\n', 'x.yaml').steps[0]).toEqual({ type: 'launchApp' })
+      expect(parseFlow('steps:\n  - launchApp: { arguments: {} }\n', 'x.yaml').steps[0]).toEqual({ type: 'launchApp' })
+    })
+
+    it.each([
+      ['a fraction', 'launchApp: { arguments: { r: 1.5 } }', /steps\[0\]: launchApp arguments\.r: .*quote 1\.5/],
+      ['a dashed key', 'launchApp: { arguments: { -FIRDebugEnabled: true } }', /without the leading "-"/],
+      ['a reserved env name', 'launchApp: { env: { DYLD_INSERT_LIBRARIES: x } }', /reserved/],
+      ['an unknown key', 'launchApp: { args: { a: 1 } }', /unknown launchApp keys: args/],
+      ['a string', 'launchApp: now', /takes \{ arguments, env \}/],
+    ])('refuses %s when the flow loads', (_, step, message) => {
+      expect(() => parseFlow(`steps:\n  - ${step}\n`, 'x.yaml')).toThrow(message)
+    })
+
+    it('agrees with the JSON schema on key forms', () => {
+      const schema = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'tapflow-flow.schema.json'), 'utf8'))
+      const step = schema.definitions.step.oneOf.find((s: { properties?: Record<string, unknown> }) => s.properties?.launchApp)
+      const opts = step.properties.launchApp.oneOf[1].properties
+      const argKey = new RegExp(opts.arguments.propertyNames.pattern)
+      const envName = new RegExp(opts.env.propertyNames.pattern)
+      for (const key of ['FIRDebugEnabled', 'com.apple.CoreData.SQLDebug', 'a-b']) {
+        expect(argKey.test(key)).toBe(true)
+        expect(() => parseFlow(`steps:\n  - launchApp: { arguments: { ${key}: "1" } }\n`, 'x.yaml')).not.toThrow()
+      }
+      for (const key of ['-x', '_x', 'a b']) {
+        expect(argKey.test(key)).toBe(false)
+        expect(() => parseFlow(`steps:\n  - launchApp: { arguments: { "${key}": "1" } }\n`, 'x.yaml')).toThrow()
+      }
+      for (const name of ['API_HOST', '_X']) expect(envName.test(name)).toBe(true)
+      for (const name of ['1X', 'A-B']) expect(envName.test(name)).toBe(false)
+    })
+  })
+
   it('keeps the JSON schema timeout floor consistent with the parser', () => {
     // The parser rejects timeouts that round to 0ms, i.e. anything below
     // 0.0005s — so the shipped JSON schema must reject them too, or

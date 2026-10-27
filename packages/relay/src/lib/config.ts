@@ -8,6 +8,7 @@ import { dnsProviders } from './cert/dnsRegistry.js'
 import { loadDataDirEnv } from './loadEnvFile.js'
 import { resolveInstallDir, resolveDefaultDataDir, LEGACY_DATA_DIR, UNIFIED_DATA_DIR, type InstallDir } from './dataDir.js'
 import { validateWebhookUrl } from './webhookUrl.js'
+import { launchOptionsProblem, type LaunchOptions } from '@tapflowio/protocol/launch'
 
 const logger = createLogger('relay:config')
 
@@ -174,6 +175,73 @@ export function resolveWebhooksConfig(raw: unknown, env: NodeJS.ProcessEnv): Tap
   return out
 }
 
+/** Per-app launch defaults (#1047), keyed by bundle id. A Map, because the key is whatever a build was uploaded with. */
+export type LaunchDefaults = ReadonlyMap<string, LaunchOptions>
+
+// Names the relay reads its own secrets from. A launch default reaches any app uploaded under its bundle id, so
+// pointing one at these would hand the relay's credentials to that app.
+const RELAY_SECRET_ENV = /^(JWT_SECRET$|SMTP_|TAPFLOW_)/
+const BUNDLE_ID = /^[A-Za-z0-9_.-]+$/
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/**
+ * The `launch` section of tapflow.config.json, with `envFrom` read from the environment (the shell, then
+ * `<dataDir>/.env`). Returns every problem rather than the first, and never a value: the messages reach a log.
+ * `reserved` is the webhook `secretEnv` names, which are the relay's secrets too.
+ */
+export function parseLaunchDefaults(raw: unknown, env: NodeJS.ProcessEnv, reserved: ReadonlySet<string> = new Set()): { defaults: LaunchDefaults; problems: string[] } {
+  const defaults = new Map<string, LaunchOptions>()
+  const problems: string[] = []
+  if (raw === undefined || raw === null) return { defaults, problems }
+  if (!isRecord(raw)) return { defaults, problems: ['launch: a map of bundle id to { arguments, env, envFrom }'] }
+  for (const [bundleId, entry] of Object.entries(raw)) {
+    const at = `launch.${bundleId}`
+    if (!BUNDLE_ID.test(bundleId)) { problems.push(`${at}: not a bundle id or package name`); continue }
+    if (!isRecord(entry)) { problems.push(`${at}: a map with arguments, env and envFrom`); continue }
+    const unknown = Object.keys(entry).filter((k) => !['arguments', 'env', 'envFrom'].includes(k))
+    if (unknown.length > 0) { problems.push(`${at}: unknown ${unknown.join(', ')} (expected arguments, env, envFrom)`); continue }
+    const { envFrom } = entry
+    if (envFrom !== undefined && !isRecord(envFrom)) { problems.push(`${at}.envFrom: a map of app variable to the name of a variable in .env`); continue }
+    // No prototype, so an app variable named `__proto__` is kept as data rather than silently dropped.
+    const fromEnv = Object.create(null) as Record<string, unknown>
+    let bad = false
+    for (const [name, source] of Object.entries(envFrom ?? {})) {
+      if (isRecord(entry.env) && Object.hasOwn(entry.env, name)) { problems.push(`${at}: ${name} is in both env and envFrom`); bad = true; continue }
+      if (typeof source !== 'string' || source === '') { problems.push(`${at}.envFrom.${name}: the name of a variable in .env`); bad = true; continue }
+      if (RELAY_SECRET_ENV.test(source) || reserved.has(source)) { problems.push(`${at}.envFrom.${name}: ${source} is one of the relay's own secrets`); bad = true; continue }
+      if (env[source] === undefined) { problems.push(`${at}.envFrom.${name}: ${source} is not set in the environment or .env`); bad = true; continue }
+      fromEnv[name] = env[source]
+    }
+    if (bad) continue
+    // An env that is not a map goes to the shared check as it is, which says so.
+    const merged = envFrom === undefined ? entry.env : isRecord(entry.env) || entry.env === undefined ? { ...entry.env, ...fromEnv } : entry.env
+    const options = { arguments: entry.arguments, env: merged }
+    const problem = launchOptionsProblem(options)
+    if (problem) { problems.push(`${at}: ${problem}`); continue }
+    defaults.set(bundleId, options as LaunchOptions)
+  }
+  return { defaults, problems }
+}
+
+// The raw section, kept by load() and resolved only by what starts a relay: an `envFrom` names a variable in the
+// relay Mac's .env, and every CLI command imports this module — an agent-only Mac with the same file would otherwise
+// fail `tapflow doctor` and `tapflow init` over a relay it does not run.
+let rawLaunch: unknown
+let rawWebhookSecrets: string[] = []
+
+/** The launch defaults for a relay about to start, or exit with every problem, like a config error. */
+export function loadLaunchDefaults(): LaunchDefaults {
+  const { defaults, problems } = parseLaunchDefaults(rawLaunch, process.env, new Set(rawWebhookSecrets))
+  if (problems.length > 0) {
+    for (const p of problems) logger.error(`config error: ${p}`)
+    process.exit(1)
+  }
+  return defaults
+}
+
 // Populated by load(): path of the dataDir/.env that was loaded, or null. CLI/server use it for a "loaded credentials" log.
 export let loadedEnvPath: string | null = null
 
@@ -301,6 +369,10 @@ function load(): TapflowConfig {
       lean: file.agent?.lean ?? DEFAULTS.agent.lean,
     },
   }
+
+  rawLaunch = (file as { launch?: unknown }).launch
+  const webhooks = (file as { webhooks?: unknown }).webhooks
+  rawWebhookSecrets = Array.isArray(webhooks) ? webhooks.flatMap((w: unknown) => isRecord(w) && typeof w.secretEnv === 'string' ? [w.secretEnv] : []) : []
 
   if (process.env.TAPFLOW_PORT) cfg.local.port = Number(process.env.TAPFLOW_PORT)
   if (process.env.TAPFLOW_TUNNEL_PORT) cfg.local.tunnelPort = Number(process.env.TAPFLOW_TUNNEL_PORT)

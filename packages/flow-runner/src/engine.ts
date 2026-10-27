@@ -1,4 +1,5 @@
 import type { UIElement } from '@tapflowio/agent-core'
+import type { LaunchApplied, LaunchOptions } from '@tapflowio/protocol'
 import type { Flow, Selector, Step, ScrollDirection } from './schema.js'
 import { matchSelector } from './selector.js'
 import { suggestSelectors, type SelectorSuggestion } from './suggest.js'
@@ -15,7 +16,11 @@ export interface FlowDriver {
   inputText(text: string): Promise<void>
   pressKey(code: string): Promise<void>
   openUrl(url: string): Promise<void>
-  launchApp(): Promise<void>
+  /**
+   * With options, the app is started fresh with them, or the launch fails; they are never dropped (#1047). Resolves to
+   * the names applied, which can include the relay's per-app defaults; `void` keeps a driver that predates it valid.
+   */
+  launchApp(options?: LaunchOptions): Promise<LaunchApplied | void>
   clearState(appId: string): Promise<void>
   screenshot(signal?: AbortSignal): Promise<Buffer>
 }
@@ -115,10 +120,30 @@ function describeSelector(sel: Selector): string {
   return parts.join(', ')
 }
 
+// What a run record and a failure message show. Argument values are shown, since they are what makes this launch
+// differ from a plain one; env values never are, because env is where a flow is told to put a secret.
+function describeLaunchOptions(opts: LaunchOptions): string {
+  const args = Object.entries(opts.arguments ?? {}).map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+  const env = Object.keys(opts.env ?? {}).map((k) => `${k}=***`)
+  return [...args, ...(env.length > 0 ? [`env ${env.join(', ')}`] : [])].join(', ')
+}
+
+// The step's own options, then the keys the relay's per-app defaults added (names only: their values are not sent
+// back, and a run record must not depend on reading the relay's config to be understood). The relay keeps a step name
+// to 500 characters, so a launch with dozens of long keys loses the last of them there.
+function describeLaunch(options: LaunchOptions | undefined, applied: LaunchApplied | void): string {
+  const own = options ? describeLaunchOptions(options) : ''
+  const args = applied ? applied.arguments.filter((k) => !Object.hasOwn(options?.arguments ?? {}, k)) : []
+  const env = applied ? applied.env.filter((k) => !Object.hasOwn(options?.env ?? {}, k)) : []
+  const config = [...args, ...(env.length > 0 ? [`env ${env.join(', ')}`] : [])].join(', ')
+  const parts = [own, config ? `config: ${config}` : ''].filter(Boolean).join('; ')
+  return parts ? `launchApp(${parts})` : 'launchApp'
+}
+
 function describeStep(step: Step): string {
   switch (step.type) {
     case 'clearState': return step.appId ? `clearState(${step.appId})` : 'clearState'
-    case 'launchApp': return 'launchApp'
+    case 'launchApp': return describeLaunch(step.options, undefined)
     case 'tapOn': return `tapOn(${describeSelector(step.selector)})`
     case 'inputText': return `inputText("${step.text}")`
     case 'pressKey': return `pressKey(${step.code})`
@@ -378,7 +403,8 @@ function screenShape(tree: UIElement[]): string {
   return JSON.stringify(tree.map((e) => [e.role, e.label, e.identifier ?? '']))
 }
 
-async function executeStep(step: Step, flow: Flow, driver: FlowDriver, timeoutMs: number, pollIntervalMs: number): Promise<void> {
+// Resolves to what a launch applied; every other step to nothing.
+async function executeStep(step: Step, flow: Flow, driver: FlowDriver, timeoutMs: number, pollIntervalMs: number): Promise<LaunchApplied | void> {
   switch (step.type) {
     case 'clearState': {
       // `parseFlow` rejects the bare form without a flow-level appId, but `runFlow` is exported and does not
@@ -391,8 +417,10 @@ async function executeStep(step: Step, flow: Flow, driver: FlowDriver, timeoutMs
       return
     }
     case 'launchApp': {
-      await driver.launchApp()
-      return waitForScreen(driver, timeoutMs, pollIntervalMs)
+      const applied = await driver.launchApp(step.options)
+      // Never throws: an app that dies on a default fails the next step, and this one's name already says which.
+      await waitForScreen(driver, timeoutMs, pollIntervalMs)
+      return applied
     }
     case 'tapOn': {
       const el = await resolveOne(driver, step.selector, timeoutMs, pollIntervalMs)
@@ -421,18 +449,21 @@ export async function runFlow(flow: Flow, driver: FlowDriver, options: EngineOpt
   let failureScreenshot: Buffer | undefined
 
   for (const [index, step] of flow.steps.entries()) {
-    const name = describeStep(step)
+    const started = describeStep(step)
     if (failureMessage !== undefined) {
-      steps.push({ index, name, status: 'skipped', durationMs: 0 })
+      steps.push({ index, name: started, status: 'skipped', durationMs: 0 })
       continue
     }
     const stepStart = Date.now()
-    options.onStep?.({ index, name, phase: 'start', label: activityLabel(step) })
+    options.onStep?.({ index, name: started, phase: 'start', label: activityLabel(step) })
     try {
-      await executeStep(step, flow, driver, timeoutMs, pollIntervalMs)
+      const applied = await executeStep(step, flow, driver, timeoutMs, pollIntervalMs)
+      // Known only once the launch answers, so the start mark carries the name without the relay's defaults.
+      const name = step.type === 'launchApp' && applied ? describeLaunch(step.options, applied) : started
       steps.push({ index, name, status: 'passed', durationMs: Date.now() - stepStart })
       options.onStep?.({ index, name, phase: 'end', status: 'passed' })
     } catch (e) {
+      const name = started
       const message = e instanceof Error ? e.message : String(e)
       failureMessage = `${name}: ${message}`
       if (failureKind === undefined) failureKind = isEnvironmentStepFailure(e) ? 'environment' : 'product'

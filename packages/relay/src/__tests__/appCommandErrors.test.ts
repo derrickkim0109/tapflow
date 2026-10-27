@@ -13,6 +13,8 @@ import type { AgentRegistered } from '@tapflowio/protocol'
 // it was asked about. A dashboard viewer holds one session per socket so an unattributed error
 // still lands somewhere sensible; an MCP caller waits for its own sessionId and cannot tell an
 // unattributed error from silence. The worst of the three paths sent nothing at all.
+const DEFAULTS = { arguments: { a: 1, b: 2 }, env: { LOG_LEVEL: 'debug' } }
+
 describe('app command failures reach the caller (#445)', () => {
   let server: RelayServer
   let port: number
@@ -35,7 +37,8 @@ describe('app command failures reach the caller (#445)', () => {
   })
 
   beforeEach(async () => {
-    server = new RelayServer({ port: 0 })
+    // Defaults for an app of its own, so every other test here launches an app with none.
+    server = new RelayServer({ port: 0, launchDefaults: new Map([['com.example.defaults', DEFAULTS]]) })
     await server.start()
     port = (server.address() as { port: number }).port
   })
@@ -44,12 +47,13 @@ describe('app command failures reach the caller (#445)', () => {
     await server.stop()
   })
 
-  async function connectAgentAndBrowser() {
+  async function connectAgentAndBrowser(capabilities?: string[]) {
     const agent = new WebSocket(`ws://localhost:${port}`)
     await waitForOpen(agent)
     agent.send(JSON.stringify({
       type: 'agent:register', platform: 'ios', agentName: 'appCommandErrors-1',
       devices: [{ id: 'dev-1', name: 'iPhone', platform: 'ios', status: 'booted' }],
+      ...(capabilities ? { capabilities } : {}),
     }))
     const reply = await waitForType<AgentRegistered>(agent, 'agent:registered')
     const sessionId = reply.registeredSessions[0]!.sessionId
@@ -347,8 +351,113 @@ describe('app command failures reach the caller (#445)', () => {
     expect(forwarded.sessionId).toBe(sessionId)
     expect((forwarded.payload as { bundleId: string }).bundleId).toBe('com.example.demo')
     expect(forwarded.requestId).toBe('rq-11')
+    // No options asked for, none invented: an agent of any version reads this payload as it always did.
+    expect(forwarded.payload).toEqual({ bundleId: 'com.example.demo' })
 
     agent.close(); browser.close()
+  })
+
+  // #1047. The relay forwards the parse product, so these fields reach the agent only because the schema names them.
+  it('forwards launch arguments and env to an agent that applies them', async () => {
+    const { agent, browser, sessionId } = await connectAgentAndBrowser(['launch-options'])
+    const buildId = insertBuild('com.example.demo')
+
+    browser.send(JSON.stringify({ type: 'app:launch', requestId: 'rq-12', sessionId, buildId, arguments: { FIRDebugEnabled: true }, env: { API_HOST: 'x' } }))
+    const forwarded = await waitForType(agent, 'app:launch')
+
+    expect(forwarded.payload).toEqual({ bundleId: 'com.example.demo', arguments: { FIRDebugEnabled: true }, env: { API_HOST: 'x' } })
+
+    agent.close(); browser.close()
+  })
+
+  // An agent without the capability ignores both fields and launches anyway, answering done — so the launch the
+  // caller asked for never happens and nothing says so.
+  it('refuses launch arguments for an agent that predates them, and still forwards a plain launch', async () => {
+    const { agent, browser, sessionId } = await connectAgentAndBrowser()
+    const buildId = insertBuild('com.example.demo')
+
+    browser.send(JSON.stringify({ type: 'app:launch', requestId: 'rq-13', sessionId, buildId, arguments: { a: 1 } }))
+    const msg = await waitForType(browser, 'app:launch-error')
+    expect(msg.requestId).toBe('rq-13')
+    expect(msg.message).toMatch(/too old to pass launch arguments/)
+    // What lets a flow runner count it as a version mismatch (exit 2) rather than the app failing.
+    expect(msg.reason).toBe('agent-outdated')
+
+    browser.send(JSON.stringify({ type: 'app:launch', requestId: 'rq-14', sessionId, buildId, arguments: {}, env: {} }))
+    expect((await waitForType(agent, 'app:launch')).requestId).toBe('rq-14')
+
+    agent.close(); browser.close()
+  })
+
+  it('refuses options the shared check refuses, naming the key, without forwarding', async () => {
+    const { agent, browser, sessionId } = await connectAgentAndBrowser(['launch-options'])
+    const buildId = insertBuild('com.example.demo')
+
+    browser.send(JSON.stringify({ type: 'app:launch', requestId: 'rq-15', sessionId, buildId, env: { SIMULATOR_UDID: 'other' } }))
+    const msg = await waitForType(browser, 'app:launch-error')
+    expect(msg.requestId).toBe('rq-15')
+    expect(msg.message).toMatch(/^env\.SIMULATOR_UDID: reserved/)
+    expect(msg.reason).toBeUndefined()
+    await barrier(agent)
+    expect(await waitForTypeOrNull(agent, 'app:launch', 0)).toBeNull()
+
+    agent.close(); browser.close()
+  })
+
+  // #1047, PR 2: tapflow.config.json's per-app defaults, merged here so the dashboard, MCP and flows all get them.
+  describe('launch defaults', () => {
+    const launch = async (caps: string[] | undefined, extra: Record<string, unknown> = {}) => {
+      const { agent, browser, sessionId } = await connectAgentAndBrowser(caps)
+      const buildId = insertBuild('com.example.defaults')
+      browser.send(JSON.stringify({ type: 'app:launch', requestId: 'rq-d', sessionId, buildId, ...extra }))
+      return { agent, browser }
+    }
+
+    it('sends them on a plain launch, marked as defaults only', async () => {
+      const { agent, browser } = await launch(['launch-options', 'launch-env'])
+      expect((await waitForType(agent, 'app:launch')).payload).toEqual({ bundleId: 'com.example.defaults', ...DEFAULTS, defaultsOnly: true })
+      agent.close(); browser.close()
+    })
+
+    it('merges the caller\'s options per key, the caller winning, and is no longer defaults only', async () => {
+      const { agent, browser } = await launch(['launch-options', 'launch-env'], { arguments: { b: 3 }, env: { X: '1' } })
+      expect((await waitForType(agent, 'app:launch')).payload).toEqual({
+        bundleId: 'com.example.defaults', arguments: { a: 1, b: 3 }, env: { LOG_LEVEL: 'debug', X: '1' },
+      })
+      agent.close(); browser.close()
+    })
+
+    it('leaves env defaults out for an agent that cannot set an app\'s environment', async () => {
+      const { agent, browser } = await launch(['launch-options'])
+      expect((await waitForType(agent, 'app:launch')).payload).toEqual({ bundleId: 'com.example.defaults', arguments: DEFAULTS.arguments, defaultsOnly: true })
+      agent.close(); browser.close()
+    })
+
+    // Refusing would fail every dashboard Launch of the app on that Mac until it is updated.
+    it('launches plainly on an agent that predates options, instead of refusing', async () => {
+      const { agent, browser } = await launch(undefined)
+      expect((await waitForType(agent, 'app:launch')).payload).toEqual({ bundleId: 'com.example.defaults' })
+      agent.close(); browser.close()
+    })
+
+    it('refuses when the caller\'s options and the defaults together pass a limit, naming the config', async () => {
+      const many = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`k${i}`, i]))
+      const { agent, browser } = await launch(['launch-options', 'launch-env'], { arguments: many })
+      const msg = await waitForType(browser, 'app:launch-error')
+      expect(msg.message).toMatch(/at most 32 .*launch defaults in tapflow\.config\.json/)
+      await barrier(agent)
+      expect(await waitForTypeOrNull(agent, 'app:launch', 0)).toBeNull()
+      agent.close(); browser.close()
+    })
+  })
+
+  it('advertises launch options to clients', async () => {
+    const browser = new WebSocket(`ws://localhost:${port}`)
+    await waitForOpen(browser)
+    const listed = waitForType(browser, 'agents:listed')
+    browser.send(JSON.stringify({ type: 'agents:list' }))
+    expect((await listed).features).toContain('launch-options')
+    browser.close()
   })
 
   // Door drops. Each asserts the request does not reach the agent, which is the half a compile error

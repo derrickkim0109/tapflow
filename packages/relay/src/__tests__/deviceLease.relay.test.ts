@@ -100,7 +100,7 @@ describe('the relay leases a device to an automation client', () => {
     await start()
     const ws = await open()
     ws.send(JSON.stringify({ type: 'agents:list' }))
-    expect((await waitForType<AgentsListed>(ws, 'agents:listed')).features).toEqual(['device-lease'])
+    expect((await waitForType<AgentsListed>(ws, 'agents:listed')).features).toContain('device-lease')
   })
 
   it('joins the asker, then boots with the lease correlator and what the lease asked for', async () => {

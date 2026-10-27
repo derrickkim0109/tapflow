@@ -51,7 +51,7 @@ steps:
 | 스텝 | 형태 | 동작 |
 |------|------|------|
 | `clearState` | 키워드 또는 `clearState: <bundleId>` | 앱 데이터를 초기화합니다. 키워드 형태는 최상위 `appId`를 씁니다. |
-| `launchApp` | 키워드 | 테스트 대상 빌드를 실행한 다음 앱 화면이 자리 잡을 때까지 기다립니다. UI 트리 요소의 역할·라벨·id가 1초 동안 그대로이면 화면이 뜬 것으로 보므로 스플래시를 첫 화면으로 착각하지 않습니다. 게임처럼 UI 트리 요소가 없는 화면도 1초 뒤에 넘어갑니다. 라벨이 계속 바뀌는 화면은 처음 읽힌 뒤 3초가 지나면 넘어가고 화면을 전혀 읽지 못하면 셀렉터 기본 대기 시간이 지나야 넘어갑니다. 이 대기 때문에 스텝이 실패하지는 않습니다. 1초 넘게 그대로 있는 스플래시는 첫 화면으로 잘못 볼 수 있습니다. |
+| `launchApp` | 키워드 또는 `launchApp: { arguments, env }` | 테스트 대상 빌드를 실행한 다음 앱 화면이 자리 잡을 때까지 기다립니다. UI 트리 요소의 역할·라벨·id가 1초 동안 그대로이면 화면이 뜬 것으로 보므로 스플래시를 첫 화면으로 착각하지 않습니다. 게임처럼 UI 트리 요소가 없는 화면도 1초 뒤에 넘어갑니다. 라벨이 계속 바뀌는 화면은 처음 읽힌 뒤 3초가 지나면 넘어가고 화면을 전혀 읽지 못하면 셀렉터 기본 대기 시간이 지나야 넘어갑니다. 이 대기 때문에 스텝이 실패하지는 않습니다. 1초 넘게 그대로 있는 스플래시는 첫 화면으로 잘못 볼 수 있습니다. 실행 인자를 넘기는 방법은 [실행 인자](#launch-arguments)에 있습니다. |
 | `tapOn` | 셀렉터 | 매칭된 요소의 중심을 탭합니다. |
 | `inputText` | 문자열 | 포커스된 입력 필드에 텍스트를 입력합니다. |
 | `pressKey` | 키 이름 | 키보드 키를 누릅니다(`Enter`, `Backspace`, `Escape` 등). |
@@ -107,7 +107,7 @@ steps:
 
 `tapflow flow run`은 플로우를 시작하기 전에 기기도 리셋합니다. 그래서 실행이 이전 실행의 데이터, 키체인, 권한을 이어받지 않습니다. 플로우 안에서 스텝 사이에 앱을 초기화할 때는 여전히 `clearState`를 씁니다. 실행이 리셋하는 항목은 [`tapflow flow run`](/ko/reference/cli#tapflow-flow-run)에 있습니다.
 
-`launchApp`은 앱이 이미 실행 중이면 앱을 새로 시작하지 않고 마지막 화면을 그대로 앞으로 가져옵니다. 앞선 실행이나 수동 테스트가 남긴 화면에서 플로우가 시작될 수 있으므로 앱의 첫 화면에서 시작해야 하는 플로우는 `launchApp` 앞에 `clearState`를 둡니다. `clearState`는 데이터를 지우기 전에 앱을 종료합니다.
+`launchApp`은 앱이 이미 실행 중이면 앱을 새로 시작하지 않고 마지막 화면을 그대로 앞으로 가져옵니다. 단, [실행 인자](#launch-arguments)를 넘기는 `launchApp`은 예외입니다. 앞선 실행이나 수동 테스트가 남긴 화면에서 플로우가 시작될 수 있으므로 앱의 첫 화면에서 시작해야 하는 플로우는 `launchApp` 앞에 `clearState`를 둡니다. `clearState`는 데이터를 지우기 전에 앱을 종료합니다.
 
 ```yaml
 # 최상위 appId를 사용
@@ -116,6 +116,35 @@ steps:
 # 다른 번들을 명시
 - clearState: com.other.app
 ```
+
+### 실행 인자 {#launch-arguments}
+
+`launchApp`에 `arguments`를 넘기면 앱을 실행할 때 인자를 함께 전달할 수 있습니다. Firebase DebugView처럼 실행 인자로만 켜지는 디버그 옵션이나 스테이징 서버 주소 같은 앱 자체 플래그를 빌드를 새로 만들지 않고 바꿀 수 있습니다.
+
+```yaml
+- launchApp:
+    arguments:
+      FIRDebugEnabled: true
+      apiHost: staging.example.com
+      AppleLanguages: [en]
+    env:
+      API_TOKEN: secret-value
+```
+
+| 키 | 값 | iOS | Android |
+|----|----|-----|---------|
+| `arguments` | 문자열, 정수, `true`/`false`, 문자열 목록 | 번들 ID 뒤에 `-키 값`으로 붙습니다. 앱은 `UserDefaults`와 `ProcessInfo.arguments`로 읽습니다 | intent extra로 넘어갑니다. 앱은 `getIntent().getExtras()`로 읽어야 합니다 |
+| `env` | 문자열 | 앱 프로세스의 환경 변수가 됩니다 | 지원하지 않습니다. 넘기면 스텝이 실패합니다 |
+
+- 인자나 환경 변수를 넘기면 앱이 이미 실행 중이어도 종료한 뒤 새로 실행합니다. 이미 떠 있는 앱은 실행 인자를 다시 읽지 않기 때문입니다.
+- Android에서는 값의 타입이 extra 타입을 정합니다. 정수는 int(범위를 넘으면 long), `true`/`false`는 boolean, 목록은 문자열 배열입니다. 앱이 문자열로 읽어야 하는 숫자는 `port: "8080"`처럼 따옴표로 감싸세요. iOS에서는 모든 값이 문자열로 들어갑니다.
+- 소수는 받지 않습니다. 오래된 Android 이미지에는 double extra가 없기 때문입니다. 소수가 필요하면 따옴표로 감싸 문자열로 넘기세요.
+- 키는 iOS에서 붙는 `-` 없이 씁니다. `-FIRDebugEnabled`처럼 쓰면 플로우를 불러올 때 거부됩니다.
+- 비밀 값은 `env`에 넣으세요. 실행 기록과 실패 메시지에는 인자 값이 그대로 보이지만 환경 변수 값은 `***`로 가려집니다.
+- tapflow가 쓰는 환경 변수 이름(`DYLD_`, `TAPFLOW_`, `SIMULATOR_`로 시작하는 이름, `HOME`, `TMPDIR` 등)은 쓸 수 없습니다.
+- 서드파티 SDK의 디버그 옵션은 플랫폼마다 켜는 방법이 다릅니다. 예를 들어 Firebase DebugView는 iOS에서는 `FIRDebugEnabled: true`로 켜지지만 Android에서는 intent extra로 켜지지 않고 기기에서 `adb shell setprop debug.firebase.analytics.app <패키지>`를 실행해야 합니다.
+- 릴레이와 실행 기기의 에이전트가 모두 실행 인자를 지원하는 버전이어야 합니다. 둘 중 하나라도 이전 버전이면 인자 없이 실행하지 않고 스텝이 실패합니다.
+- 릴레이가 `tapflow.config.json`의 [실행 기본값](/ko/reference/configuration#launch-defaults)을 함께 넘길 수 있습니다. 스텝과 기본값에 같은 키가 있으면 스텝의 값을 씁니다. 실행 기록에는 적용된 기본값의 키가 스텝의 인자 뒤에 붙습니다. 값은 남지 않습니다. 예: `launchApp(apiHost="staging.example.com"; config: FIRDebugEnabled, env API_TOKEN)`.
 
 ## 실행
 
@@ -144,7 +173,7 @@ tapflow flow run .tapflow/flows/login.yaml .tapflow/flows/checkout.yaml
 | `--include-tags <tags>` | 이 태그 중 하나라도 있는 플로우만 실행합니다(쉼표로 구분). |
 | `--exclude-tags <tags>` | 이 태그 중 하나라도 있는 플로우는 건너뜁니다(쉼표로 구분). `--include-tags`보다 우선합니다. |
 
-`launchApp` 스텝은 인자를 받지 않고 `--build`로 지정한 빌드를 실행합니다. 덕분에 플로우 파일에 빌드 ID를 하드코딩하지 않아도 되고 CI 실행마다 새 빌드에 그대로 재사용할 수 있습니다.
+`launchApp` 스텝은 빌드 ID 없이 `--build`로 지정한 빌드를 실행합니다. 덕분에 플로우 파일에 빌드 ID를 하드코딩하지 않아도 되고 CI 실행마다 새 빌드에 그대로 재사용할 수 있습니다.
 
 실행을 시작하면 러너가 `watch this run:` 줄에 대시보드 링크를 출력합니다. 이 링크를 열면 플로우가 기기를 조작하는 모습을 실시간으로 볼 수 있고 실행이 끝나면 보기도 끝납니다. CI 환경에서는 출력하지 않습니다(`CI` 환경 변수, Jenkins의 `JENKINS_URL`, Azure Pipelines의 `TF_BUILD`로 판단합니다). 링크에 릴레이 주소가 그대로 드러나서 공개 저장소의 로그에 남기 때문입니다. 링크 주소가 정해지는 방식과 보기 조건은 [MCP 서버 문서](/ko/automation/mcp-server#watch-the-device)와 같고 여기서는 `TAPFLOW_RELAY_URL` 대신 `--relay` 주소를 씁니다.
 

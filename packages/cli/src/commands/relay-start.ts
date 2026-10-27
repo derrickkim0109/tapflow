@@ -1,6 +1,6 @@
 import path from 'path'
 import { z } from 'zod'
-import { RelayServer, initDb, config, loadedEnvPath, install, configFound, assertInstallDir, createCertProvider, startTlsBackgroundTasks, buildCorsOrigins, proxyWithoutPublicUrlWarning, resolveRelayDisplayHost, resolveTunnelPort, isInitialized } from '@tapflowio/relay'
+import { RelayServer, initDb, config, loadLaunchDefaults, loadedEnvPath, install, configFound, assertInstallDir, createCertProvider, startTlsBackgroundTasks, buildCorsOrigins, proxyWithoutPublicUrlWarning, resolveRelayDisplayHost, resolveTunnelPort, isInitialized } from '@tapflowio/relay'
 import type { TunnelRuntime } from '@tapflowio/relay'
 import { banner, step, warn } from '../lib/print.js'
 import { startConfiguredTunnel, tunnelRuntimeFor } from '../lib/tunnel-runner.js'
@@ -46,6 +46,8 @@ export async function cmdRelayStart(opts: RelayStartOptions): Promise<void> {
   // config already loaded <dataDir>/.env before reading any secret (JWT/SMTP/DNS tokens); just report it.
   if (loadedEnvPath) step(`Loaded credentials from ${loadedEnvPath}`)
   initDb(path.join(config.local.dataDir, 'tapflow.db'))
+  // Before the certificate and the tunnel: a bad launch default exits, and nothing started yet is left running.
+  const launchDefaults = loadLaunchDefaults()
 
   let tls: { cert: string; key: string } | undefined
   let certProvider: ReturnType<typeof createCertProvider> | null = null
@@ -90,7 +92,7 @@ export async function cmdRelayStart(opts: RelayStartOptions): Promise<void> {
   let server: RelayServer
   try {
     // Construction is inside the try too: a TLS key that does not match its cert throws here.
-    server = new RelayServer({ port, uploadsDir: path.join(config.local.dataDir, 'uploads'), wsBackpressureBytes: config.local.wsBackpressureBytes, trustedProxies: config.local.trustedProxies, corsOrigins: buildCorsOrigins(config, port, tunnelRuntime), tls, tunnel: tunnelRuntime, tunnelPort })
+    server = new RelayServer({ port, uploadsDir: path.join(config.local.dataDir, 'uploads'), wsBackpressureBytes: config.local.wsBackpressureBytes, trustedProxies: config.local.trustedProxies, corsOrigins: buildCorsOrigins(config, port, tunnelRuntime), tls, tunnel: tunnelRuntime, tunnelPort, launchDefaults })
     await server.start()
   } catch (err) {
     await tunnel?.stop()

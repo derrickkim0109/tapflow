@@ -1,6 +1,6 @@
 ---
 title: Configuration
-description: "The tapflow.config.json schema and its environment variable overrides: relay, agent, tunnel, TLS, data directory, SMTP and webhooks."
+description: "The tapflow.config.json schema and its environment variable overrides: relay, agent, tunnel, TLS, data directory, SMTP, webhooks and launch defaults."
 ---
 
 # Configuration
@@ -41,6 +41,7 @@ Paths inside the file are relative to the file itself, the way a `tsconfig.json`
 | `tls` | LAN HTTPS (secure context) settings, required for WebCodecs hardware decode. See the HTTPS section below. |
 | `smtp` | SMTP settings for sending invitation and password reset emails. |
 | `webhooks` | Outbound endpoints notified when a build's review status changes. Signing secrets are read from env vars named by `secretEnv`. See the Webhooks section below. |
+| `launch` | Launch arguments every launch of an app gets, keyed by bundle id. See the Launch defaults section below. |
 | `agent.lean` | Lean mode for the iOS simulators and Android emulators this machine's agent boots. Read by the agent, not the relay. Default `false`. See the Lean mode section below. |
 
 `smtp.from` defaults to `tapflow <smtp.user>` when `smtp.user` is set, and to `tapflow <noreply@tapflow.local>` otherwise. Override it explicitly if you need a different sender address.
@@ -335,6 +336,38 @@ tapflow POSTs to registered URLs when a build's review status changes to `Done` 
 | `webhooks[].enabled` | Whether the endpoint is active. Defaults to `true`. |
 
 Changes to `webhooks` take effect after a relay restart.
+
+## Launch defaults {#launch-defaults}
+
+`launch` gives an app [launch arguments](/automation/flows#launch-arguments) that every launch of it gets, from the dashboard's Launch button, an MCP `launch_app` or a flow's `launchApp`. Use it for a flag every tester needs, such as a staging server address, without writing it into each flow.
+
+```json
+{
+  "launch": {
+    "com.example.app": {
+      "arguments": { "apiHost": "staging.example.com", "FIRDebugEnabled": true },
+      "env": { "LOG_LEVEL": "debug" },
+      "envFrom": { "API_TOKEN": "STAGING_API_TOKEN" }
+    }
+  }
+}
+```
+
+| Key | Description |
+|-----|-------------|
+| `launch.<bundle id>` | The app's bundle id or package name, exactly as its builds were uploaded with. |
+| `.arguments` | Launch arguments, with the same values and rules as in a flow. |
+| `.env` | Environment variables with their values written here. Use it for values that are not secret. |
+| `.envFrom` | Environment variables whose value is read from another variable, by name: `"API_TOKEN": "STAGING_API_TOKEN"` gives the app `API_TOKEN` with the value of `STAGING_API_TOKEN` in the relay's `.env` or its environment. Put secrets here, not in `env`. |
+
+- A launch that passes its own arguments or env gets the defaults as well. When both set the same key, the launch's own value is used.
+- Because defaults count as launch arguments, a running app that has defaults is restarted on every launch, the dashboard's Launch button included. To get back to the screen you were on, open the app from the device's home screen instead.
+- A device that cannot take a default launches without it, and the relay logs a warning: env defaults on Android, which has no way to set an app's environment, and every default on a device whose agent is too old to pass them. On Android, an app with more than one launcher activity also launches without its defaults when the launch passes no arguments of its own; with its own, the launch fails as it would without defaults. A run record names the defaults a launch applied, so a missing one shows there.
+- A default's value is not shown anywhere: run records and the MCP result name its key only.
+- The relay refuses to start when an entry is invalid, when `envFrom` names a variable that is not set, or when it names one of the relay's own secrets (`JWT_SECRET`, `SMTP_*`, `TAPFLOW_*` and webhook secrets). The relay logs a warning for a bundle id no uploaded build has, which usually means a typo or a difference in case.
+- Anyone who can upload a build can upload one under that bundle id and receive its `envFrom` values. Give `envFrom` only values that are safe for every uploader to have, such as a staging token.
+
+Changes to `launch` take effect after a relay restart.
 
 ## Related {#related}
 

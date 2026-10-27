@@ -8,8 +8,9 @@ import type {
 import { formFactorOf } from './avdConfig.js'
 import type {
   AgentControlOutbound, ClipboardReplyBody, OpenUrlReplyBody,
-  AppInstallReplyBody, AppLaunchReplyBody, AppClearStateReplyBody, DevicePosture, FormFactor, RunResetReport, RunResetRequest,
+  AppInstallReplyBody, AppLaunchReplyBody, AppLaunchToAgent, LaunchOptions, AppClearStateReplyBody, DevicePosture, FormFactor, RunResetReport, RunResetRequest,
 } from '@tapflowio/protocol'
+import { appliedKeys, compactLaunchOptions, launchOptionsProblem } from '@tapflowio/protocol/launch'
 import fs from 'fs'
 import path from 'path'
 import { tmpdir } from 'os'
@@ -74,7 +75,7 @@ const logger = createLogger('android-agent')
 // actually works on a given image is per device, and `network:state.available` carries that — the
 // split the protocol documents. Added last, after the handler and the boot-time reset, because the
 // string on its own is what puts a control on screen.
-const AGENT_CAPABILITIES: AgentCapability[] = ['clipboard', 'full-reset', 'network-control', 'build-download']
+const AGENT_CAPABILITIES: AgentCapability[] = ['clipboard', 'full-reset', 'network-control', 'build-download', 'launch-options']
 
 // Parse H.264 SPS NAL unit to extract frame dimensions.
 // scrcpy sends a new SPS (inside an IDR keyframe) whenever the capture size changes —
@@ -478,6 +479,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   private releaseStallWatch: (() => void) | null = null
   private relayUrl: string | null = null
   private resourcesTimer: ReturnType<typeof setInterval> | null = null
+  private resourcesInFlight: WebSocket | null = null
   private readonly resources = createResourceSampler()
   private _stopping = false
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -597,8 +599,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
               this.handleRelayMessage(m as { type: string; sessionId: string; requestId?: string; payload?: unknown })
             } catch { /* ignore malformed */ }
           })
-          this.reportResources()
-          this.resourcesTimer = setInterval(() => this.reportResources(), 5000)
+          void this.reportResources()
+          this.resourcesTimer = setInterval(() => { void this.reportResources() }, 5000)
           this.lastPingAt = null
           this.lastSocketError = undefined
           ws.on('ping', () => { this.lastPingAt = Date.now() })
@@ -736,23 +738,37 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     }, delay)
   }
 
-  private reportResources(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-    const bootedCount = Array.from(this.deviceStates.values()).filter((s) => s.scrcpySession !== null || s.emulatorVideo !== null).length
-    const slotsTotal = this.deviceStates.size
-    const { memUsedMB, memTotalMB } = this.resources.getMemoryUsage()
-    this.sendOn(this.ws, {
-      type: 'agent:resources',
-      resources: {
-        cpuPercent: this.resources.getCpuPercent(),
-        memUsedMB,
-        memTotalMB,
-        slotsAvailable: Math.max(0, slotsTotal - bootedCount),
-        slotsTotal,
-        reportedAt: Date.now(),
-        memoryPressure: this.resources.getMemoryPressure(),
-      },
-    })
+  /** Samples off the event loop, then reports. One sample at a time per socket, so a slow one (bounded by its
+   *  1 s timeout) is not stacked by the next tick; keyed by socket, so a reconnect is not skipped behind the
+   *  old socket's sample. Slots and the clock are read after the sample, when the report leaves. */
+  private async reportResources(): Promise<void> {
+    const ws = this.ws
+    if (!ws || ws.readyState !== WebSocket.OPEN || this.resourcesInFlight === ws) return
+    this.resourcesInFlight = ws
+    try {
+      const [{ memUsedMB, memTotalMB }, memoryPressure] = await Promise.all([
+        this.resources.getMemoryUsage(),
+        this.resources.getMemoryPressure(),
+      ])
+      // A reconnect while sampling replaced the socket: this report has nowhere to go.
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return
+      const bootedCount = Array.from(this.deviceStates.values()).filter((s) => s.scrcpySession !== null || s.emulatorVideo !== null).length
+      const slotsTotal = this.deviceStates.size
+      this.sendOn(ws, {
+        type: 'agent:resources',
+        resources: {
+          cpuPercent: this.resources.getCpuPercent(),
+          memUsedMB,
+          memTotalMB,
+          slotsAvailable: Math.max(0, slotsTotal - bootedCount),
+          slotsTotal,
+          reportedAt: Date.now(),
+          memoryPressure,
+        },
+      })
+    } finally {
+      if (this.resourcesInFlight === ws) this.resourcesInFlight = null
+    }
   }
 
   private cleanupDeviceState(state: DeviceState): void {
@@ -2683,7 +2699,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         break
       }
       case 'app:launch': {
-        const { bundleId } = msg.payload as { bundleId: string }
+        const { bundleId, arguments: args, env, defaultsOnly } = msg.payload as AppLaunchToAgent['payload']
         const sessionId = msg.sessionId
         const { requestId } = msg
         if (typeof requestId !== 'string' || requestId === '') {
@@ -2698,10 +2714,19 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           respond({ type: 'app:launch-error', message: 'No booted device' })
           break
         }
+        // The relay checks with the same function; this is the last door before an `adb shell` line, and a relay of
+        // another version may check less. See the iOS handler.
+        const problem = launchOptionsProblem({ arguments: args, env })
+        if (problem) {
+          respond({ type: 'app:launch-error', message: problem })
+          break
+        }
+        const options = compactLaunchOptions({ arguments: args, env })
         // Same reason as `app:install`: a launched app writes data a late `pm clear` would take.
         this.awaitPendingClears(state!.deviceId)
-          .then(() => this.adb.launchApp(serial, bundleId))
-          .then(() => respond({ type: 'app:launch-done' }))
+          .then(() => this.adb.launchApp(serial, bundleId, options, defaultsOnly === true))
+          // What was delivered, which for the relay's defaults can be less than what was sent, down to nothing.
+          .then((applied) => respond(options ? { type: 'app:launch-done', applied: appliedKeys(applied ?? {}) } : { type: 'app:launch-done' }))
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e)
             // The toast gets the reason alone; the full adb output (the cause) stays in this log.
@@ -3456,8 +3481,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     })
   }
 
-  async launchApp(packageName: string): Promise<void> {
-    await this.adb.launchApp(this.soleLive().serial, packageName)
+  async launchApp(packageName: string, options?: LaunchOptions): Promise<void> {
+    const problem = launchOptionsProblem(options ?? {})
+    if (problem) throw new ValidationError(problem)
+    await this.adb.launchApp(this.soleLive().serial, packageName, compactLaunchOptions(options))
   }
 
   async screenshot(): Promise<Buffer> {

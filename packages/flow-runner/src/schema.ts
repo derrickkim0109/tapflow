@@ -1,6 +1,8 @@
 import { parse as parseYaml } from 'yaml'
 import { ValidationError } from '@tapflowio/agent-core'
 import path from 'path'
+import type { LaunchOptions } from '@tapflowio/protocol'
+import { compactLaunchOptions, launchOptionsProblem } from '@tapflowio/protocol/launch'
 
 export interface Selector {
   // Bare-string selector: resolved as exact identifier → exact label → partial label.
@@ -18,7 +20,7 @@ export type ScrollDirection = 'up' | 'down' | 'left' | 'right'
 
 export type Step =
   | { type: 'clearState'; appId?: string }
-  | { type: 'launchApp' }
+  | { type: 'launchApp'; options?: LaunchOptions }
   | { type: 'tapOn'; selector: Selector }
   | { type: 'inputText'; text: string }
   | { type: 'pressKey'; code: string }
@@ -116,6 +118,19 @@ function parseStep(raw: unknown, ctx: string): Step {
     case 'clearState': {
       if (typeof value !== 'string' || value.length === 0) throw new ValidationError(`${ctx}: "clearState" takes a bundle id (or use the bare keyword with a flow-level appId)`)
       return { type: 'clearState', appId: value }
+    }
+    case 'launchApp': {
+      // `launchApp:` with nothing after it is YAML null, the same step as the bare keyword.
+      if (value === null) return { type: 'launchApp' }
+      if (!isRecord(value)) throw new ValidationError(`${ctx}: "launchApp" takes { arguments, env } or nothing`)
+      const { arguments: args, env, ...rest } = value
+      const unknownKeys = Object.keys(rest)
+      if (unknownKeys.length > 0) throw new ValidationError(`${ctx}: unknown launchApp keys: ${unknownKeys.join(', ')} (expected arguments, env)`)
+      // The same check the relay and the agents apply, so a flow that loads is one every door accepts.
+      const problem = launchOptionsProblem({ arguments: args, env })
+      if (problem) throw new ValidationError(`${ctx}: launchApp ${problem}`)
+      const options = compactLaunchOptions({ arguments: args, env } as LaunchOptions)
+      return options ? { type: 'launchApp', options } : { type: 'launchApp' }
     }
     case 'tapOn': return { type: 'tapOn', selector: parseSelector(value, ctx) }
     case 'assertVisible': return { type: 'assertVisible', selector: parseSelector(value, ctx) }

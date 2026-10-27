@@ -51,7 +51,7 @@ The vocabulary is deliberately small. These ten cover most scenarios.
 | Step | Form | Behavior |
 |------|------|----------|
 | `clearState` | keyword or `clearState: <bundleId>` | Resets the app data. The keyword form uses the top-level `appId`. |
-| `launchApp` | keyword | Launches the build under test and waits for its screen to settle: the role, label and id of every UI tree element unchanged for a second, so a splash screen is not taken for the first screen. A screen with no UI tree elements, such as a game, moves on after that second too. A screen whose labels keep changing moves on 3 seconds after it was first read, and one that cannot be read at all after the default per-selector wait. The wait never fails the step. A splash that stays unchanged for longer than a second can still be taken for the first screen. |
+| `launchApp` | keyword or `launchApp: { arguments, env }` | Launches the build under test and waits for its screen to settle: the role, label and id of every UI tree element unchanged for a second, so a splash screen is not taken for the first screen. A screen with no UI tree elements, such as a game, moves on after that second too. A screen whose labels keep changing moves on 3 seconds after it was first read, and one that cannot be read at all after the default per-selector wait. The wait never fails the step. A splash that stays unchanged for longer than a second can still be taken for the first screen. To pass launch arguments, see [Launch arguments](#launch-arguments). |
 | `tapOn` | selector | Taps the center of the matched element. |
 | `inputText` | string | Types text into the focused input field. |
 | `pressKey` | key name | Presses a keyboard key (`Enter`, `Backspace`, `Escape`, …). |
@@ -107,7 +107,7 @@ The object form needs at least one of `id`, `label`, or `role`; `role`/`index` r
 
 `tapflow flow run` also resets the device before the flows start, so a run does not begin from an earlier run's data, keychain or permissions. `clearState` is still how a flow resets its app between its own steps. What the run resets is listed under [`tapflow flow run`](/reference/cli#tapflow-flow-run).
 
-If the app is already running, `launchApp` does not restart it: it brings the app forward on whatever screen it was last on. A flow can then start from a screen an earlier run or a manual test left behind, so a flow that must start from the app's first screen puts `clearState` before `launchApp`. `clearState` stops the app before wiping its data.
+If the app is already running, `launchApp` does not restart it: it brings the app forward on whatever screen it was last on. A `launchApp` with [launch arguments](#launch-arguments) is the exception. A flow can then start from a screen an earlier run or a manual test left behind, so a flow that must start from the app's first screen puts `clearState` before `launchApp`. `clearState` stops the app before wiping its data.
 
 ```yaml
 # uses the top-level appId
@@ -116,6 +116,35 @@ If the app is already running, `launchApp` does not restart it: it brings the ap
 # names a different bundle
 - clearState: com.other.app
 ```
+
+### Launch arguments {#launch-arguments}
+
+`launchApp` can pass arguments to the app it launches. You can turn on a debug option that only a launch argument enables, such as Firebase DebugView, or change an app flag such as a staging server address, without a new build.
+
+```yaml
+- launchApp:
+    arguments:
+      FIRDebugEnabled: true
+      apiHost: staging.example.com
+      AppleLanguages: [en]
+    env:
+      API_TOKEN: secret-value
+```
+
+| Key | Values | iOS | Android |
+|-----|--------|-----|---------|
+| `arguments` | string, whole number, `true`/`false`, list of strings | Passed after the bundle id as `-key value`. The app reads them with `UserDefaults` and `ProcessInfo.arguments` | Passed as intent extras. The app has to read them with `getIntent().getExtras()` |
+| `env` | string | Set in the app process's environment | Not supported. The step fails if you pass it |
+
+- With arguments or env, the app is stopped and started again even if it is already running, because a running app does not read its launch arguments again.
+- On Android a value's type decides the extra's type: a whole number is an int (a long when it does not fit), `true`/`false` a boolean, a list a string array. Quote a number the app reads as a string, as in `port: "8080"`. On iOS every value arrives as a string.
+- Fractions are refused, because older Android images have no double extra. Quote a fraction to pass it as a string.
+- Write a key without the `-` that iOS adds. A key such as `-FIRDebugEnabled` is refused when the flow loads.
+- Put secrets in `env`. Run records and failure messages show argument values as they are, and env values as `***`.
+- Environment names tapflow depends on are refused: names starting with `DYLD_`, `TAPFLOW_` or `SIMULATOR_`, `HOME`, `TMPDIR` and a few more.
+- Third-party SDKs turn on their debug options differently on each platform. Firebase DebugView, for example, turns on with `FIRDebugEnabled: true` on iOS, but on Android no intent extra turns it on: run `adb shell setprop debug.firebase.analytics.app <package>` on the device instead.
+- The relay and the agent on the device's Mac both need a version that supports launch arguments. If either is older, the step fails rather than launching without them.
+- The relay can add [launch defaults](/reference/configuration#launch-defaults) for the app from `tapflow.config.json`. When the step and the defaults set the same key, the step's value is used. In the run record, the keys of the defaults a launch applied follow the step's own options, without their values: `launchApp(apiHost="staging.example.com"; config: FIRDebugEnabled, env API_TOKEN)`.
 
 ## Running flows
 
@@ -144,7 +173,7 @@ tapflow flow run .tapflow/flows/login.yaml .tapflow/flows/checkout.yaml
 | `--include-tags <tags>` | Run only flows tagged with at least one of these (comma-separated). |
 | `--exclude-tags <tags>` | Skip flows tagged with any of these (comma-separated). Wins over `--include-tags`. |
 
-The `launchApp` step takes no argument and launches the build passed via `--build`. That keeps the build id out of the flow file, so the same flow runs against a fresh build on every CI run.
+The `launchApp` step names no build and launches the one passed via `--build`. That keeps the build id out of the flow file, so the same flow runs against a fresh build on every CI run.
 
 When the run starts, the runner prints a dashboard link on a `watch this run:` line. Open it to watch, live, the flow driving the device; the watch ends when the run does. In CI the line is not printed (detected from the `CI` environment variable, Jenkins's `JENKINS_URL` or Azure Pipelines' `TF_BUILD`), because the link shows the relay's address and would stay in a public repository's log. How the address is chosen, and who can watch, are the same as for the [MCP server](/automation/mcp-server#watch-the-device), with the `--relay` address in place of `TAPFLOW_RELAY_URL`.
 

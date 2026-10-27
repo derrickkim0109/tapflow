@@ -121,6 +121,7 @@ asymmetry is a decision, and it is why iOS never sends `unsupported` for a butto
 - Do not expose iOS-specific methods as public API if they are not in the `DeviceAgent` interface.
 - Do not reintroduce SCStream/ScreenCaptureKit — geometry coordinate mismatches cause double-frame issues.
 - Do not stream JPEG frames over WebRTC DataChannel — the channel silently closes on large messages (~236KB+; details in "WebSocket Binary streaming — transport choice" below).
+- Do not run a child process synchronously on a timer or a poll (`execFileSync`, `spawnSync`). The audio poll and the resource report each did, and a drag stuttered at their interval: [agent-event-loop-blocking.md](../../contributing/agent-event-loop-blocking.md).
 
 ---
 
@@ -295,7 +296,7 @@ The iOS UI tree comes from a resident **XCUITest runner** that runs *inside* the
 - Protocol: `GET /health` → the token the host passed (readiness, and proof the runner is ours); `GET /tree?bundleId=<id>` → the app's `XCUIApplication.debugDescription` (text). The simulator shares `localhost` with the host (WDA pattern), so the host reaches the in-simulator server directly.
 - **One runner per simulator, on a port the runner picks.** The host passes `TEST_RUNNER_TAPFLOW_TREE_PORT=0` and `TEST_RUNNER_TAPFLOW_TREE_TOKEN` (xcodebuild strips the prefix; without it nothing arrives). The runner prints `TAPFLOW_TREE_READY port=<n>` once it is listening, and the host reads that line from xcodebuild's stdout (so no `-quiet`, and the pipe is drained for the runner's life), then requires `/health` to answer with its token. A fixed port let a runner that lost its port still look ready, while another simulator's runner answered every request: measured, not theoretical.
 - `XCUITreeReader.ts` builds the runner (`build-for-testing`, cached under `xctest-runner/build/`, gitignored) and rebuilds when `build/tapflow-runner.stamp` no longer matches the runner sources, the checked-in project and `xcodebuild -version`. It launches one runner per device (`test-without-building`, resident), then fetches `/tree` from that device's port. Faults on one device (a refused read, a start that never answered) drop only that device's runner. `xcuiTree.ts` parses the debugDescription text into the unified schema — kept a **pure function** so it stays unit-testable against the `xcuiTree.test.ts` fixture (Open Q9: a future Xcode format change fails there).
-- Queries by bundleId: the reader needs the foreground app's bundleId, tracked as `DeviceState.currentBundleId` on `app:launch`. `readUITree` throws an actionable `PlatformError` if no app has been launched — never a silent empty tree.
+- Queries by bundleId: the reader needs the foreground app's bundleId, tracked in `IOSAgent.lastBundleIds` on `app:launch` — deliberately outside `DeviceState`, so it survives a relay reconnect that rebuilds that map. `readUITree` throws an actionable `PlatformError` if no app has been launched — never a silent empty tree.
 - Frames: debugDescription frames are points; the parser normalizes them 0-1 against the `Window` frame (same coordinate space as the touch path).
 - Lifecycle: started when an automation client (flow runner, MCP) boots the device, otherwise on the first UI-tree query, so the manual QA / streaming path never pays for it (about 650 MB per device). Killed on that device's shutdown, before an erase boot, and for every device on disconnect.
 - `enabled`: debugDescription does not expose it, so elements default to `enabled: true`. If fidelity needs it, switch to the private snapshot API (plan Open Q9).
@@ -314,8 +315,12 @@ cd packages/ios-agent/xctest-runner && xcodegen generate
 ### keyboard-helper interface
 
 ```bash
-keyboard-helper <show|hide> <udid|booted>
+keyboard-helper <show|hide> <udid|booted>   # single-shot
+keyboard-helper --daemon                     # stdin: "show <udid>\n" | "hide <udid>\n" → "ok\n" | "err <msg>\n"
 ```
+
+The agent only runs the daemon: `SimctlWrapper` holds one `KeyboardHelperDaemon` and queues one command
+at a time through it. The single-shot form is for hand-testing from a terminal.
 
 Loads `CoreSimulator.framework` directly and calls `SimDevice.setHardwareKeyboardEnabled(_:keyboardType:error:)`.
 No macOS Accessibility permission required.
@@ -449,7 +454,7 @@ right-anchor button: margin.right = max(imgWidth + rollover.x, 0)
 
 Button center (expanded canvas): `left-anchor: margin.left + rollover.x`  
 Render order: `behindBtns → composite → onTopBtns`  
-Cache key: `tapflow-frame-v2-{chromeName}.png`
+Cache key: `tapflow-frame-v3-{chromeName}-c{expandedW}x{expandedH}.png` on the composite path, `tapflow-frame-nineslice-nb-{chromeName}-{screenW}x{screenH}-c{expandedW}x{expandedH}.png` on the nine-slice one. The expanded canvas size is in the key because the same chrome renders at different sizes once buttons expand it.
 
 **Screen corner radius**: outer radius is read from `paths.simpleOutsideBorder.cornerRadiusX` in `chrome.json`.
 ```text
@@ -814,8 +819,10 @@ already done, so the dashboard interrupts rather than re-colours.
 
 - **`booted` on `DeviceState` is a cache, not the truth.** `initDeviceStates` clears it on
   `agent:registered`, which is every *reconnect*. Reading it as liveness shipped a regression twice
-  in one PR. The wire path uses `deviceFor` and the capability path `soleLiveDeviceId`; both ask
-  simctl before believing a device is down. The other six capability entry points still do not (#646).
+  in one PR. The wire path uses `deviceFor` and every capability entry point that can await uses
+  `soleLiveDeviceId` / `soleLiveDeviceState`; both ask simctl before believing a device is down (#646).
+  `stream()` is the one left on the cache, because it cannot await without changing `DeviceAgent` —
+  the comment on `soleDeviceState` says what that costs.
 - **Tests must never reach the real filter.** `arm()` runs on every boot, so a suite that boots a
   mock device was rewriting the host's live filter configuration once per boot test on any machine
   with tapflow's extension installed — silently, because the class *reports* a missing container app

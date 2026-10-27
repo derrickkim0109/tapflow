@@ -236,6 +236,19 @@ describe('a browser frame is stripped, because its product is what gets forwarde
   it('keeps a real buildId', () => {
     expect(ok({ type: 'app:install', sessionId: 's', requestId: 'r', buildId: 3 }).msg).toMatchObject({ buildId: 3 })
   })
+
+  // The relay forwards the parse product, so a field the schema does not name never reaches an agent. These two must be
+  // named, or every launch option is stripped here and the launch still succeeds.
+  it('carries launch arguments and env through', () => {
+    const launch = { type: 'app:launch', sessionId: 's', requestId: 'r', buildId: 3, arguments: { a: 'x', n: 1, b: true, l: ['en'] }, env: { K: 'v' } }
+    expect(ok(launch).msg).toEqual(launch)
+  })
+
+  it('refuses a launch option of the wrong shape, answerably', () => {
+    for (const extra of [{ arguments: [] }, { arguments: { a: { b: 1 } } }, { arguments: { a: null } }, { env: { K: 1 } }, { env: 'K=v' }]) {
+      expect(fail({ type: 'app:launch', sessionId: 's', requestId: 'r', buildId: 3, ...extra }).reason).toBe('bad-payload')
+    }
+  })
 })
 
 describe('directionOf replaces the hand-written agent list', () => {

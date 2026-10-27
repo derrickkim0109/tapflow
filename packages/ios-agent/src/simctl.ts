@@ -31,6 +31,9 @@ export interface SimctlExecOpts {
   timeoutMs?: number
   /** Ceiling on stdout. Exceeding it rejects rather than buffering without bound. */
   maxBuffer?: number
+  /** Added to this process's environment for the call, never replacing it: dropping PATH or DEVELOPER_DIR would make
+   *  `xcrun` pick a different Xcode. simctl forwards only `SIMCTL_CHILD_`-prefixed names to what it launches. */
+  env?: Record<string, string>
 }
 
 /** Thrown when a call blows its `maxBuffer`. Distinguishable on purpose: for the clipboard, an
@@ -62,7 +65,7 @@ function coreSimServiceError(): Error {
 // than inherited, which is the price of `pbcopy` not being expressible as arguments.
 function runWithOpts(opts: SimctlExecOpts, args: string[]): Promise<string> {
   return new Promise<string>((resolve, reject) => {
-    const proc = spawn('xcrun', ['simctl', ...args])
+    const proc = spawn('xcrun', ['simctl', ...args], opts.env ? { env: { ...process.env, ...opts.env } } : {})
     // Accumulate BYTES and decode once at the end. Decoding each chunk as it arrives splits
     // multi-byte characters at pipe boundaries and turns them into U+FFFD — execFile avoided
     // that by running stdout through a StringDecoder, and this path has to reproduce it.

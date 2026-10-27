@@ -6,6 +6,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { EnvironmentStepError, isEligible, parseFlow, runFlow, type FlowDriver } from '@tapflowio/flow-runner'
 import { SessionEndedError, SessionLeftError, type TapflowClient } from './client.js'
 import { TESTING_GUIDE } from './guide.js'
+import { compactLaunchOptions, launchOptionsProblem, type LaunchApplied } from '@tapflowio/protocol/launch'
 
 // Input refusal reasons that name the environment rather than the product,
 // mirroring flow-runner's ENVIRONMENTAL_INPUT_REASONS. `unsupported`,
@@ -84,11 +85,14 @@ export function makeFlowDriver(client: TapflowClient, sessionId: string, buildId
     inputText: async (text) => guard(() => client.typeText(sessionId, text)),
     pressKey: async (code) => guard(() => client.pressKey(sessionId, code)),
     openUrl: (url) => guard(() => client.openUrl(sessionId, url)),
-    launchApp: async () => {
+    // Takes the options explicitly: a function with no parameter still satisfies `FlowDriver.launchApp`, and would
+    // have run a flow's launch arguments as a plain launch with nothing failing to compile. The return type is spelled
+    // out for the same reason: the interface allows `void`, and a body that dropped `applied` would compile.
+    launchApp: async (options): Promise<LaunchApplied | undefined> => {
       if (buildId === undefined) {
         throw new EnvironmentStepError('this flow uses launchApp — pass buildId (see list_builds)')
       }
-      await guard(() => client.launchApp(sessionId, buildId))
+      return guard(() => client.launchApp(sessionId, buildId, options))
     },
     clearState: (appId) => guard(() => client.clearState(sessionId, appId)),
     screenshot: (signal) => guard(() => client.screenshot(sessionId, 'png', signal)),
@@ -675,12 +679,19 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
       inputSchema: {
         sessionId: z.string().describe('Session ID from list_devices'),
         buildId: z.number().int().describe('Build ID from the tapflow relay builds API'),
+        arguments: z.record(z.string(), z.union([z.string(), z.number().int(), z.boolean(), z.array(z.string())])).optional()
+          .describe('Restarts a running app with these. iOS: -key value. Android: intent extras. env: iOS only'),
+        env: z.record(z.string(), z.string()).optional(),
       },
     },
-    async ({ sessionId, buildId }) => {
+    async ({ sessionId, buildId, arguments: args, env }) => {
+      // The same check the relay and the agents apply, answered before anything is sent.
+      const problem = launchOptionsProblem({ arguments: args, env })
+      if (problem) return err(`launch_app failed: ${problem}`)
       try {
-        await client.launchApp(sessionId, buildId)
-        return ok(JSON.stringify({ launched: true, buildId }))
+        // `applied` names what reached the app, the relay's per-app defaults included.
+        const applied = await client.launchApp(sessionId, buildId, compactLaunchOptions({ arguments: args, env }))
+        return ok(JSON.stringify({ launched: true, buildId, ...(applied ? { applied } : {}) }))
       } catch (e) {
         return err(`launch_app failed: ${(e as Error).message}`)
       }

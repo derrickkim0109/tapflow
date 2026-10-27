@@ -6,6 +6,9 @@ import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { defaultRunner, type AdbRunner } from './adb.js'
+import type { LaunchOptions } from '@tapflowio/protocol'
+import { hasLaunchOptions } from '@tapflowio/protocol/launch'
+import { androidLaunchExtras } from './launchExtras.js'
 
 const logger = createLogger('android-agent:adb-wrapper')
 
@@ -326,10 +329,64 @@ export class AdbWrapper {
    * returns before the app even has focus (measured 0.2–0.36 s against 0.5–0.9 s), so a step sent right after the
    * reply could reach the launcher instead. Monkey stays as the fallback, and its error text is what a failure says.
    */
-  async launchApp(serial: string, packageName: string): Promise<void> {
-    const component = await this.launcherComponent(serial, packageName)
-    if (component && await this.startAndWait(serial, component)) return
+  async launchApp(serial: string, packageName: string, options?: LaunchOptions, defaultsOnly = false): Promise<LaunchOptions | undefined> {
+    // Resolved once and reused by whichever launch follows, so a default that falls back costs no second resolve.
+    let resolved: { component: string | undefined } | undefined
+    if (hasLaunchOptions(options)) {
+      if (!defaultsOnly) {
+        await this.launchFresh(serial, packageName, options!)
+        return options
+      }
+      // The relay's per-app defaults, none of them asked for by the caller: what this device cannot take is left out
+      // rather than failing a launch that works without it. A caller's own options fail in `launchFresh` instead.
+      resolved = { component: await this.launcherComponent(serial, packageName) }
+      const deliverable = deliverableDefaults(packageName, options!, resolved.component)
+      if (deliverable) {
+        await this.launchFresh(serial, packageName, deliverable, resolved.component)
+        return deliverable
+      }
+    }
+    const component = resolved ? resolved.component : await this.launcherComponent(serial, packageName)
+    if (component && await this.startAndWait(serial, component)) return undefined
     await this.launchWithMonkey(serial, packageName)
+    return undefined
+  }
+
+  /**
+   * A launch carrying arguments (#1047). Three differences from the plain one, each so that the arguments are applied
+   * or the launch fails, never a launch without them:
+   * - `env` is refused: Android gives an app's process no environment from outside.
+   * - No monkey fallback: monkey cannot carry intent extras. A package with no single launcher activity fails here.
+   * - `-S` stops the app first in the same command, since a running app would only be brought forward and its intent
+   *   never re-read; and the two `Activity not started` warnings, which the plain launch counts as launched, fail.
+   */
+  private async launchFresh(serial: string, packageName: string, options: LaunchOptions, resolved?: string): Promise<void> {
+    if (Object.keys(options.env ?? {}).length > 0) {
+      throw new ValidationError('env is iOS-only: Android has no way to set an app\'s environment. Pass it in arguments instead, read from the intent extras')
+    }
+    const component = resolved ?? await this.launcherComponent(serial, packageName)
+    if (!component) {
+      throw new ValidationError(`Could not find a single launcher activity for ${packageName}, so the launch arguments cannot be delivered`)
+    }
+    let out: string
+    try {
+      out = await this.runner.exec(
+        '-s', serial, 'shell', 'timeout', String(AM_START_WAIT_SEC), 'am', 'start', '-S', '-W',
+        '-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-f', '0x10200000', '-n', component,
+        ...androidLaunchExtras(options.arguments),
+        '2>&1',
+      )
+    } catch (e) {
+      out = (e as { stdout?: string }).stdout ?? ''
+      // Not `cause: e`: node's message and `cmd` carry the whole argv, argument values included, and the cause is
+      // what the agent logs. stderr says why without them.
+      if (!out.includes('Starting: Intent')) {
+        throw new PlatformError('adb did not finish the launch', { cause: new Error((e as { stderr?: string }).stderr?.trim() || 'no output') })
+      }
+    }
+    const lines = out.split('\n').map((l) => l.trim())
+    const failed = lines.find((l) => l.startsWith('Error') || l.startsWith('Exception') || l.startsWith('Warning: Activity not started'))
+    if (failed) throw new PlatformError(failed)
   }
 
   // The launcher activity as `pkg/class`, or undefined. Only that exact shape is taken: with two launcher activities
@@ -633,4 +690,16 @@ function hierarchyXml(output: string): string | undefined {
   const start = output.indexOf('<?xml') >= 0 ? output.indexOf('<?xml') : output.indexOf('<hierarchy')
   const end = output.lastIndexOf('</hierarchy>')
   return start < 0 || end < 0 ? undefined : output.slice(start, end + '</hierarchy>'.length)
+}
+
+// The part of the relay's defaults `launchFresh` can deliver, or undefined when none of it can. A relay that knows this
+// agent has no `launch-env` sends no env default, so env here means a relay that checked less.
+function deliverableDefaults(packageName: string, options: LaunchOptions, component: string | undefined): LaunchOptions | undefined {
+  if (Object.keys(options.env ?? {}).length > 0) console.warn(`[tapflow] ${packageName}: env defaults left out — Android cannot set an app's environment`)
+  if (Object.keys(options.arguments ?? {}).length === 0) return undefined
+  if (!component) {
+    console.warn(`[tapflow] ${packageName}: no single launcher activity, so its launch defaults were left out and the app launched without them`)
+    return undefined
+  }
+  return { arguments: options.arguments }
 }

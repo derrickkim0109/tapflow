@@ -110,6 +110,17 @@ describe('run_flow — install before replay', () => {
     expect(calls).toEqual(['install', 'launch']) // install strictly before the launchApp step
   })
 
+  // #1047. The driver's `launchApp` once took no parameter, which still satisfies the interface: a flow's launch
+  // arguments would have run as a plain launch with nothing failing.
+  it('passes a launchApp step\'s options to the client', async () => {
+    const calls: string[] = []
+    const client = fakeClient(calls)
+    vi.mocked(client.queryUITree).mockResolvedValue([{ role: 'button', label: 'OK', frame: { x: 0, y: 0, width: 1, height: 1 }, enabled: true }])
+    const res = await runFlowHandler(client)({ sessionId: 's1', flow: 'steps:\n  - launchApp: { arguments: { flag: true }, env: { A: x } }\n', buildId: 5, install: false })
+    expect(res.isError).toBeFalsy()
+    expect(client.launchApp).toHaveBeenCalledWith('s1', 5, { arguments: { flag: true }, env: { A: 'x' } })
+  })
+
   it('install:false skips the install but still launches', async () => {
     const calls: string[] = []
     const client = fakeClient(calls)
@@ -257,5 +268,40 @@ describe('run_flow — install before replay', () => {
     const result = await runFlow(flow, driver)
     expect(result.status).toBe('failed')
     expect(result.failureKind).toBe('environment')
+  })
+})
+
+describe('launch_app — launch options', () => {
+  const launchHandler = (client: TapflowClient) => captureTools(client).get('launch_app') as Handler
+
+  it('passes arguments and env, with empty maps dropped', async () => {
+    const client = fakeClient([])
+    await launchHandler(client)({ sessionId: 's1', buildId: 5, arguments: { flag: true }, env: {} })
+    expect(client.launchApp).toHaveBeenCalledWith('s1', 5, { arguments: { flag: true } })
+    await launchHandler(client)({ sessionId: 's1', buildId: 5 })
+    expect(client.launchApp).toHaveBeenLastCalledWith('s1', 5, undefined)
+  })
+
+  // #1047, PR 2: the relay's per-app defaults reach the app without the agent naming them, so the result does.
+  it('reports the applied keys, defaults included', async () => {
+    const client = fakeClient([])
+    vi.mocked(client.launchApp).mockResolvedValue({ arguments: ['a'], env: ['LOG_LEVEL'] })
+    const res = await launchHandler(client)({ sessionId: 's1', buildId: 5 })
+    expect(JSON.parse((res.content as { text: string }[])[0]!.text)).toEqual({ launched: true, buildId: 5, applied: { arguments: ['a'], env: ['LOG_LEVEL'] } })
+  })
+
+  // The interface allows `void`, so a driver that dropped the value would compile and lose the run record's names.
+  it('passes the applied keys through the run_flow driver', async () => {
+    const client = fakeClient([])
+    vi.mocked(client.launchApp).mockResolvedValue({ arguments: ['a'], env: [] })
+    expect(await makeFlowDriver(client, 's1', 5).launchApp()).toEqual({ arguments: ['a'], env: [] })
+  })
+
+  it('refuses what the shared check refuses, before calling the relay', async () => {
+    const client = fakeClient([])
+    const res = await launchHandler(client)({ sessionId: 's1', buildId: 5, env: { DYLD_INSERT_LIBRARIES: 'x' } })
+    expect(res.isError).toBe(true)
+    expect((res.content as { text: string }[])[0]!.text).toMatch(/reserved/)
+    expect(client.launchApp).not.toHaveBeenCalled()
   })
 })

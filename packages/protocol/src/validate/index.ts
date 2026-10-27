@@ -182,7 +182,13 @@ const BROWSER_INBOUND = {
   // It was also the wrong diagnosis: nothing was looked up, so "not found" describes a query that never
   // ran.
   'app:install': z.object({ type: z.literal('app:install'), sessionId, requestId, buildId: z.number().int() }),
-  'app:launch': z.object({ type: z.literal('app:launch'), sessionId, requestId, buildId: z.number().int() }),
+  // Shape only. The rules (key form, reserved names, size) are `launchOptionsProblem`'s, which the relay applies in its
+  // handler so the caller is told which key and why, rather than this door's `malformed app:launch payload`.
+  'app:launch': z.object({
+    type: z.literal('app:launch'), sessionId, requestId, buildId: z.number().int(),
+    arguments: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())])).optional(),
+    env: z.record(z.string(), z.string()).optional(),
+  }),
   'app:clear-state': z.object({
     type: z.literal('app:clear-state'), sessionId, requestId,
     payload: z.object({ bundleId: z.string() }),
@@ -390,7 +396,8 @@ const INBOUND = { ...BROWSER_INBOUND, ...AGENT_INBOUND, ...STREAM_INBOUND } as c
 // from a session that has never acked as **success** (#457), so a dropped `input:key` would be
 // reported to an MCP caller as an input that landed.
 //
-// Exactly the twelve browser requests that declare a required `requestId`. The relay maps each to the
+// Every browser request that declares a required `requestId` except `device:lease`, which names no
+// session to answer on. The relay maps each to the
 // reply its own waiter reads; `scripts/__tests__/correlatedRequestsGated.test.mjs` derives that set
 // from the protocol and holds all three lists to it.
 const ANSWERABLE = {
@@ -506,7 +513,7 @@ export function parseInbound(raw: unknown): ParseResult {
   const result = INBOUND[known].safeParse(frame)
   if (!result.success) {
     const detail = z.prettifyError(result.error)
-    // Second stage, and only for the twelve. If the envelope stands on its own, the failure is in the
+    // Second stage, and only for these. If the envelope stands on its own, the failure is in the
     // payload and the relay has an address and a correlator to answer with — see `ANSWERABLE`.
     if (Object.hasOwn(ANSWERABLE, known)) {
       const answerable = known as AnswerableType

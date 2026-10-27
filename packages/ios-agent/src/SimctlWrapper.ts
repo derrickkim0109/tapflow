@@ -5,6 +5,9 @@ import { promises as fs } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { PlatformError, MAX_CLIPBOARD_BYTES } from '@tapflowio/agent-core'
+import type { LaunchOptions } from '@tapflowio/protocol'
+import { hasLaunchOptions } from '@tapflowio/protocol/launch'
+import { iosLaunchArgv, simctlChildEnv } from './launchArgs.js'
 
 const execFileAsync = promisify(execFile)
 const ROTATION_HELPER  = join(import.meta.dirname, '..', 'bin', 'rotation-helper')
@@ -357,8 +360,17 @@ export class SimctlWrapper {
 
   // Returns the launched app's host PID (`simctl launch` prints "<bundleId>: <pid>"), or null if it
   // can't be parsed. The audiotap-helper taps this PID; non-audio callers ignore it.
-  async launchApp(udid: string, bundleId: string): Promise<number | null> {
-    const out = await this.runner.exec('launch', udid, bundleId)
+  //
+  // With options, a running app is terminated first: `simctl launch` on a running bundle returns the existing pid and
+  // starts nothing, so the arguments would reach no process. Without them a running app is only brought forward, as
+  // it always was.
+  async launchApp(udid: string, bundleId: string, options?: LaunchOptions): Promise<number | null> {
+    const out = hasLaunchOptions(options)
+      ? await this.runner.execWithOpts(
+        { env: simctlChildEnv(options?.env) },
+        'launch', '--terminate-running-process', udid, bundleId, ...iosLaunchArgv(options?.arguments),
+      )
+      : await this.runner.exec('launch', udid, bundleId)
     const m = out.match(/:\s*(\d+)\s*$/)
     return m ? Number(m[1]) : null
   }

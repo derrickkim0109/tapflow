@@ -1,6 +1,6 @@
 ---
 title: 설정 파일
-description: "tapflow.config.json 스키마와 환경 변수 재정의: relay, agent, tunnel, TLS, 데이터 디렉터리, SMTP, 웹훅."
+description: "tapflow.config.json 스키마와 환경 변수 재정의: relay, agent, tunnel, TLS, 데이터 디렉터리, SMTP, 웹훅, 실행 기본값."
 ---
 
 # 설정 파일
@@ -41,6 +41,7 @@ description: "tapflow.config.json 스키마와 환경 변수 재정의: relay, a
 | `tls` | LAN HTTPS(보안 컨텍스트) 설정. WebCodecs 하드웨어 디코드에 필요합니다. 아래 HTTPS 섹션을 참고하세요. |
 | `smtp` | 초대·비밀번호 재설정 이메일 발송을 위한 SMTP 설정 |
 | `webhooks` | 빌드 리뷰 상태가 바뀔 때 알림을 보낼 아웃바운드 엔드포인트. 서명 secret은 `secretEnv`가 가리키는 환경 변수에서 읽습니다. 아래 웹훅 섹션을 참고하세요. |
+| `launch` | 앱을 실행할 때마다 넘길 실행 인자. 번들 ID별로 적습니다. 아래 실행 기본값 섹션을 참고하세요. |
 | `agent.lean` | Lean mode 설정. 이 머신의 에이전트가 부팅하는 iOS 시뮬레이터와 Android 에뮬레이터에 적용됩니다. 릴레이가 아니라 에이전트가 읽는 값입니다. 기본값은 `false`입니다. 아래 Lean mode 섹션을 참고하세요. |
 
 `smtp.from`은 `smtp.user`가 설정되어 있으면 `tapflow <smtp.user>` 형태로 자동 설정되고 없으면 `tapflow <noreply@tapflow.local>`입니다. 발신자 주소를 다르게 지정하려면 명시적으로 입력합니다.
@@ -341,6 +342,38 @@ SMTP가 설정되지 않으면 초대 이메일과 비밀번호 재설정 이메
 | `webhooks[].enabled` | 활성 여부. 기본 `true` |
 
 `webhooks` 변경은 릴레이를 다시 시작해야 반영됩니다.
+
+## 실행 기본값 {#launch-defaults}
+
+`launch`는 앱을 실행할 때마다 넘길 [실행 인자](/ko/automation/flows#launch-arguments)를 정합니다. 대시보드의 Launch 버튼, MCP `launch_app`, 플로우의 `launchApp` 모두에 적용됩니다. 스테이징 서버 주소처럼 모든 테스터에게 필요한 플래그를 플로우마다 적지 않고 한 곳에 둘 때 씁니다.
+
+```json
+{
+  "launch": {
+    "com.example.app": {
+      "arguments": { "apiHost": "staging.example.com", "FIRDebugEnabled": true },
+      "env": { "LOG_LEVEL": "debug" },
+      "envFrom": { "API_TOKEN": "STAGING_API_TOKEN" }
+    }
+  }
+}
+```
+
+| 키 | 설명 |
+|----|------|
+| `launch.<번들 ID>` | 앱의 번들 ID 또는 패키지 이름. 빌드를 올릴 때 쓰인 값과 정확히 같아야 합니다. |
+| `.arguments` | 실행 인자. 값과 규칙은 플로우와 같습니다. |
+| `.env` | 값을 여기에 직접 적는 환경 변수. 비밀이 아닌 값에 씁니다. |
+| `.envFrom` | 다른 변수의 값을 이름으로 가져오는 환경 변수. `"API_TOKEN": "STAGING_API_TOKEN"`이라고 쓰면 릴레이의 `.env`나 환경 변수에 있는 `STAGING_API_TOKEN` 값이 앱의 `API_TOKEN`이 됩니다. 비밀 값은 `env`가 아니라 여기에 둡니다. |
+
+- 실행할 때 인자나 환경 변수를 따로 넘기면 기본값과 함께 적용됩니다. 같은 키가 겹치면 실행할 때 넘긴 값을 씁니다.
+- 기본값도 실행 인자로 치므로 기본값이 있는 앱은 이미 떠 있어도 실행할 때마다 다시 시작합니다. 대시보드의 Launch 버튼도 마찬가지입니다. 보던 화면으로 돌아가려면 기기 홈 화면에서 앱을 여세요.
+- 기기가 받을 수 없는 기본값은 빼고 실행하며 릴레이가 경고를 남깁니다. Android에는 앱의 환경 변수를 정할 방법이 없어 env 기본값을 빼고 에이전트가 기본값을 넘기지 못하는 이전 버전이면 기본값을 모두 뺍니다. Android에서 launcher activity가 둘 이상인 앱도 실행할 때 따로 넘긴 인자가 없으면 기본값 없이 실행합니다. 따로 넘긴 인자가 있으면 기본값이 없을 때처럼 실행이 실패합니다. 실행 기록에 적용된 기본값의 키가 남으므로 빠진 기본값은 그 기록에서 확인할 수 있습니다.
+- 기본값의 값은 어디에도 보이지 않습니다. 실행 기록과 MCP 결과에는 키만 남습니다.
+- 항목이 잘못됐거나 `envFrom`이 설정되지 않은 변수나 릴레이 자신의 비밀(`JWT_SECRET`, `SMTP_*`, `TAPFLOW_*`, 웹훅 secret)을 가리키면 릴레이가 시작하지 않습니다. 올라온 빌드 중에 없는 번들 ID는 오타나 대소문자 차이일 때가 많아 경고로 알립니다.
+- 빌드를 올릴 수 있는 사람은 누구나 같은 번들 ID로 빌드를 올려 그 앱의 `envFrom` 값을 받을 수 있습니다. 스테이징 토큰처럼 올리는 사람 모두가 가져도 되는 값만 `envFrom`에 두세요.
+
+`launch` 변경은 릴레이를 다시 시작해야 반영됩니다.
 
 ## 관련 문서 {#related}
 

@@ -1755,3 +1755,98 @@ describe('RelayClient.lease', () => {
     expect(urls[0]).toContain('client=run-7')
   })
 })
+
+// #1047. Two places can drop launch options without a word: an older relay's validator strips them, and an older
+// agent behind a newer relay ignores them. Both still answer done, so the client checks before and after.
+describe('RelayClient launch options', () => {
+  let wss: WebSocketServer | null = null
+
+  afterEach(async () => {
+    const s = wss
+    wss = null
+    if (!s) return
+    for (const c of s.clients) c.terminate()
+    await new Promise<void>((r) => s.close(() => r()))
+  })
+
+  async function relay(opts: { features?: string[]; applied?: boolean | unknown; refuse?: Record<string, unknown> }) {
+    const received: Record<string, unknown>[] = []
+    wss = new WebSocketServer({ port: 0 })
+    wss.on('connection', (ws) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>
+        received.push(msg)
+        if (msg['type'] === 'agents:list') ws.send(JSON.stringify({ type: 'agents:listed', sessions: [], ...(opts.features ? { features: opts.features } : {}) }))
+        if (msg['type'] === 'app:launch' && opts.refuse) {
+          ws.send(JSON.stringify({ type: 'app:launch-error', sessionId: msg['sessionId'], requestId: msg['requestId'], ...opts.refuse }))
+        } else if (msg['type'] === 'app:launch') {
+          const applied = opts.applied === true ? { applied: { arguments: Object.keys((msg['arguments'] as object) ?? {}), env: [] } }
+            : opts.applied ? { applied: opts.applied } : {}
+          ws.send(JSON.stringify({ type: 'app:launch-done', sessionId: msg['sessionId'], requestId: msg['requestId'], ...applied }))
+        }
+      })
+    })
+    const port = (wss.address() as { port: number }).port
+    const client = new RelayClient(`ws://localhost:${port}`, '')
+    await client.connect()
+    return { client, received }
+  }
+
+  it('sends the options to a relay that carries them, and accepts the applied keys', async () => {
+    const { client, received } = await relay({ features: ['launch-options'], applied: true })
+    expect(await client.launchApp('s1', 7, { arguments: { flag: true } })).toEqual({ arguments: ['flag'], env: [] })
+    expect(received.find((m) => m['type'] === 'app:launch')).toMatchObject({ buildId: 7, arguments: { flag: true } })
+  })
+
+  // The relay's per-app defaults reach a plain launch too, and their names are what the run record shows.
+  // The engine reads both lists after the app is up; a malformed reply would throw there and count as the app failing.
+  it.each([[{ arguments: ['a'] }], [{ arguments: 'a', env: [] }], [{ arguments: [1], env: [] }]])('fails as environment on a malformed applied %j', async (malformed) => {
+    const { client } = await relay({ features: ['launch-options'], applied: malformed })
+    const err = await client.launchApp('s1', 7).catch((e: unknown) => e)
+    expect((err as Error).message).toMatch(/malformed list of applied options/)
+    expect(isEnvironmentStepFailure(err)).toBe(true)
+  })
+
+  it('returns the applied keys of a launch that sent none', async () => {
+    const { client } = await relay({ features: ['launch-options'], applied: true })
+    expect(await client.launchApp('s1', 7)).toEqual({ arguments: [], env: [] })
+  })
+
+  it('refuses before sending when the relay does not carry them', async () => {
+    const { client, received } = await relay({ features: ['device-lease'] })
+    const err = await client.launchApp('s1', 7, { arguments: { flag: true } }).catch((e: unknown) => e)
+    expect((err as Error).message).toMatch(/relay is too old/)
+    // An environment failure (exit 2), not a product one: the app did nothing wrong.
+    expect(isEnvironmentStepFailure(err)).toBe(true)
+    expect(received.some((m) => m['type'] === 'app:launch')).toBe(false)
+  })
+
+  it('fails a launch the agent answered without naming what it applied', async () => {
+    const { client } = await relay({ features: ['launch-options'] })
+    const err = await client.launchApp('s1', 7, { env: { A: '1' } }).catch((e: unknown) => e)
+    expect((err as Error).message).toMatch(/without the launch arguments/)
+    expect(isEnvironmentStepFailure(err)).toBe(true)
+  })
+
+  // The relay supports the options but the device's agent does not: a version mismatch, so exit 2. Any other
+  // refusal stays what a launch failure always was.
+  it('counts the relay\'s agent-outdated refusal as an environment failure, and no other', async () => {
+    const outdated = await relay({ features: ['launch-options'], refuse: { message: 'agent too old', reason: 'agent-outdated' } })
+    expect(isEnvironmentStepFailure(await outdated.client.launchApp('s1', 7, { arguments: { a: 1 } }).catch((e: unknown) => e))).toBe(true)
+    outdated.client.disconnect()
+    for (const c of wss!.clients) c.terminate()
+    await new Promise<void>((r) => wss!.close(() => r()))
+    wss = null
+    const other = await relay({ features: ['launch-options'], refuse: { message: 'env is iOS-only' } })
+    const err = await other.client.launchApp('s1', 7, { env: { A: '1' } }).catch((e: unknown) => e)
+    expect((err as Error).message).toMatch(/env is iOS-only/)
+    expect(isEnvironmentStepFailure(err)).toBe(false)
+  })
+
+  it('asks the relay nothing for a plain launch, and needs no applied keys', async () => {
+    const { client, received } = await relay({})
+    await client.launchApp('s1', 7)
+    expect(received.some((m) => m['type'] === 'agents:list')).toBe(false)
+    expect(Object.keys(received.find((m) => m['type'] === 'app:launch')!)).toEqual(['type', 'sessionId', 'requestId', 'buildId'])
+  })
+})

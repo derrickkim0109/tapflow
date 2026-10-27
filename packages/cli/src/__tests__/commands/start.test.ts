@@ -7,6 +7,7 @@ vi.mock('@tapflowio/relay', () => ({
     start: vi.fn().mockResolvedValue(undefined),
   }) }),
   initDb: vi.fn(),
+  loadLaunchDefaults: vi.fn(() => new Map()),
   loadedEnvPath: null,
   createCertProvider: vi.fn(),
   startTlsBackgroundTasks: vi.fn(() => () => {}),
@@ -32,7 +33,7 @@ vi.mock('../../lib/tunnel-runner.js', async (importOriginal) => ({
 vi.mock('../../lib/port-available.js', () => ({ refuseUnlessBindable: vi.fn() }))
 
 import { execSync } from 'node:child_process'
-import { RelayServer, initDb, config, createCertProvider, resolveRelayDisplayHost, buildCorsOrigins, proxyWithoutPublicUrlWarning, isInitialized } from '@tapflowio/relay'
+import { RelayServer, initDb, config, loadLaunchDefaults, createCertProvider, resolveRelayDisplayHost, buildCorsOrigins, proxyWithoutPublicUrlWarning, isInitialized } from '@tapflowio/relay'
 import { AgentRegistry } from '@tapflowio/agent-core'
 import { startConfiguredTunnel } from '../../lib/tunnel-runner.js'
 import { refuseUnlessBindable } from '../../lib/port-available.js'
@@ -400,6 +401,13 @@ describe('cmdStart', () => {
     describe('실제 터널 결과를 relay에 넘긴다', () => {
       beforeEach(() => {
         vi.mocked(config).tunnel = { provider: 'tailscale' }
+      })
+
+      // A bad launch default exits the process, which skips the tunnel's cleanup — so it is read before the tunnel starts.
+      it('launch 기본값을 터널보다 먼저 읽는다', async () => {
+        await cmdStart({ platform: 'ios' })
+        expect(vi.mocked(loadLaunchDefaults).mock.invocationCallOrder[0])
+          .toBeLessThan(vi.mocked(startConfiguredTunnel).mock.invocationCallOrder[0])
       })
 
       it('터널이 RelayServer 생성보다 먼저 시작된다', async () => {

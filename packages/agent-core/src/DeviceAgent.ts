@@ -1,3 +1,4 @@
+import type { LaunchOptions } from '@tapflowio/protocol'
 import type { Device, UIElement } from './types.js'
 
 export interface DeviceAgent {
@@ -11,8 +12,11 @@ export interface DeviceAgent {
    * the launch itself **resolved only after the app's first frame** (Android: `am start -W`, or once its 10 s bound ran
    * out, so a reply is not proof that a frame was drawn). An agent that does
    * neither, and answers an empty tree while the app is still starting, makes a flow send its next step to nothing.
+   *
+   * With `options` carrying anything, the app is started fresh even when it is running, since a running process has
+   * already read its arguments. An option the platform cannot apply is refused, never dropped (#1047).
    */
-  launchApp(bundleId: string): Promise<void>
+  launchApp(bundleId: string, options?: LaunchOptions): Promise<void>
   screenshot(): Promise<Buffer>
   stream(): ReadableStream<Buffer>
   touchStart(x: number, y: number): void

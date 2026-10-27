@@ -341,6 +341,55 @@ describe('AndroidAgent', () => {
     })
   })
 
+  // The two memory reads run off the event loop now (they held it 4 ms in a built agent and ~200 ms under tsx,
+  // every 5 s), so a sample can land after the socket it was taken for closed.
+  describe('resource reports (agent:resources)', () => {
+    type Internals = {
+      resources: { getMemoryUsage: () => Promise<{ memUsedMB: number; memTotalMB: number }>; getMemoryPressure: () => Promise<undefined> }
+      reportResources: () => Promise<void>
+      sendOn: (ws: unknown, msg: { type: string }) => void
+    }
+    function holdSamples(agent: AndroidAgent) {
+      const internals = agent as unknown as Internals
+      const releases: Array<() => void> = []
+      internals.resources.getMemoryUsage = () => new Promise((r) => { releases.push(() => r({ memUsedMB: 1, memTotalMB: 2 })) })
+      internals.resources.getMemoryPressure = () => Promise.resolve(undefined)
+      const sendOn = vi.spyOn(internals, 'sendOn')
+      return { internals, releases, reports: () => sendOn.mock.calls.filter(([, msg]) => msg.type === 'agent:resources').length }
+    }
+
+    it('takes one sample at a time', async () => {
+      const agent = new AndroidAgent({}, mockAdb())
+      const { internals, releases, reports } = holdSamples(agent)
+      await agent.connect(`ws://localhost:${port}`) // its own report is the one in flight
+      await vi.waitFor(() => expect(releases).toHaveLength(1))
+      await internals.reportResources()
+      expect(releases).toHaveLength(1)
+      releases[0]()
+      await vi.waitFor(() => expect(reports()).toBe(1))
+      agent.disconnect()
+    })
+
+    it('sends nothing for a sample that lands after its socket closed, and sends one that lands while open', async () => {
+      const stale = new AndroidAgent({}, mockAdb())
+      const held = holdSamples(stale)
+      await stale.connect(`ws://localhost:${port}`)
+      await vi.waitFor(() => expect(held.releases).toHaveLength(1))
+      stale.disconnect()
+      held.releases[0]()
+      await new Promise((r) => setTimeout(r, 30))
+      expect(held.reports()).toBe(0)
+
+      const live = new AndroidAgent({}, mockAdb())
+      const open = holdSamples(live)
+      await live.connect(`ws://localhost:${port}`)
+      await vi.waitFor(() => expect(open.releases).toHaveLength(1))
+      open.releases[0]()
+      await vi.waitFor(() => expect(open.reports()).toBe(1))
+      live.disconnect()
+    })
+  })
+
   describe('device:boot flow', () => {
     it('sends device:booting then device:ready', async () => {
       const adb = mockAdb(false)
@@ -3598,7 +3647,40 @@ describe('AndroidAgent', () => {
         const done = waitForType(browser, 'app:launch-done')
         inject({ type: 'app:launch', requestId: 'rqi-1', payload: { bundleId: 'com.example.app' } })
         await done
-        expect(launchSpy).toHaveBeenCalledWith('emulator-5554', 'com.example.app')
+        expect(launchSpy).toHaveBeenCalledWith('emulator-5554', 'com.example.app', undefined, false)
+      })
+
+      it('passes launch arguments through and reports their names', async () => {
+        const launchSpy = vi.spyOn(adb, 'launchApp').mockResolvedValue({ arguments: { flag: true } })
+        const done = waitForType(browser, 'app:launch-done')
+        inject({ type: 'app:launch', requestId: 'rqi-2', payload: { bundleId: 'com.example.app', arguments: { flag: true } } })
+        expect((await done)['applied']).toEqual({ arguments: ['flag'], env: [] })
+        expect(launchSpy).toHaveBeenCalledWith('emulator-5554', 'com.example.app', { arguments: { flag: true } }, false)
+      })
+
+      // The relay's defaults the device could not take are reported as not applied, which is what a run record shows.
+      it('reports what was delivered of the relay defaults, down to nothing', async () => {
+        const launchSpy = vi.spyOn(adb, 'launchApp').mockResolvedValue(undefined)
+        const done = waitForType(browser, 'app:launch-done')
+        inject({ type: 'app:launch', requestId: 'rqi-5', payload: { bundleId: 'com.example.app', arguments: { flag: true }, defaultsOnly: true } })
+        expect((await done)['applied']).toEqual({ arguments: [], env: [] })
+        expect(launchSpy).toHaveBeenCalledWith('emulator-5554', 'com.example.app', { arguments: { flag: true } }, true)
+      })
+
+      it('refuses options the shared check refuses, without launching', async () => {
+        const launchSpy = vi.spyOn(adb, 'launchApp')
+        const err = waitForType(browser, 'app:launch-error')
+        inject({ type: 'app:launch', requestId: 'rqi-3', payload: { bundleId: 'com.example.app', arguments: { '-x': 1 } } })
+        const msg = await err
+        expect(msg['requestId']).toBe('rqi-3')
+        expect(msg['message']).toMatch(/leading "-"/)
+        expect(launchSpy).not.toHaveBeenCalled()
+      })
+
+      it('answers an env launch with the platform refusal', async () => {
+        const err = waitForType(browser, 'app:launch-error')
+        inject({ type: 'app:launch', requestId: 'rqi-4', payload: { bundleId: 'com.example.app', env: { A: '1' } } })
+        expect((await err)['message']).toMatch(/env is iOS-only/)
       })
     })
 
