@@ -9,6 +9,11 @@ status: stable
 > Read this before switching rotation back to `settings put user_rotation`, changing
 > scrcpy's `capture_orientation`, or downgrading the bundled scrcpy server. The rotation
 > pipeline is correct; the bugs were in the tools it drives.
+>
+> **Scope since four-way rotation:** this is the scrcpy path — real devices, and an emulator that
+> fell back to scrcpy — which still toggles with `wm user-rotation lock`. An emulator streaming
+> over gRPC turns its *body* with `adb emu rotate` and writes no lock; see "Rotation turns the
+> emulator's body" in `packages/android-agent/AGENTS.md`.
 
 ## The two fixes that make rotation work
 

@@ -32,7 +32,7 @@ function initGLState(canvas: HTMLCanvasElement): GLState | null {
     alpha: false,
     antialias: false,
     powerPreference: 'high-performance',
-    preserveDrawingBuffer: true, // required for captureStream() recording
+    preserveDrawingBuffer: true, // useIOSScreen mirrors this canvas with drawImage on a later animation frame
   })
   if (!gl) return null
 

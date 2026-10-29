@@ -57,6 +57,7 @@ export class WASMDecoder implements Decoder {
   private _size: DecoderSize | null = null
   private resizeCb?: (size: DecoderSize) => void
   private decodedCb?: (presentTime: number, sample?: DecodeSample) => void
+  private readonly presented = new Set<() => void>()
 
   constructor(
     createRenderer: (canvas: HTMLCanvasElement) => YUVRenderer = defaultRenderer,
@@ -73,6 +74,10 @@ export class WASMDecoder implements Decoder {
 
   onResize(cb: (size: DecoderSize) => void): void { this.resizeCb = cb }
   onDecodedFrame(cb: (presentTime: number, sample?: DecodeSample) => void): void { this.decodedCb = cb }
+  onPresented(cb: () => void): () => void {
+    this.presented.add(cb)
+    return () => { this.presented.delete(cb) }
+  }
 
   decode(data: ArrayBuffer): void {
     if (!this.ready) { this.pending.push(data); return }
@@ -105,6 +110,7 @@ export class WASMDecoder implements Decoder {
     // No exact per-frame decodeMs (software path) — the viewer's FIFO tracker derives
     // decode→present from submit↔present. Report present time only.
     this.decodedCb?.(performance.now())
+    for (const cb of this.presented) cb()
     if (!this._size || this._size.width !== size.width || this._size.height !== size.height) {
       this._size = size
       this.resizeCb?.(size)

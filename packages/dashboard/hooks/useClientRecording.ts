@@ -56,8 +56,8 @@ export function useClientRecording({ sessionId, buildId, onRecordingUploaded }: 
     rafIdRef.current = requestAnimationFrame(loop)
   }, [])
 
-  // Caller must set recordCanvasRef.current.width/height before calling this.
-  // (iOS uses container px, Android multiplies by devicePixelRatio — kept as caller responsibility.)
+  // Caller must set recordCanvasRef.current.width/height before calling this. (iOS: the laid-out device scaled to the
+  // stream's pixels, held to RECORDING_MAX_SIDE; Android: the decoded frame's size — kept as caller responsibility.)
   /**
    * Tell the recorder which function draws a frame. The newest one wins, and the frame loop reads
    * it afresh every tick.
@@ -68,8 +68,8 @@ export function useClientRecording({ sessionId, buildId, onRecordingUploaded }: 
    * the turn into refs it wrote *after* handing the closure to this hook. That is a Rules of React
    * violation the React Compiler will not compile past. It is not an option on this hook either:
    * `composeFrame` needs `recordCanvasRef`, which this hook returns, so the viewer cannot have
-   * built it yet when it calls us. (`IOSViewer`'s composer reads what it needs from refs on every
-   * draw, so it registers once and never mirrored a turn.)
+   * built it yet when it calls us. (`IOSViewer`'s composer is rebuilt on every turn too, and hands
+   * itself over the same way.)
    *
    * **The obligation this moved out of the type system.** A caller that starts recording without
    * ever calling this gets a black video — no error, no warning, a green typecheck, where the old

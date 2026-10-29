@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, act } from '@testing-library/react'
+import { render, screen, act, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 /**
@@ -372,5 +372,272 @@ describe('AndroidViewer — a frame ahead of its description (#845)', () => {
     v.rerenderWith({ screenWidth: 1200, screenHeight: 2000 })
     v.rerenderWith({ screenWidth: 1080, screenHeight: 2400 })
     expect(screen.queryByText(/Changing posture…|Waiting for stream…/)).toBeNull()
+  })
+})
+
+// Body mode (gRPC emulators report `bodyRotation`): the frame is drawn as the body is held, Rotate turns the body
+// a quarter clockwise, and a touch goes on the wire in the screen Android draws.
+describe('AndroidViewer — a device that reports its body', () => {
+  beforeEach(() => { stubCanvasContext() })
+  afterEach(() => { vi.restoreAllMocks() })
+
+  // Mutations: send a portrait/landscape target; count the second press from the report, not the turn on its way.
+  // Mutation: send a portrait/landscape target.
+  it('sends a quarter clockwise for every press', async () => {
+    const { send, rerenderWith } = renderViewer(0)
+    rerenderWith({ bodyRotation: 0 })
+    const rotate = screen.getByRole('button', { name: /rotate the device/i })
+    await userEvent.click(rotate)
+    await userEvent.click(rotate)
+    await vi.waitFor(() => expect(rotateCalls(send).map(([m]) => (m as { payload: unknown }).payload)).toEqual([{ direction: 'clockwise' }, { direction: 'clockwise' }]))
+  })
+
+  // The next frame is the turned body, so nothing is held back: not by the press, and not while the description
+  // (0.6–3.6 s behind) still describes the body before. Mutations: hold the picture on a press; frame the shell by
+  // the description, so a landscape frame waits behind "Changing posture…".
+  it('shows the turned frame at once, before the description catches up', async () => {
+    const { rerenderWith, container } = renderViewer(0)
+    rerenderWith({ bodyRotation: 0 })
+    readyToCompose()
+    const held = () => container.querySelector('.animate-pulse') !== null
+    await userEvent.click(screen.getByRole('button', { name: /rotate the device/i }))
+    expect(held()).toBe(false)
+    act(() => { captured.onResize?.({ width: 2400, height: 1080 }) }) // the turned body's frame, description still portrait
+    expect(held()).toBe(false)
+    expect(container.textContent).not.toContain('Changing posture')
+  })
+
+  // The corners are the panel's, which no turn changes: the frame flips at once while the description is a turn
+  // behind, and choosing a side of the shell by that description made them jump. Mutation: radius from a side
+  // chosen by `streamRotation`.
+  it('keeps the screen\'s corners while the frame turns ahead of the description', () => {
+    const { rerenderWith, container } = renderViewer(0)
+    rerenderWith({ bodyRotation: 0, cornerRadius: 0.1 })
+    readyToCompose()
+    const radius = () => (container.querySelector('div[style*="overflow: hidden"]') as HTMLElement).style.borderRadius
+    const before = radius()
+    // 0.1 of a 1080-px width is 108 device px; the shell's long side is 720 of the device's 2400.
+    expect(before).toBe(`${Math.round((108 * 720) / 2400)}px`)
+    act(() => { captured.onResize?.({ width: 2400, height: 1080 }) }) // turned frame, description still portrait
+    expect(radius()).toBe(before)
+    // A quality tier shrinks the stream; the corner is the panel's, so it does not move.
+    act(() => { captured.onResize?.({ width: 1280, height: 576 }) })
+    expect(radius()).toBe(before)
+    rerenderWith({ bodyRotation: 90, streamRotation: 270, screenWidth: 1080, screenHeight: 2400, cornerRadius: 0.1 })
+    expect(radius()).toBe(before)
+  })
+
+  // The cursor shows where the pointer is whatever the description says. Mutation: show it only when the frame and
+  // the description agree — it vanished on every turn and stayed gone until the mouse moved.
+  it('keeps the cursor on screen while the description lags the frame', () => {
+    const { rerenderWith, container } = renderViewer(0)
+    rerenderWith({ bodyRotation: 0 })
+    readyToCompose()
+    act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 240, height: 100, right: 240, bottom: 100, x: 0, y: 0, toJSON: () => ({}) })
+    const host = container.querySelector('div[style*="cursor: none"]') as Element
+    act(() => { host.dispatchEvent(new PointerEvent('pointermove', { clientX: 10, clientY: 10, bubbles: true, pointerId: 1 })) })
+    const cursor = container.querySelector('div[style*="z-index: 20"]') as HTMLElement
+    expect(cursor.style.display).toBe('block')
+  })
+
+  // A touch goes out in the frame's space and the agent turns it by the frame it holds, so nothing waits on the
+  // description (0.6–3.6 s behind a turn). Dropping touches until it caught up was the first version, and it was
+  // felt as input stalling after every turn. Mutation: refuse the touch while the two disagree.
+  it('takes a touch at once while the description lags the frame', () => {
+    const { send, rerenderWith, container } = renderViewer(0)
+    rerenderWith({ bodyRotation: 0 })
+    readyToCompose()
+    act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 240, height: 100, right: 240, bottom: 100, x: 0, y: 0, toJSON: () => ({}) })
+    Element.prototype.setPointerCapture ??= () => {}
+    const host = container.querySelector('div[style*="cursor: none"]') as Element
+    const touches = () => send.mock.calls.filter(([m]) => (m as { type: string }).type === 'input:touch:start')
+    act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 24, clientY: 10, bubbles: true, pointerId: 1 })) })
+    expect(touches().map(([m]) => (m as { payload: unknown }).payload)).toEqual([{ x: 0.1, y: 0.1, space: 'frame' }])
+  })
+
+  // **A press spins the device first and sends the turn once the spin is done; the turned frame ends the spin.**
+  describe('the spin on a press', () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+    const bezel = (c: HTMLElement) => c.querySelector('div[style*="translate(-50%, -50%) rotate("]') as HTMLElement
+    const area = (c: HTMLElement) => bezel(c).parentElement as HTMLElement
+    const press = () => fireEvent.click(screen.getByRole('button', { name: /rotate the device/i }))
+    const ready = () => {
+      const view = renderViewer(0)
+      view.rerenderWith({ bodyRotation: 0 })
+      readyToCompose()
+      return view
+    }
+
+    // Mutations: send at the press; spin without animating.
+    it('spins a quarter, animated, and sends the turn when the spin has finished', () => {
+      const { send, container } = ready()
+      press()
+      expect(bezel(container).style.transform).toContain('rotate(90deg)')
+      expect(bezel(container).className).toContain('transition-transform')
+      // The area takes the turned shape with it, so the toolbar moves rather than being run over.
+      expect(parseFloat(area(container).style.width)).toBeGreaterThan(parseFloat(area(container).style.height))
+      expect(rotateCalls(send)).toHaveLength(0)
+      act(() => { vi.advanceTimersByTime(350) })
+      expect(rotateCalls(send)).toHaveLength(1)
+    })
+
+    // The turned body's frame is the picture the spin ended on, so it replaces the spin with no motion.
+    // Mutations: end the spin on the description; animate the swap back.
+    it('ends on the frame whose sides swapped, without moving', () => {
+      const { container } = ready()
+      press()
+      act(() => { vi.advanceTimersByTime(350) })
+      act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+      expect(bezel(container).style.transform).toContain('rotate(0deg)')
+      expect(bezel(container).className).not.toContain('transition-transform')
+    })
+
+    // A quality tier scales the frame without turning it. Mutation: count any resize as the turn.
+    it('is not ended by a frame that only changed size', () => {
+      const { container } = ready()
+      press()
+      act(() => { captured.onResize?.({ width: 540, height: 1200 }) })
+      expect(bezel(container).style.transform).toContain('rotate(90deg)')
+    })
+
+    // Mutation: count presses by whether one is pending, so a second press is lost.
+    it('spins a quarter more for each press, and pays a quarter per turned frame', () => {
+      const { container } = ready()
+      press(); press()
+      expect(bezel(container).style.transform).toContain('rotate(180deg)')
+      act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+      expect(bezel(container).style.transform).toContain('rotate(90deg)')
+      act(() => { captured.onResize?.({ width: 1080, height: 2400 }) })
+      expect(bezel(container).style.transform).toContain('rotate(0deg)')
+    })
+
+    // Mutation: leave the device turned when its frame never comes.
+    it('turns back when the frame never comes', () => {
+      const { container } = ready()
+      press()
+      act(() => { vi.advanceTimersByTime(4_000) })
+      expect(bezel(container).style.transform).toContain('rotate(0deg)')
+      expect(bezel(container).className).toContain('transition-transform')
+    })
+
+    // The way back is drawn as a turn too, so input stays closed until it has landed. Mutation: reopen input the
+    // moment nothing is owed.
+    it('takes no touch while a turn whose frame never came is undone', () => {
+      const { send, container } = ready()
+      vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 100, height: 240, right: 100, bottom: 240, x: 0, y: 0, toJSON: () => ({}) })
+      Element.prototype.setPointerCapture ??= () => {}
+      const host = container.querySelector('div[style*="cursor: none"]') as Element
+      const touches = () => send.mock.calls.filter(([m]) => (m as { type: string }).type === 'input:touch:start')
+      press()
+      act(() => { vi.advanceTimersByTime(4_000) })
+      act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 10, clientY: 24, bubbles: true, pointerId: 1 })) })
+      expect(touches()).toHaveLength(0)
+      act(() => { vi.advanceTimersByTime(350) })
+      act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 10, clientY: 24, bubbles: true, pointerId: 2 })) })
+      expect(touches()).toHaveLength(1)
+    })
+
+    // A point on a device caught mid-turn lands nowhere it was aimed. Mutation: take it anyway.
+    it('takes no touch while the device spins, and takes one once the frame has come', () => {
+      const { send, container } = ready()
+      vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 100, height: 240, right: 100, bottom: 240, x: 0, y: 0, toJSON: () => ({}) })
+      Element.prototype.setPointerCapture ??= () => {}
+      const host = container.querySelector('div[style*="cursor: none"]') as Element
+      const touches = () => send.mock.calls.filter(([m]) => (m as { type: string }).type === 'input:touch:start')
+      press()
+      act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 10, clientY: 24, bubbles: true, pointerId: 1 })) })
+      expect(touches()).toHaveLength(0)
+      act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+      act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 10, clientY: 24, bubbles: true, pointerId: 2 })) })
+      expect(touches()).toHaveLength(1)
+    })
+
+    // A turn somebody else made arrives as a frame with nothing owed, and is drawn as it comes — spinning it would
+    // turn a picture that has already turned. Mutation: spin on any turned frame.
+    it('does not spin for a turn this viewer did not ask for', () => {
+      const { container } = ready()
+      act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+      expect(bezel(container).style.transform).toContain('rotate(0deg)')
+    })
+  })
+
+  // The body's turn is the device's, shared with every viewer. Mutation: undo it on unmount as the toggle does.
+  it('does not turn the device back when the viewer leaves', async () => {
+    const { send, unmount, rerenderWith } = renderViewer(0)
+    rerenderWith({ bodyRotation: 0 })
+    await userEvent.click(screen.getByRole('button', { name: /rotate the device/i }))
+    unmount()
+    expect(rotateCalls(send)).toHaveLength(1)
+  })
+
+  // The wire carries the frame's own point and says so; the agent turns it into the screen. The cursor and the
+  // recording's overlay are in the screen, turned by the correction: body a quarter clockwise over a
+  // portrait-locked screen (correction 270), the frame's top-left is the screen's bottom-left. Mutations: send the
+  // screen's point; drop `space`, so the agent reads a frame point as the screen.
+  it('sends a touch in the frame\'s space, and says so', () => {
+    const { send, rerenderWith, container } = renderViewer(270)
+    rerenderWith({ bodyRotation: 90, streamRotation: 270 })
+    // The surface host — the picture, under `cursor: none` — where the pointer handlers are.
+    const host = container.querySelector('div[style*="cursor: none"]')
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 240, height: 100, right: 240, bottom: 100, x: 0, y: 0, toJSON: () => ({}) })
+    Element.prototype.setPointerCapture ??= () => {}
+    const target = (host ?? container.firstElementChild) as Element
+    act(() => { target.dispatchEvent(new PointerEvent('pointerdown', { clientX: 0, clientY: 0, bubbles: true, pointerId: 1 })) })
+    const start = send.mock.calls.map(([m]) => m as { type: string; payload?: { x: number; y: number } }).find((m) => m.type === 'input:touch:start')
+    expect(start?.payload).toEqual({ x: 0, y: 0, space: 'frame' })
+  })
+
+  // Without a body the picture is the screen, and the wire says nothing more — the space every other sender uses.
+  // Mutation: mark every touch as the frame's.
+  it('sends no space where the picture is the screen', () => {
+    const { send, container } = renderViewer(0)
+    const host = container.querySelector('div[style*="cursor: none"]') as Element
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 100, height: 240, right: 100, bottom: 240, x: 0, y: 0, toJSON: () => ({}) })
+    Element.prototype.setPointerCapture ??= () => {}
+    act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 10, clientY: 24, bubbles: true, pointerId: 1 })) })
+    const start = send.mock.calls.map(([m]) => m as { type: string; payload?: unknown }).find((m) => m.type === 'input:touch:start')
+    expect(start?.payload).toEqual({ x: 0.1, y: 0.1 })
+  })
+
+  // A pinch is the same: both fingers in the frame, said once. The hint is drawn from the screen's pair, turned
+  // back onto the picture, so it sits under the pointer. Mutation: send the screen's fingers.
+  it('sends a pinch in the frame\'s space', () => {
+    const { send, rerenderWith, container } = renderViewer(270)
+    rerenderWith({ bodyRotation: 90, streamRotation: 270 })
+    const host = container.querySelector('div[style*="cursor: none"]') as Element
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 240, height: 100, right: 240, bottom: 100, x: 0, y: 0, toJSON: () => ({}) })
+    Element.prototype.setPointerCapture ??= () => {}
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { code: 'AltLeft' })) })
+    act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 48, clientY: 20, bubbles: true, pointerId: 1 })) })
+    const pinch = send.mock.calls.map(([m]) => m as { type: string; payload?: unknown }).find((m) => m.type === 'input:pinch:start')
+    expect(pinch?.payload).toEqual({ f0: { x: 0.8, y: 0.8 }, f1: { x: 0.2, y: 0.2 }, space: 'frame' })
+    // The hint is kept in the screen and turned back onto the picture: the second finger sits under the pointer.
+    // Mutation: turn it by the correction instead of its inverse — every test at correction 0 passes that.
+    const hints = [...container.querySelectorAll<HTMLElement>('div[style*="border-radius: 50%"][style*="z-index: 10"]')]
+    const at = hints.map((h) => [parseFloat(h.style.left), parseFloat(h.style.top)].map((n) => Math.round(n)))
+    expect(at).toEqual([[80, 80], [20, 20]])
+  })
+
+  // The recording's overlay is drawn in the screen Android draws, so the cursor is kept there: a tap at the frame's
+  // top-left, on a body a quarter clockwise over a portrait-locked screen, is the screen's bottom-left. Mutation:
+  // keep the frame's point for the cursor.
+  it('records the cursor in the screen\'s space on a turned body', () => {
+    const { rerenderWith, container } = renderViewer(270)
+    rerenderWith({ bodyRotation: 90, streamRotation: 270 })
+    readyToCompose()
+    act(() => { captured.onResize?.({ width: 2400, height: 1080 }) })
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({ left: 0, top: 0, width: 240, height: 100, right: 240, bottom: 100, x: 0, y: 0, toJSON: () => ({}) })
+    Element.prototype.setPointerCapture ??= () => {}
+    const host = container.querySelector('div[style*="cursor: none"]') as Element
+    act(() => { host.dispatchEvent(new PointerEvent('pointerdown', { clientX: 0, clientY: 0, bubbles: true, pointerId: 1 })) })
+    const ctx = document.createElement('canvas').getContext('2d') as unknown as { arc: ReturnType<typeof vi.fn> }
+    ctx.arc.mockClear()
+    captured.compose?.()
+    const [x, y] = ctx.arc.mock.calls.at(-1) as [number, number]
+    expect(x).toBe(0)
+    expect(y).toBeGreaterThan(0)
   })
 })

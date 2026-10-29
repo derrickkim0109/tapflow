@@ -787,8 +787,8 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
 
   return (
     <>
-      {iosChrome && <IOSViewer {...commonProps} chrome={iosChrome} formFactor={formFactor} perfHookRef={devPerfHookRef} onStreamSize={onStreamSize} />}
-      {androidChrome && <AndroidViewer {...commonProps} androidButtons={androidChrome.buttons} screenWidth={androidChrome.screenWidth} screenHeight={androidChrome.screenHeight} cornerRadius={androidChrome.cornerRadius} postures={postures} streamRotation={androidChrome.streamRotation} perfHookRef={devPerfHookRef} />}
+      {iosChrome && <IOSViewer {...commonProps} chrome={iosChrome} formFactor={formFactor} postures={postures} perfHookRef={devPerfHookRef} onStreamSize={onStreamSize} />}
+      {androidChrome && <AndroidViewer {...commonProps} androidButtons={androidChrome.buttons} screenWidth={androidChrome.screenWidth} screenHeight={androidChrome.screenHeight} cornerRadius={androidChrome.cornerRadius} postures={postures} streamRotation={androidChrome.streamRotation} bodyRotation={androidChrome.bodyRotation} perfHookRef={devPerfHookRef} />}
       {import.meta.env.DEV && perfMode && perfVisible && (
         <>
           <StatsOverlay perfHookRef={statsRef} />

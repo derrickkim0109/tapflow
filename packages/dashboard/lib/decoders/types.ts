@@ -46,4 +46,10 @@ export interface Decoder {
    * Latency instrumentation only.
    */
   onDecodedFrame?(cb: (presentTime: number, sample?: DecodeSample) => void): void
+  /**
+   * Adds a listener fired once per frame drawn to `surface`, and returns its removal — for a consumer that copies
+   * the surface and should copy only when it changed. Unlike `onDecodedFrame` (a single slot the DEV latency
+   * tracker holds), any number may listen, and listening turns no sampling on.
+   */
+  onPresented?(cb: () => void): () => void
 }

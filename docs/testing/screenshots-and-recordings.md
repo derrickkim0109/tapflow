@@ -21,6 +21,8 @@ Press the camera button in the toolbar (**Screenshot**) or <kbd>⌘</kbd> <kbd>S
 
 Recordings collect in the build's **Recordings** tab. Open the **Recordings** tab under the info card to see each recording's time, how long it is kept for (such as **Expires in 2d**), and its size, and download it with the **Download** button. Every teammate who opens the same build sees this list.
 
+A recording is saved the way the device is shown: start one with the device turned to landscape and the video is landscape too. Turning or folding the device during a recording keeps the video at the size it started with, and the device is fitted inside it.
+
 The video format depends on your browser: `.mp4` where the browser can record MP4 (H.264), `.webm` otherwise.
 
 ## Platform support {#platform-support}

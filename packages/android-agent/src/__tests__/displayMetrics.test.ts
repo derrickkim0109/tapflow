@@ -88,6 +88,19 @@ describe('parseCornerRadius', () => {
     expect(parseCornerRadius('', 1080, 2424)).toBeNull()
   })
 
+  // The display's name is localised; the parser keyed on the English one read null on a Korean system (measured
+  // on Galaxy_S23_API_35), and the viewer cut the screen square. A virtual display of the same size is listed first,
+  // so only the `local:` filter picks the panel. Mutations: find the panel by its name again; drop the filter.
+  it('finds a built-in panel whatever the system language names it', () => {
+    const korean = `
+  DisplayDeviceInfo{"가상 화면": uniqueId="virtual:com.example,1000,1080x2400", 1080 x 2400, modeId 1,
+    RoundedCorner{position=TopLeft, radius=7}
+  DisplayDeviceInfo{"기본으로 제공되는 화면": uniqueId="local:4619827259835644672", 1080 x 2400, modeId 1,
+    roundedCorners RoundedCorners{[RoundedCorner{position=TopLeft, radius=104, center=Point(104, 104)
+`
+    expect(parseCornerRadius(korean, 1080, 2400)).toBe(104)
+  })
+
   it('answers null for a matching panel that reports no corner', () => {
     expect(parseCornerRadius(`
   DisplayDeviceInfo{"Built-in Screen": uniqueId="local:1", 1080 x 2424, modeId 1, density 440

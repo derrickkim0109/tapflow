@@ -1,12 +1,15 @@
 'use client';
 
-import { Fragment } from 'react';
+import { Fragment, useState } from 'react';
 import type { Dispatch, HTMLAttributes, PointerEvent, ReactNode, SetStateAction } from 'react';
 import type { FormFactor } from '@tapflowio/protocol'
 import { buttonHitRect, buttonTargets, buttonTitles } from '@/lib/buttonHit';
 import { iosScreenLayout } from '@/lib/iosScreenLayout';
+import type { Turn } from '@/lib/coordinate-transform';
 import type { ChromeData } from '@/lib/types'
 import type { IOSScreen } from '@/hooks/useIOSScreen';
+import { usePanelFade } from '@/hooks/usePanelFade';
+import type { FoldDirection } from '@/hooks/usePostureControl';
 
 /** The frame buttons' interactive half. Without it the buttons are drawn at rest and cannot be pressed. */
 export interface IOSFrameButtonControls {
@@ -25,8 +28,8 @@ interface IOSDeviceScreenProps {
   /** What the agent reported the device to be. Decides whether a volume button's tooltip follows
    *  the orientation (an iPad's does); absent reads as a phone. */
   formFactor?: FormFactor;
-  /** Turns the device on screen. iOS orientation is the viewer's own state; no message carries it. */
-  isLandscape: boolean;
+  /** How far to turn the device, clockwise — `iosTurn`, or a viewer's turn ahead of the device's. */
+  turn: Turn;
   /** Joined to a session: the waiting overlay speaks only then. */
   joined: boolean;
   fps: number;
@@ -36,6 +39,8 @@ interface IOSDeviceScreenProps {
   overlay?: ReactNode;
   /** Drawn beside the device in the unrotated screen area — the live cursor. */
   areaOverlay?: ReactNode;
+  /** A fold this viewer asked for, still in flight — `usePostureControl().folding`. The screen says so. */
+  folding?: FoldDirection | null;
 }
 
 /**
@@ -44,23 +49,53 @@ interface IOSDeviceScreenProps {
  * page renders it as it is, so a change to how the device looks lands in one place.
  */
 export function IOSDeviceScreen({
-  screen, chrome, formFactor, isLandscape, joined, fps,
-  containerHandlers, buttons, overlay, areaOverlay,
+  screen, chrome, formFactor, turn, joined, fps,
+  containerHandlers, buttons, overlay, areaOverlay, folding = null,
 }: IOSDeviceScreenProps) {
   const { canvasRef, containerRef, screenAreaRef, canvasReady, stalled } = screen;
   const { displayW, displayH, screenBox } = iosScreenLayout(chrome);
   const box = { width: chrome.compositeWidth, height: chrome.compositeHeight };
   const targets = buttonTargets(chrome.buttons, box);
-  const titles = buttonTitles(chrome.buttons, box, isLandscape, formFactor);
+  const quarter = turn === 90 || turn === 270;
+  const titles = buttonTitles(chrome.buttons, box, turn, formFactor);
+  // **The device turns the short way, like DeviceHub's frame.** The angle is kept running rather than
+  // taken mod 360, or 270 → 0 would animate three quarters backwards. Adjusted during render against
+  // the turn it last drew, so the first render draws without animating.
+  //
+  // **A turn that comes with another frame is a fold, not a turn**, and is not animated: the Duo's
+  // unfolded panel is drawn a quarter round from its cover, so a fold changes the turn without the
+  // device being turned, and animating it spun a dark panel round. The new panel fades in instead
+  // (`usePanelFade`).
+  const [spin, setSpin] = useState({ turn, deg: turn as number, frame: chrome.framePng, animate: false });
+  if (spin.turn !== turn || spin.frame !== chrome.framePng) {
+    setSpin({
+      turn, deg: spin.deg + ((turn - spin.turn + 540) % 360) - 180,
+      frame: chrome.framePng, animate: spin.frame === chrome.framePng,
+    });
+  }
+  usePanelFade(containerRef, spin.frame);
+  // A fold takes the Duo 4–6 s, both panels dark for part of it; the screen says so the way it says it is
+  // waiting for a frame, rather than looking stuck. It wins over the frame wait, which a fold causes.
+  const waiting = folding ? (folding === 'fold' ? 'Folding...' : 'Unfolding...')
+    : joined && fps === 0 && (!canvasReady || stalled) ? (canvasReady ? 'Waiting for next frame...' : 'Waiting for first frame...')
+    : null;
+  const motion = spin.animate ? 'motion-safe:duration-300 motion-safe:ease-in-out' : '';
 
   return (
-    <div ref={screenAreaRef} style={{ width: isLandscape ? displayH : displayW, height: isLandscape ? displayW : displayH, position: 'relative', flexShrink: 0 }}>
+    <div
+      ref={screenAreaRef}
+      className={spin.animate ? `motion-safe:transition-[width,height] ${motion}` : undefined}
+      style={{ width: quarter ? displayH : displayW, height: quarter ? displayW : displayH, position: 'relative', flexShrink: 0 }}
+    >
       <div
         ref={containerRef}
-        className="relative cursor-default"
+        className={spin.animate ? `cursor-default motion-safe:transition-transform ${motion}` : 'cursor-default'}
         style={{
+          // Centred in the area whatever its size, so the area can grow and shrink while the device turns
+          // and the two always land together.
+          position: 'absolute', top: '50%', left: '50%',
           width: displayW, height: displayH,
-          ...(isLandscape ? { position: 'absolute', top: (displayW - displayH) / 2, left: (displayH - displayW) / 2, transform: 'rotate(-90deg)', transformOrigin: 'center center' } : {}),
+          transform: `translate(-50%, -50%) rotate(${spin.deg}deg)`, transformOrigin: 'center center',
         }}
         {...containerHandlers}
       >
@@ -84,13 +119,15 @@ export function IOSDeviceScreen({
           </div>
         )}
         {overlay}
-        {joined && fps === 0 && (!canvasReady || stalled) && (
+        {waiting && (
           <div data-testid="screen-waiting" className="absolute overflow-hidden pointer-events-none flex items-center justify-center" style={{ zIndex: 8, ...screenBox }}>
             {/* Over a picture already on screen — a restart, a stalled stream — white text alone was
                 unreadable, so the screen is dimmed behind it. Before the first frame the skeleton
                 under it is dark enough already. */}
             {canvasReady && <div aria-hidden="true" className="absolute inset-0 bg-black/60 bg-screen-shimmer bg-[length:200%_100%] animate-screen-shimmer motion-reduce:animate-none" />}
-            <span className="relative text-sm text-white">{canvasReady ? 'Waiting for next frame...' : 'Waiting for first frame...'}</span>
+            {/* Turned back by the device's turn: the overlay sits on the screen and turns with it, and the
+                words have to stand upright for whoever is reading them. */}
+            <span className="relative text-sm text-white whitespace-nowrap" style={{ transform: `rotate(${-turn}deg)` }}>{waiting}</span>
           </div>
         )}
         {chrome.buttons.map((btn, i) => {

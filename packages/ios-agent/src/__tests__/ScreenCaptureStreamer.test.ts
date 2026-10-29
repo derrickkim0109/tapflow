@@ -37,6 +37,51 @@ async function setupProc() {
 describe('ScreenCaptureStreamer', () => {
   afterEach(() => vi.useRealTimers())
 
+  // A multi-panel device (iPhone Duo) is captured one panel at a time. Mutations: drop `--panel` from the
+  // args (the helper then captures the largest panel, dark while folded); write the switch for a panel it
+  // already has (a second keyframe for nothing); write it without the newline (the helper reads lines).
+  it('passes the panel to the helper and switches it over stdin, once per change', async () => {
+    const proc = await setupProc()
+    const { spawn } = await import('child_process')
+    const { ScreenCaptureStreamer } = await import('../ScreenCaptureStreamer')
+    const s = new ScreenCaptureStreamer('udid-1', 30, 'jpeg', 0, { width: 1398, height: 2034 })
+    s.start()
+    expect(vi.mocked(spawn).mock.calls.at(-1)?.[1]).toEqual(['30', 'udid-1', 'jpeg', '--panel', '1398x2034'])
+    s.selectPanel({ width: 1398, height: 2034 })
+    expect(proc.stdin.write).not.toHaveBeenCalled()
+    s.selectPanel({ width: 2007, height: 2853 })
+    s.selectPanel({ width: 2007, height: 2853 })
+    expect(proc.stdin.write.mock.calls).toEqual([['panel 2007x2853\n']])
+  })
+
+  it('leaves a single-panel device\'s args as they were', async () => {
+    await setupProc()
+    const { spawn } = await import('child_process')
+    const { ScreenCaptureStreamer } = await import('../ScreenCaptureStreamer')
+    new ScreenCaptureStreamer('udid-1', 30, 'h264').start()
+    expect(vi.mocked(spawn).mock.calls.at(-1)?.[1]).toEqual(['30', 'udid-1', 'h264'])
+  })
+
+  it('reads frames straight out of a chunk that starts with one, and still joins a frame split across chunks', async () => {
+    const proc = await setupProc()
+    const { ScreenCaptureStreamer } = await import('../ScreenCaptureStreamer')
+    const reader = new ScreenCaptureStreamer('udid', 30, 'h264').start().getReader()
+    const frame = (flags: number, ...body: number[]) => Buffer.from([0, 0, 0, body.length + 1, flags, ...body])
+    const whole = frame(1, 7, 7, 7)
+    proc.stdout.emit('data', whole)
+    const first = await reader.read()
+    expect([...first.value!.payload]).toEqual([7, 7, 7])
+    // Not copied: the same memory, at the same place. Small Buffers share Node's pool, so `.buffer` alone matches a copy too.
+    expect(first.value!.payload.buffer).toBe(whole.buffer)
+    expect(first.value!.payload.byteOffset).toBe(whole.byteOffset + 5)
+    const split = frame(0, 1, 2, 3, 4)
+    proc.stdout.emit('data', split.subarray(0, 6))
+    proc.stdout.emit('data', split.subarray(6))
+    const second = await reader.read()
+    expect([...second.value!.payload]).toEqual([1, 2, 3, 4])
+    expect(second.value!.keyframe).toBe(false)
+  })
+
   it('sends SIGTERM on cancel', async () => {
     const proc = await setupProc()
     const { ScreenCaptureStreamer } = await import('../ScreenCaptureStreamer')

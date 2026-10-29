@@ -95,6 +95,8 @@ const sessionId = z.string().min(1)
 const requestId = z.string().min(1)
 
 const point = z.object({ x: z.number(), y: z.number() })
+const space = z.literal('frame').optional()
+const touchPoint = z.object({ x: z.number(), y: z.number(), space })
 
 // ── envelope-tier builders ───────────────────────────────────────────────────
 //
@@ -196,18 +198,18 @@ const BROWSER_INBOUND = {
   'open-url': z.object({
     type: z.literal('open-url'), sessionId, requestId, payload: z.object({ url: z.string() }),
   }),
-  'input:touch:start': z.object({ type: z.literal('input:touch:start'), sessionId, payload: point }),
-  'input:touch:move': z.object({ type: z.literal('input:touch:move'), sessionId, payload: point }),
+  'input:touch:start': z.object({ type: z.literal('input:touch:start'), sessionId, payload: touchPoint }),
+  'input:touch:move': z.object({ type: z.literal('input:touch:move'), sessionId, payload: touchPoint }),
   // `payload` optional because that is what the wire carries — the dashboard omits it and the agents
   // never read it. See the note on `InputTouchEnd`.
   'input:touch:end': z.object({
     type: z.literal('input:touch:end'), sessionId, requestId, payload: point.optional(),
   }),
   'input:pinch:start': z.object({
-    type: z.literal('input:pinch:start'), sessionId, payload: z.object({ f0: point, f1: point }),
+    type: z.literal('input:pinch:start'), sessionId, payload: z.object({ f0: point, f1: point, space }),
   }),
   'input:pinch:move': z.object({
-    type: z.literal('input:pinch:move'), sessionId, payload: z.object({ f0: point, f1: point }),
+    type: z.literal('input:pinch:move'), sessionId, payload: z.object({ f0: point, f1: point, space }),
   }),
   'input:pinch:end': z.object({ type: z.literal('input:pinch:end'), sessionId, requestId }),
   // `modifiers` is a bitmap, not a list — see the note on `InputKey`.
@@ -224,7 +226,10 @@ const BROWSER_INBOUND = {
   }),
   'input:rotate': z.object({
     type: z.literal('input:rotate'), sessionId,
-    payload: z.object({ orientation: z.enum(['portrait', 'landscape']) }).optional(),
+    payload: z.union([
+      z.object({ orientation: z.enum(['portrait', 'landscape']) }),
+      z.object({ direction: z.enum(['clockwise', 'counterclockwise']) }),
+    ]).optional(),
   }),
   'input:posture': z.object({
     type: z.literal('input:posture'), sessionId,

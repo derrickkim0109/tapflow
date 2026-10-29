@@ -6,10 +6,9 @@ export type { Point as NormPoint }
 /**
  * Convert a raw pointer position to a normalized screen coordinate for iOS.
  *
- * In landscape mode the container div is not CSS-rotated (the inner element is),
- * so `rect` is always the unrotated bounding rect. The rotation mapping is:
- *   portrait_x = 1 - v,  portrait_y = u
- * where u = horizontal fraction, v = vertical fraction of the unrotated rect.
+ * Turned, the device's container is CSS-rotated and the caller passes the unrotated box around it,
+ * so `rect` is always unrotated. With u, v the pointer's fractions of that box, the frame point is:
+ *   0: (u, v)   90: (v, 1 − u)   180: (1 − u, 1 − v)   270: (1 − v, u)
  *
  * `compositeW` / `compositeH` and `screenRect` fields should already be halved
  * (chrome JSON stores 2× values; the caller divides by 2 before passing here).
@@ -20,21 +19,30 @@ export function iosToNormScreen(
   compositeW: number,
   compositeH: number,
   screenRect: { x: number; y: number; width: number; height: number },
-  isLandscape: boolean,
+  turn: Turn,
 ): Point | null {
   const { x: sx, y: sy, width: sw, height: sh } = screenRect
-  let cx: number, cy: number
-  if (isLandscape) {
-    const u = (point.x - rect.left) / rect.width
-    const v = (point.y - rect.top) / rect.height
-    cx = (1 - v) * compositeW
-    cy = u * compositeH
-  } else {
-    cx = (point.x - rect.left) * (compositeW / rect.width)
-    cy = (point.y - rect.top) * (compositeH / rect.height)
-  }
+  const u = (point.x - rect.left) / rect.width
+  const v = (point.y - rect.top) / rect.height
+  const [fx, fy] = turn === 90 ? [v, 1 - u] : turn === 180 ? [1 - u, 1 - v] : turn === 270 ? [1 - v, u] : [u, v]
+  const cx = fx * compositeW
+  const cy = fy * compositeH
   if (cx < sx || cx > sx + sw || cy < sy || cy > sy + sh) return null
   return { x: (cx - sx) / sw, y: (cy - sy) / sh }
+}
+
+/**
+ * How far the iOS viewer turns the device, clockwise.
+ *
+ * **The agent's word wins when it gives one.** A multi-panel device (iPhone Duo) reports the turn its
+ * lit panel needs, because SpringBoard turns that panel by itself and the tester's Rotate is carried
+ * out on the device; adding the viewer's own quarter on top would turn it twice. Every other iPhone
+ * reports nothing, and its framebuffer stays portrait while the UI turns inside it, so the viewer's
+ * own landscape is the one quarter it has always applied (`rotate(-90deg)`).
+ */
+export function iosTurn(streamRotation: Turn | undefined, isLandscape: boolean): Turn {
+  if (streamRotation !== undefined) return streamRotation
+  return isLandscape ? 270 : 0
 }
 
 /**
@@ -53,6 +61,23 @@ export function androidToNorm(
   if (xv < 0 || xv > 1 || yv < 0 || yv > 1) return null
   if (needsCSSRotation) return { x: yv, y: 1 - xv }
   return { x: xv, y: yv }
+}
+
+/**
+ * A normalised point in a picture, carried to the same point in that picture turned `turn` clockwise.
+ *
+ * **Android's body mode needs it in both directions.** The viewer draws the frame as the body is held, while the
+ * cursor, the pinch hint and the recording's overlay are drawn in the screen Android draws. The frame turned by
+ * `streamRotation` is that screen (measured on a Pixel 9: body a quarter clockwise over a portrait-locked app,
+ * frame (0,0) is screen (0,1) — 270 here). A touch is not turned here: it goes out as the frame's own point.
+ */
+export function turnPoint(p: Point, turn: Turn): Point {
+  switch (turn) {
+    case 0: return p
+    case 90: return { x: 1 - p.y, y: p.x }
+    case 180: return { x: 1 - p.x, y: 1 - p.y }
+    case 270: return { x: p.y, y: 1 - p.x }
+  }
 }
 
 /**
@@ -92,15 +117,26 @@ export function composeTurn(streamRotation: Turn, needsCSSRotation: boolean): Tu
 /**
  * The size of the picture a turned frame produces — the frame's axes swapped by a quarter turn.
  *
- * **The frame is not the picture.** On the emulator's gRPC backend the capture is the panel in its
- * own fixed physical orientation, and the viewer turns it by `streamRotation`; a tester asking for
- * landscape on a portrait-locked app adds another quarter. Anything producing a file — a
+ * **The frame is not the picture.** On the emulator's gRPC backend the capture is the panel as the body is
+ * held; a viewer that draws Android's screen turns it by `streamRotation`, and on the toggle path a tester
+ * asking for landscape on a portrait-locked app adds another quarter. Body mode draws the frame as it comes. Anything producing a file — a
  * screenshot, a recording — has to size itself to the picture, or it saves the frame behind it.
  * An unfolded foldable is portrait on screen and landscape in the frame, and recorded sideways.
  */
 export function turnedSize(frameW: number, frameH: number, turn: Turn): { width: number; height: number } {
   const quarter = turn === 90 || turn === 270
   return { width: quarter ? frameH : frameW, height: quarter ? frameW : frameH }
+}
+
+/** The longest side a recording is encoded at. The browser encodes it while it also decodes the stream, so a
+ *  full-resolution iPad (2732) or Pro Max with its frame (~3000) is held to a 1080p-class size. */
+export const RECORDING_MAX_SIDE = 1920
+
+/** `size` shrunk to fit `RECORDING_MAX_SIDE`, aspect kept, and made even on both sides — what video encoders take. */
+export function recordingSize(size: { width: number; height: number }): { width: number; height: number } {
+  const k = Math.min(1, RECORDING_MAX_SIDE / Math.max(size.width, size.height))
+  const even = (n: number) => Math.max(2, 2 * Math.round((n * k) / 2))
+  return { width: even(size.width), height: even(size.height) }
 }
 
 /**

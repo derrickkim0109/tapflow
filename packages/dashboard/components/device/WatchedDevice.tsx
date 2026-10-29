@@ -13,6 +13,7 @@ import { skeletonSize } from '@/lib/deviceSkeleton';
 import type { BinaryFrameHandler } from '@/lib/envelope';
 import type { AndroidChrome, ChromeData, ChromePayload } from '@/lib/types';
 import { iosScreenLayout } from '@/lib/iosScreenLayout';
+import { iosTurn, turnPoint, type Turn } from '@/lib/coordinate-transform';
 import { TapMarks } from '@/components/watch/TapMarks';
 import { placeOnIosFrame, type WatchMarks } from '@/lib/watchActions';
 
@@ -36,8 +37,8 @@ interface WatchedDeviceProps {
 /**
  * **The device a watcher sees: the screen and nothing that sends.** The same drawing the QA session uses
  * (`IOSDeviceScreen` / `AndroidDeviceScreen`), with none of the controls — no toolbar, no input, no
- * recording. Rotation is the holder's own state and not on the wire, so the device is drawn upright; no
- * AI client rotates today.
+ * recording. A device that reports its own turn (iOS `streamRotation`, Android `bodyRotation`) is drawn as
+ * reported; one that does not is drawn upright, since the holder's toggle is its own state and not on the wire.
  */
 export function WatchedDevice({ chrome, deviceReady, platform, formFactor, binaryFrameHandlerRef, replay = false, screenKey, marks }: WatchedDeviceProps) {
   const [streamSize, setStreamSize] = useState<{ width: number; height: number } | null>(null);
@@ -79,7 +80,7 @@ function WatchedIOS({ chrome, formFactor, binaryFrameHandlerRef, onStreamSize, r
     <>
       {/* `joined` is what lets the screen say a live stream stalled; a replay is never waiting on one. */}
       <IOSDeviceScreen
-        screen={screen} chrome={chrome} formFactor={formFactor} isLandscape={false} joined={!replay} fps={fps}
+        screen={screen} chrome={chrome} formFactor={formFactor} turn={iosTurn(chrome.streamRotation, false)} joined={!replay} fps={fps}
         overlay={marks ? <TapMarks marks={marks} place={place} /> : undefined}
       />
       {screen.decoderUnsupported && <UnsupportedDecoder />}
@@ -98,14 +99,18 @@ function WatchedAndroid({ chrome, deviceReady, binaryFrameHandlerRef, marks }: {
     binaryFrameHandlerRef, frameCount,
     screenWidth: chrome.screenWidth, screenHeight: chrome.screenHeight,
     streamRotation: chrome.streamRotation ?? 0, cornerRadius: chrome.cornerRadius,
-    userWantsLandscape: false, rotatePending: false,
+    userWantsLandscape: false, rotatePending: false, bodyRotation: chrome.bodyRotation,
   });
   return (
     <>
       {/* The overlay is the screen itself on Android, and a watcher's device is upright — the input's own space. */}
       <AndroidDeviceScreen
         screen={screen} deviceReady={deviceReady} posturePending={false}
-        overlay={marks ? <TapMarks marks={marks} place={(x, y) => ({ left: x, top: y })} /> : undefined}
+        overlay={marks ? <TapMarks marks={marks} place={(x, y) => {
+          // Marks are in the screen Android draws (the input's space); body mode's shell is the frame.
+          const p = turnPoint({ x, y }, ((360 - screen.screenTurn) % 360) as Turn)
+          return { left: p.x, top: p.y }
+        }} /> : undefined}
       />
       {screen.decoderUnsupported && <UnsupportedDecoder />}
     </>

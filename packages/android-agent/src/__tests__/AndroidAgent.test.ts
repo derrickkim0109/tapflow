@@ -188,6 +188,8 @@ interface TestState {
   deviceId: string
   /** The skin orientation the last frame reported. */
   skin: SkinRotation | null
+  /** The newest frame, recorded as it arrives — ahead of the reconcile that writes `skin`. */
+  latestFrame: { w: number; h: number; skin: SkinRotation | null } | null
   /** The grid injected touches land in; null falls back to the panel size. */
   touchRange: { width: number; height: number } | null
   posturing: boolean
@@ -215,6 +217,9 @@ interface AndroidAgentInternals {
   normaliseOnBoot(state: TestState, serial: string): Promise<void>
   uprightOnBoot(serial: string): Promise<void>
   watchScreen(state: TestState, serial: string, skin: SkinRotation): void
+  prepareBody(state: TestState, serial: string, upright: boolean): Promise<void>
+  sendChrome(state: TestState): void
+  reconcileSerial(state: TestState, serial: string, w: number, h: number, skin: SkinRotation | null): Promise<boolean>
 }
 const internals = (agent: AndroidAgent): AndroidAgentInternals =>
   agent as unknown as AndroidAgentInternals
@@ -233,6 +238,12 @@ function mockAdb(booted = false): AdbWrapper {
   vi.spyOn(adb, 'airplaneMode').mockResolvedValue(false)
   // Every boot reads the rotation lock (#910); an auto-rotating device is the one it leaves alone.
   vi.spyOn(adb, 'getUserRotation').mockResolvedValue({ mode: 'free' })
+  // An emulator's body, as the console reports it: upright, and a quarter clockwise per `emu rotate` (measured).
+  const body = { at: 0 as 0 | 90 | 180 | 270 }
+  ;(adb as unknown as { body: typeof body }).body = body
+  vi.spyOn(adb, 'readBodyRotation').mockImplementation(async () => body.at)
+  vi.spyOn(adb, 'rotateBodyClockwise').mockImplementation(async () => { body.at = ((body.at + 90) % 360) as 0 | 90 | 180 | 270 })
+  vi.spyOn(adb, 'freeRotation').mockResolvedValue(undefined)
   if (booted) adb.setSerial('avd:Pixel_8_API_34', 'emulator-5554')
   vi.spyOn(adb, 'listDevices').mockResolvedValue([{
     id: 'avd:Pixel_8_API_34',
@@ -480,6 +491,27 @@ describe('AndroidAgent', () => {
         agent.disconnect(); browser.close()
         return { pm, payload }
       }
+
+      // A run replays from the same orientation whatever a person left: its boot stands the emulator's body up,
+      // although this device was already running. Mutation: drop `runReset` from the boot's upright.
+      it('stands the emulator\'s body up for a run, wherever it was left', async () => {
+        const adb = mockAdb(true)
+        ;(adb as unknown as { body: { at: number } }).body.at = 180
+        const agent = new AndroidAgent({}, adb)
+        // The wiring itself: this suite streams over scrcpy, which stands an emulator up whatever the boot asked.
+        const prepare = vi.spyOn(agent as unknown as { prepareBody(s: unknown, serial: string, upright: boolean): Promise<void> }, 'prepareBody')
+        await agent.connect(`ws://localhost:${port}`)
+        const browser = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(browser)
+        browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+        await waitForType(browser, 'session:joined')
+        const ready = waitForType(browser, 'device:ready')
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-reset-body', sessionId: agent.sessionId, payload: { deviceId: 'avd:Pixel_8_API_34', runReset: { uninstall: [], clear: [] } } }))
+        await ready
+        expect(prepare).toHaveBeenCalledWith(expect.anything(), 'emulator-5554', true)
+        expect((adb as unknown as { body: { at: number } }).body.at).toBe(0)
+        agent.disconnect(); browser.close()
+      })
 
       it('clears every app it was named, installed ones only, and reports app-data', async () => {
         const { pm, payload } = await bootWithReset({ uninstall: ['com.example.app'], clear: ['com.example.helper'] }, ['com.example.app'])
@@ -1946,11 +1978,11 @@ describe('AndroidAgent', () => {
         // The restart used to be a flag on the shared state, and the boot read it as its own.
         process.env.TAPFLOW_ANDROID_BACKEND = 'grpc'
         const adb = mockAdb(true)
-        // A device that folds gets stood upright by the normalisation; that write is what is counted.
-        const upright = vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
         const { agent, browser } = await joinedAgent(adb)
         vi.spyOn(agent as unknown as { listPostures(id: string): Promise<unknown[]> }, 'listPostures')
           .mockResolvedValue([{ id: 'half-open', label: 'Half open' }])
+        // The normalisation itself is what is counted: it no longer writes anything a spy on adb could see.
+        const upright = vi.spyOn(agent as unknown as { normaliseOnBoot(): Promise<void> }, 'normaliseOnBoot')
         browser.send(boot(agent.sessionId, 'rq-a'))
         await waitForType(browser, 'device:ready')
         expect(upright).toHaveBeenCalledTimes(1)
@@ -2804,6 +2836,44 @@ describe('AndroidAgent', () => {
         // shared state would answer one input with another's id, which is #499 rebuilt inside the agent.
         expect(ack.requestId).toBe('rq-in1')
       })
+
+      // Body mode measures the pointer on the frame and says so. The turn is the newest frame's skin, so a touch
+      // right after a turn lands where it was aimed while the chrome still describes the turn before.
+      // Mutation: drop `fromFrame` from either handler, or read `state.skin` (the chrome's) instead of the frame's.
+      describe('a point measured on the frame', () => {
+        it('is turned by the frame\'s skin', () => {
+          const control = getState().scrcpySession!.control
+          getState().latestFrame = { w: 2400, h: 1080, skin: 'REVERSE_LANDSCAPE' }
+          inject({ type: 'input:touch:start', payload: { x: 0.1, y: 0.2, space: 'frame' } })
+          // frame (0.1,0.2) on a body a quarter clockwise is screen (0.2,0.9): 216, 2160
+          expect(control.touchDown).toHaveBeenCalledWith(0, 216, 2160)
+          inject({ type: 'input:touch:move', payload: { x: 0.1, y: 0.2, space: 'frame' } })
+          expect(control.touchMove).toHaveBeenCalledWith(0, 216, 2160)
+        })
+
+        it('lands the same while the screen\'s rotation still lags the frame', () => {
+          const control = getState().scrcpySession!.control
+          Object.assign(getState(), { latestFrame: { w: 2400, h: 1080, skin: 'REVERSE_LANDSCAPE' }, rotation: 90 })
+          inject({ type: 'input:touch:start', payload: { x: 0.1, y: 0.2, space: 'frame' } })
+          expect(control.touchDown).toHaveBeenCalledWith(0, 216, 2160)
+        })
+
+        it('is not turned by a stale chrome skin', () => {
+          const control = getState().scrcpySession!.control
+          Object.assign(getState(), { latestFrame: { w: 1080, h: 2400, skin: 'PORTRAIT' }, skin: 'REVERSE_LANDSCAPE' })
+          inject({ type: 'input:touch:start', payload: { x: 0.1, y: 0.2, space: 'frame' } })
+          expect(control.touchDown).toHaveBeenCalledWith(0, 108, 480)
+        })
+
+        it('is the screen when no skin is known, and when the sender names no space', () => {
+          const control = getState().scrcpySession!.control
+          inject({ type: 'input:touch:start', payload: { x: 0.1, y: 0.2, space: 'frame' } })
+          expect(control.touchDown).toHaveBeenLastCalledWith(0, 108, 480)
+          getState().latestFrame = { w: 2400, h: 1080, skin: 'REVERSE_LANDSCAPE' }
+          inject({ type: 'input:touch:start', payload: { x: 0.1, y: 0.2 } })
+          expect(control.touchDown).toHaveBeenLastCalledWith(0, 108, 480)
+        })
+      })
     })
 
     describe('input — pinch', () => {
@@ -2822,9 +2892,51 @@ describe('AndroidAgent', () => {
         inject({ type: 'input:pinch:end', requestId: 'rq-pinch' })
         expect(control.pinchEnd).toHaveBeenCalledOnce()
       })
+
+      it('turns both fingers of a frame pinch by the frame\'s skin', () => {
+        const control = getState().scrcpySession!.control
+        getState().latestFrame = { w: 2400, h: 1080, skin: 'REVERSE_LANDSCAPE' }
+        const payload = { f0: { x: 0.2, y: 0.3 }, f1: { x: 0.8, y: 0.9 }, space: 'frame' }
+        inject({ type: 'input:pinch:start', payload })
+        // f0 → screen (0.3,0.8): 324, 1920 · f1 → (0.9,0.2): 972, 480
+        expect(control.pinchStart).toHaveBeenCalledWith(324, 1920, 972, 480)
+        inject({ type: 'input:pinch:move', payload })
+        expect(control.pinchMove).toHaveBeenCalledWith(324, 1920, 972, 480)
+      })
     })
 
     describe('input — rotate', () => {
+      // A `direction` comes only from a viewer drawing the body. With no gRPC client — a stream restarting, or a
+      // step that ran after its session was cleaned up — it must still never take the toggle, which writes
+      // `wm user-rotation lock`. Mutation: gate the body turn on `grpcClient` alone.
+      it('turns the body for a direction, and never locks, when no gRPC client is up', async () => {
+        const rotateSpy = vi.spyOn(adb, 'setRotation')
+        inject({ type: 'input:rotate', payload: { direction: 'clockwise' } })
+        await vi.waitFor(() => expect((adb as unknown as { body: { at: number } }).body.at).toBe(90))
+        expect(rotateSpy).not.toHaveBeenCalled()
+      })
+
+      // A real device has no body; nothing that draws one sends it a direction, and the toggle is not an answer.
+      // Mutation: let the direction fall through to the toggle.
+      it('ignores a direction for a device with no body', async () => {
+        const rotateSpy = vi.spyOn(adb, 'setRotation')
+        adb.setSerial('avd:Pixel_8_API_34', 'R58M1234567')
+        inject({ type: 'input:rotate', payload: { direction: 'clockwise' } })
+        inject({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(rotateSpy).toHaveBeenCalledTimes(1))
+        expect(rotateSpy).toHaveBeenCalledWith('R58M1234567', 3)
+        expect(adb.rotateBodyClockwise).not.toHaveBeenCalled()
+      })
+
+      // The toggle still locks an emulator streaming without gRPC, and that lock is tapflow's: the AVD is
+      // forgotten so the next gRPC session frees it. Mutation: leave the marker.
+      it('forgets having freed the AVD when the toggle locks an emulator', async () => {
+        const forgot: string[] = []
+        ;(agent as unknown as { rotationLock: { forget(n: string): void } }).rotationLock.forget = (n) => { forgot.push(n) }
+        inject({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(forgot).toEqual(['Pixel_8_API_34']))
+      })
+
       // An older dashboard sends no target, and toggles.
       it('toggles landscape and asks the device to rotate to canonical landscape (3)', async () => {
         const rotateSpy = vi.spyOn(adb, 'setRotation')
@@ -2908,12 +3020,12 @@ describe('AndroidAgent', () => {
         expect(rotateSpy).not.toHaveBeenCalled()
       })
 
-      // scrcpy does not go through `normaliseOnBoot`, so a reset placed there would miss it. This
-      // suite boots on scrcpy.
-      //
-      // Mutation: move the reset into `normaliseOnBoot`.
-      it('reads the rotation lock on a scrcpy boot', () => {
-        expect(adb.getUserRotation).toHaveBeenCalledWith('emulator-5554')
+      // scrcpy does not go through `normaliseOnBoot`, so the boot's body step sits ahead of the backend split —
+      // an emulator on scrcpy is read and stood up too. This suite boots on scrcpy. Mutation: move the step into
+      // `normaliseOnBoot`; or keep reading the rotation lock (`uprightOnBoot`) for an emulator.
+      it('reads where an emulator\'s body is held on a scrcpy boot, not its rotation lock', () => {
+        expect(adb.readBodyRotation).toHaveBeenCalledWith('emulator-5554')
+        expect(adb.getUserRotation).not.toHaveBeenCalled()
       })
     })
 
@@ -3826,11 +3938,15 @@ describe('AndroidAgent', () => {
         `DeviceState{identifier=0, name='CLOSED'}\nDeviceState{identifier=1, name='HALF_OPENED'}`)
       // Folded, the way the previous session left it.
       vi.spyOn(adb, 'deviceState').mockResolvedValue(`Committed state: DeviceState{identifier=0, name='CLOSED'}`)
+      ;(adb as unknown as { body: { at: number } }).body.at = 90 // and turned, as a Fold AVD boots
 
       await bootDevice()
 
       expect(setPosture).toHaveBeenCalledWith('emulator-5554', '2')
-      expect(setRotation).toHaveBeenCalledWith('emulator-5554', 0)
+      // No rotation lock any more — that is what kept apps from following the body. And this device was already
+      // running, so its body is left where it is held: only a boot that brings it up, or a run, stands it up.
+      expect(setRotation).not.toHaveBeenCalled()
+      expect(adb.rotateBodyClockwise).not.toHaveBeenCalled()
 
       // **And before the stream, which is the half that took a second attempt.** Unfolding a
       // running stream makes the session's first act a resolution change, and this capture sends
@@ -3838,7 +3954,7 @@ describe('AndroidAgent', () => {
       // manual rotation produced a frame. Ordering is the fix, so ordering is what is held.
       expect(setPosture.mock.invocationCallOrder[0])
         .toBeLessThan(vi.mocked(EmulatorVideo).mock.invocationCallOrder[0]!)
-      expect(setRotation.mock.invocationCallOrder[0])
+      expect(vi.mocked(adb.readBodyRotation).mock.invocationCallOrder[0])
         .toBeLessThan(vi.mocked(EmulatorVideo).mock.invocationCallOrder[0]!)
     })
 
@@ -4886,15 +5002,15 @@ describe('what a rotation does on each backend', () => {
   // Mutation: await the re-read inside the queued step.
   it('does not hold the next rotation while the screen is re-read', async () => {
     const adb = mockAdb(true)
-    const set = vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
     const agent = new AndroidAgent({}, adb)
     vi.spyOn(agent as unknown as { reconcileSerial(): Promise<boolean> }, 'reconcileSerial')
       .mockReturnValue(new Promise<boolean>(() => {}))
     internals(agent).deviceStates.set('s1', stateOn('grpc'))
     internals(agent).handleRelayMessage({ type: 'input:rotate', sessionId: 's1', payload: { orientation: 'landscape' } })
     internals(agent).handleRelayMessage({ type: 'input:rotate', sessionId: 's1', payload: { orientation: 'portrait' } })
-    await vi.waitFor(() => expect(set).toHaveBeenCalledTimes(2))
-    expect(set.mock.calls.map((c) => c[1])).toEqual([3, 0])
+    // On gRPC the body turns: a quarter to landscape, then three more round to upright.
+    await vi.waitFor(() => expect(adb.rotateBodyClockwise).toHaveBeenCalledTimes(4))
+    expect((adb as unknown as { body: { at: number } }).body.at).toBe(0)
   })
 
   it('does not re-describe the screen on scrcpy, which would blank the viewer', async () => {
@@ -4989,7 +5105,8 @@ describe('a posture change reports as soon as the guest commits', () => {
       readyState: 1,
       send: (d: string) => { if ((JSON.parse(d) as { type: string }).type === 'device:postures') order.push('device:postures') },
     }
-    const state = { deviceId: 'avd:Pixel_8_API_34', sessionId: 's1', booted: true } as unknown as TestState
+    // On scrcpy: the rotation carry these tests time runs only there.
+    const state = { deviceId: 'avd:Pixel_8_API_34', sessionId: 's1', booted: true, scrcpySession: {} } as unknown as TestState
     internals(agent).deviceStates.set('s1', state)
     internals(agent).handleRelayMessage({ type: 'input:posture', sessionId: 's1', payload: { postureId: '2' } })
     return order
@@ -5081,19 +5198,13 @@ describe('what the delta review found', () => {
     }
   })
 
-  it('re-describes the screen after carrying the rotation across', async () => {
-    // A rotation changes the correction and not the frame's shape, so nothing in the stream
-    // reveals it and an idle screen sends no frame. The report has already gone out by then, so
-    // without this the picture is shown a quarter turn out — and `toDevicePx` maps taps through
-    // the same stale `state.rotation`.
+  // On gRPC the viewer draws the body, which a fold does not move, and Android picks the new panel's rotation
+  // from the sensor; a lock carried across is what kept apps from following the body. Mutation: carry it anyway.
+  it('carries no rotation lock across a fold on gRPC', async () => {
     const adb = mockAdb(true)
     vi.spyOn(adb, 'getDisplayMetrics').mockResolvedValue(metrics(270))
     const setRotation = vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
     const agent = new AndroidAgent({}, adb)
-    const sent: string[] = []
-    ;(agent as unknown as { ws: { readyState: number; send(d: string): void } }).ws = {
-      readyState: 1, send: (d: string) => sent.push((JSON.parse(d) as { type: string }).type),
-    }
     const state = {
       deviceId: 'avd:Pixel_8_API_34', sessionId: 's1', booted: true, grpcClient: {},
       videoWidth: 1080, videoHeight: 2424, displayWidth: 1080, displayHeight: 2424,
@@ -5102,9 +5213,7 @@ describe('what the delta review found', () => {
 
     await internals(agent).finishPosture(state, 'emulator-5554', 0)
 
-    expect(setRotation).toHaveBeenCalledWith('emulator-5554', 0)
-    expect(state.rotation).toBe(270)
-    expect(sent).toContain('session:chrome')
+    expect(setRotation).not.toHaveBeenCalled()
   })
 
   it('says nothing when there is no viewer to say it to', async () => {
@@ -5327,18 +5436,16 @@ describe('normaliseOnBoot', () => {
     expect(setPosture).not.toHaveBeenCalled()
   })
 
-  it('stands the device upright, and says so in the state the rotate toggle reads', async () => {
+  // The lock this used to write is what kept apps from following the body; standing up is the body step's
+  // now (`prepareBody`). Mutation: write the lock again.
+  it('writes no rotation lock on a foldable\'s boot', async () => {
     const { adb, agent } = agentIn('HALF_OPENED')
     const setRotation = vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
-    // A session that left the device in landscape: both the device and the toggle must come back.
     const state = { deviceId: 'avd:Pixel_8_API_34', landscape: true } as unknown as TestState
 
     await internals(agent).normaliseOnBoot(state, 'emulator-5554')
 
-    expect(setRotation).toHaveBeenCalledWith('emulator-5554', 0)
-    // Without this the first press of the rotate button would toggle *back* to landscape on a
-    // device already standing upright, and do nothing visible.
-    expect(state.landscape).toBe(false)
+    expect(setRotation).not.toHaveBeenCalled()
   })
 
   it('settles between the two writes, because a lock written mid-swap is discarded', async () => {
@@ -5534,11 +5641,55 @@ describe('PosturableAgent (the wiring)', () => {
       '    init=1080x2424 cur=1080x2424\n mRotation=ROTATION_0')
     vi.spyOn(adb, 'getDisplayMetrics').mockResolvedValueOnce(before).mockResolvedValue(after)
     const agent = new AndroidAgent({}, adb)
+    // On scrcpy, where the viewer's toggle is the rotation — the only backend this carry is for.
+    internals(agent).deviceStates.set('s1', { deviceId: 'avd:Pixel_8_API_34', booted: true, grpcClient: null, scrcpySession: {} } as unknown as TestState)
 
     await agent.setPosture('avd:Pixel_8_API_34', '1')
 
     // 270° before, 0° after — so the rotation is put back, as quarter turns (3 = 270).
     expect(adb.setRotation).toHaveBeenCalledWith('emulator-5554', 3)
+  })
+
+  // A body-drawn emulator must never get a lock: it is what kept apps from following the body. `setPosture` takes a
+  // device, not a session, so it has to find the device's state to see gRPC — and an emulator with no session is
+  // drawn by its body when it next streams; a restarting gRPC stream has no client for a moment. Mutations: pass no
+  // state; carry when no session says otherwise; ask "is it gRPC" instead of "is it scrcpy".
+  it.each([
+    ['a gRPC session', { deviceId: 'avd:Pixel_8_API_34', booted: true, grpcClient: {} }],
+    ['a gRPC stream restarting', { deviceId: 'avd:Pixel_8_API_34', booted: true, grpcClient: null, scrcpySession: null }],
+    ['no session', null],
+  ])('carries no lock across a fold on an emulator with %s', async (_name, live) => {
+    const adb = posturableAdb()
+    const dm = await import('../displayMetrics')
+    vi.spyOn(adb, 'getDisplayMetrics')
+      .mockResolvedValueOnce(dm.parseDisplayMetrics('    init=2076x2152 cur=2152x2076\n mRotation=ROTATION_270'))
+      .mockResolvedValue(dm.parseDisplayMetrics('    init=1080x2424 cur=1080x2424\n mRotation=ROTATION_0'))
+    const agent = new AndroidAgent({}, adb)
+    if (live) internals(agent).deviceStates.set('s1', live as unknown as TestState)
+
+    await agent.setPosture('avd:Pixel_8_API_34', '1')
+
+    expect(adb.setRotation).not.toHaveBeenCalled()
+  })
+
+  // A boot that swaps scrcpy for gRPC during the settling read has already freed the lock this would write.
+  // Mutation: ask about the backend only before the read.
+  it('carries no lock when the stream turns gRPC while the carry settles', async () => {
+    const adb = posturableAdb()
+    const dm = await import('../displayMetrics')
+    const live = { deviceId: 'avd:Pixel_8_API_34', booted: true, grpcClient: null, scrcpySession: {} as unknown }
+    vi.spyOn(adb, 'getDisplayMetrics')
+      .mockResolvedValueOnce(dm.parseDisplayMetrics('    init=2076x2152 cur=2152x2076\n mRotation=ROTATION_270'))
+      .mockImplementation(async () => {
+        Object.assign(live, { scrcpySession: null, grpcClient: {} })
+        return dm.parseDisplayMetrics('    init=1080x2424 cur=1080x2424\n mRotation=ROTATION_0')
+      })
+    const agent = new AndroidAgent({}, adb)
+    internals(agent).deviceStates.set('s1', live as unknown as TestState)
+
+    await agent.setPosture('avd:Pixel_8_API_34', '1')
+
+    expect(adb.setRotation).not.toHaveBeenCalled()
   })
 
   it('leaves the rotation alone when the change did not disturb it', async () => {
@@ -5582,5 +5733,134 @@ describe('PosturableAgent (the wiring)', () => {
   it('is posturable by feature detection, whatever the device turns out to be', () => {
     // The capability is the agent's, not the device's — one AndroidAgent hosts both kinds.
     expect(isPosturable(new AndroidAgent({}, mockAdb()))).toBe(true)
+  })
+})
+
+// The body-turning model (four-way rotation): an emulator streaming over gRPC turns its body and says how far.
+describe('an emulator\'s body', () => {
+  const grpcState = (body: 0 | 90 | 180 | 270 | null = null) => ({
+    deviceId: 'avd:Pixel_8_API_34', sessionId: 's1', landscape: false, booted: true,
+    videoWidth: 1080, videoHeight: 2400, displayWidth: 1080, displayHeight: 2400,
+    rotation: 0, streamRotation: 0, skin: null, body, reconciling: false, screenWatch: null, cornerRadiusPx: 0,
+    grpcClient: {}, scrcpySession: null,
+  }) as unknown as TestState
+  const sentChromes = (agent: AndroidAgent) => {
+    const sent: Array<Record<string, unknown>> = []
+    ;(agent as unknown as { ws: { readyState: number; send(d: string): void } }).ws = {
+      readyState: 1, send: (d: string) => { const m = JSON.parse(d) as { type: string; payload: Record<string, unknown> }; if (m.type === 'session:chrome') sent.push(m.payload) },
+    }
+    return sent
+  }
+  const body = (adb: AdbWrapper) => (adb as unknown as { body: { at: 0 | 90 | 180 | 270 } }).body
+
+  // Mutations: send it on scrcpy; leave it out on gRPC.
+  it('reports how far the body is turned on gRPC, and nothing on scrcpy', () => {
+    const agent = new AndroidAgent({}, mockAdb(true))
+    const sent = sentChromes(agent)
+    internals(agent).sendChrome(grpcState(90))
+    internals(agent).sendChrome({ ...grpcState(90), grpcClient: null } as unknown as TestState)
+    expect(sent[0]!['bodyRotation']).toBe(90)
+    expect('bodyRotation' in sent[1]!).toBe(false)
+  })
+
+  // The skin a frame carries is the body inverted: REVERSE_LANDSCAPE is a quarter clockwise (measured — the frame
+  // then arrives as the device is held). Mutation: take the skin's degrees as they are.
+  it('takes the body from the frame\'s skin, inverted', async () => {
+    const adb = mockAdb(true)
+    vi.spyOn(adb, 'getDisplayMetrics').mockResolvedValue({ natural: { width: 1080, height: 2400 }, current: { width: 1080, height: 2400 }, rotation: 0 })
+    const agent = new AndroidAgent({}, adb)
+    const state = grpcState(0)
+    await internals(agent).reconcileScreen(state, 'emulator-5554', 2400, 1080, 'REVERSE_LANDSCAPE')
+    expect((state as unknown as { body: number }).body).toBe(90)
+  })
+
+  // A rotate's pass asks with the skin last *committed*; the frame that turned arrived first and is the truth.
+  // Seen on a Galaxy S23: the stale pass ran last and the viewer framed a landscape frame in a portrait shell.
+  // Mutation: reconcile with the asker's skin.
+  it('reconciles with the newest frame\'s skin, whoever asked', async () => {
+    const adb = mockAdb(true)
+    vi.spyOn(adb, 'getDisplayMetrics').mockResolvedValue({ natural: { width: 1080, height: 2400 }, current: { width: 1080, height: 2400 }, rotation: 0 })
+    const agent = new AndroidAgent({}, adb)
+    const state = { ...grpcState(0), skin: 'PORTRAIT', latestFrame: { w: 2400, h: 1080, skin: 'REVERSE_LANDSCAPE' } } as unknown as TestState
+    await internals(agent).reconcileSerial(state, 'emulator-5554', 1080, 2400, 'PORTRAIT')
+    expect((state as unknown as { skin: string }).skin).toBe('REVERSE_LANDSCAPE')
+    expect((state as unknown as { streamRotation: number }).streamRotation).toBe(270)
+    expect((state as unknown as { body: number }).body).toBe(90)
+  })
+
+  // A quarter clockwise or anticlockwise from where the body reads, and an older viewer's landscape met by
+  // either landscape. Mutations: turn from a remembered body; meet landscape with one landscape only.
+  it('turns the body from a fresh reading, a quarter at a time', async () => {
+    const adb = mockAdb(true)
+    const agent = new AndroidAgent({}, adb)
+    vi.spyOn(agent as unknown as { reconcileSerial(): Promise<boolean> }, 'reconcileSerial').mockResolvedValue(false)
+    internals(agent).deviceStates.set('s1', grpcState(0))
+    const rotate = (payload: unknown) => internals(agent).handleRelayMessage({ type: 'input:rotate', sessionId: 's1', payload })
+    const held = () => (internals(agent).deviceStates.get('s1') as unknown as { body: number }).body
+    rotate({ direction: 'clockwise' })
+    await vi.waitFor(() => expect(held()).toBe(90)) // confirmed, not merely sent
+    body(adb).at = 270 // turned in the emulator's own controls
+    rotate({ direction: 'clockwise' })
+    await vi.waitFor(() => expect(body(adb).at).toBe(0))
+    rotate({ direction: 'counterclockwise' })
+    await vi.waitFor(() => expect(body(adb).at).toBe(270))
+    vi.mocked(adb.rotateBodyClockwise).mockClear()
+    rotate({ orientation: 'landscape' })
+    await new Promise((r) => setTimeout(r, 30))
+    expect(adb.rotateBodyClockwise).not.toHaveBeenCalled()
+  })
+
+  // A turn the emulator took and did not make leaves the body where it reads, not where it was asked to go.
+  // Mutation: record the target without confirming it.
+  it('keeps the body where it reads when a turn does not land', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const adb = mockAdb(true)
+    vi.mocked(adb.rotateBodyClockwise).mockResolvedValue(undefined) // takes it, does not turn
+    const agent = new AndroidAgent({}, adb)
+    const state = grpcState(0)
+    await internals(agent).prepareBody({ ...state, deviceId: 'avd:X' } as unknown as TestState, 'emulator-5554', false)
+    body(adb).at = 90
+    const s2 = grpcState(90)
+    await (agent as unknown as { turnBodyTo(s: TestState, serial: string, want: number): Promise<unknown> }).turnBodyTo(s2, 'emulator-5554', 0)
+    expect((s2 as unknown as { body: number }).body).toBe(90)
+  }, 10_000)
+
+  // Earlier tapflow versions locked the rotation and a lock cannot be told from one a person chose: freed the
+  // first time tapflow sees the AVD, never again. Mutations: free on every boot; never free.
+  it('frees the rotation lock once per AVD', async () => {
+    const adb = mockAdb(true)
+    const freedAvds = new Set<string>()
+    const agent = new AndroidAgent({ rotationLockMemory: { freed: (n) => freedAvds.has(n), markFreed: (n) => { freedAvds.add(n) }, forget: (n) => { freedAvds.delete(n) } } }, adb)
+    await internals(agent).prepareBody(grpcState(), 'emulator-5554', false)
+    await internals(agent).prepareBody(grpcState(), 'emulator-5554', false)
+    expect(adb.freeRotation).toHaveBeenCalledTimes(1)
+    expect([...freedAvds]).toEqual(['Pixel_8_API_34'])
+  })
+
+  // A marker that cannot be written is not a lock that stayed: the free is reported as done, and the body is
+  // still read. Mutation: share one try between the free and the marker.
+  it('does not call a freed lock unfreed when the marker cannot be written', async () => {
+    const adb = mockAdb(true)
+    body(adb).at = 90
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const agent = new AndroidAgent({ rotationLockMemory: { freed: () => false, markFreed: () => { throw new Error('EROFS') }, forget: () => {} } }, adb)
+    const state = grpcState()
+    await internals(agent).prepareBody(state, 'emulator-5554', false)
+    expect((state as unknown as { body: number }).body).toBe(90)
+    expect(warn.mock.calls.flat().join(' ')).not.toContain('could not free')
+  })
+
+  // Only a boot that brought the emulator up, or a run, stands the body up; otherwise it is read and left.
+  // Mutation: always stand it up.
+  it('stands the body up only when asked, and otherwise only reads it', async () => {
+    const adb = mockAdb(true)
+    body(adb).at = 270
+    const agent = new AndroidAgent({}, adb)
+    const left = grpcState()
+    await internals(agent).prepareBody(left, 'emulator-5554', false)
+    expect(body(adb).at).toBe(270)
+    expect((left as unknown as { body: number }).body).toBe(270)
+    await internals(agent).prepareBody(grpcState(), 'emulator-5554', true)
+    expect(body(adb).at).toBe(0)
   })
 })

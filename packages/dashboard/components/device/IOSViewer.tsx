@@ -14,8 +14,9 @@ import { DeepLinkDialog } from './DeepLinkDialog';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Kbd, KbdGroup } from '@/components/ui/kbd';
-import type { ChromeData } from '@/lib/types'
-import { iosToNormScreen, toPinchFingers as makePinchFingers } from '@/lib/coordinate-transform';
+import type { ChromeData, PosturesPayload } from '@/lib/types'
+import { iosToNormScreen, iosTurn, placeTurnedFrame, recordingSize, remaining, toPinchFingers as makePinchFingers, turnedSize, type Turn } from '@/lib/coordinate-transform';
+import { usePostureControl } from '@/hooks/usePostureControl';
 import { useIOSScreen } from '@/hooks/useIOSScreen';
 import { IOSDeviceScreen } from './IOSDeviceScreen';
 import { iosScreenLayout } from '@/lib/iosScreenLayout';
@@ -30,6 +31,12 @@ const CURSOR_RING_R = 13;
 const CURSOR_DOT_R = 8;
 const MOVE_THROTTLE_MS = 16;
 const DRAG_THRESHOLD = 0.02;
+
+/** How long the device takes to turn on screen — the `duration-300` in `IOSDeviceScreen`, plus a beat. */
+const SPIN_MS = 350;
+/** How long a turn shown ahead of the device waits for the device to report it. The agent reads the turn
+ *  back for up to 3 s after sending it (`ROTATE_SETTLE_MS`); this covers that with room for a slow helper. */
+const PENDING_TURN_MS = 8_000;
 
 interface IOSViewerProps {
   sessionId: string;
@@ -73,6 +80,8 @@ interface IOSViewerProps {
   /** Told the size the stream arrives at, so a viewer with no chrome from the agent can take the
    *  device's real aspect (see `framelessChrome`). */
   onStreamSize?: (size: { width: number; height: number }) => void;
+  /** Foldable postures from `device:postures` — an iPhone Duo's, most closed first. */
+  postures?: PosturesPayload;
 }
 
 export function IOSViewer({
@@ -82,7 +91,7 @@ export function IOSViewer({
   binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, onRecordingUploaded,
   swKeyboardVisible, swKeyboardPending, onKbdToggle,
   rebootPending, onReboot, restartButtonRef,
-  perfHookRef, onStreamSize,
+  perfHookRef, onStreamSize, postures,
 }: IOSViewerProps) {
   const { fps, frameCount } = useFps();
 
@@ -90,6 +99,20 @@ export function IOSViewer({
 
   const [deepLinkOpen, setDeepLinkOpen] = useState(false);
   const [isLandscape, setIsLandscape] = useState(false);
+  // A turn shown ahead of the device's own report, and how long to wait for that report.
+  const [pendingTurn, setPendingTurn] = useState<{ target: Turn; deadline: number } | null>(null);
+  // The same, for a second press before a re-render — the state is a render behind (the reason `landscapeRef` exists).
+  const pendingTurnRef = useRef<{ target: Turn; deadline: number } | null>(null);
+  // Input is held while the device turns: a point taken mid-animation lands somewhere else.
+  const spinUntil = useRef(0);
+  // Turns waiting for the frame to finish turning before they are sent. A viewer that goes away first
+  // sends them as it goes: the tester pressed, and the device is shared.
+  const rotateTimers = useRef(new Map<ReturnType<typeof setTimeout>, () => void>());
+  useEffect(() => {
+    const timers = rotateTimers.current;
+    return () => { for (const [t, sendNow] of timers) { clearTimeout(t); sendNow() } };
+  }, []);
+  const posture = usePostureControl(send, sessionId, postures);
   const [keyboardActive, setKeyboardActive] = useState(false);
   const [flashedButton, setFlashedButton] = useState<string | null>(null);
   const [hoveredButton, setHoveredButton] = useState<string | null>(null);
@@ -141,11 +164,34 @@ export function IOSViewer({
   })
   const { canvasRef, containerRef, screenAreaRef, decoderUnsupported } = screen
 
-  // Sync record canvas size when chrome arrives
+  const shownTurn: Turn = pendingTurn?.target ?? iosTurn(chrome.streamRotation, isLandscape)
+
+  /**
+   * The device as it is shown — turned — which is what a recording is sized to. Null before it is laid out.
+   *
+   * At the stream's resolution, not the page's. The frame and cursor are drawn in the page's CSS pixels and the
+   * composer scales them to the canvas, so the canvas is the laid-out device times the screen's stream pixels per CSS
+   * pixel. It used to be the laid-out size itself — under a third of the stream on a native-tier iPhone — where
+   * Android records at the stream's size. Held to `RECORDING_MAX_SIDE`, so a native-tier phone with its frame comes
+   * out at about 70% of the stream rather than all of it.
+   */
+  const shownDeviceSize = useCallback(() => {
+    const container = containerRef.current
+    if (!container || container.clientWidth === 0) return null
+    // Never below 1: before the first frame the canvas is the browser's default 300×150, which would shrink it.
+    const fc = canvasRef.current
+    const k = fc && fc.clientWidth > 0
+      ? Math.max(1, Math.max(fc.width, fc.height) / Math.max(fc.clientWidth, fc.clientHeight))
+      : 1
+    return recordingSize(turnedSize(container.clientWidth * k, container.clientHeight * k, shownTurn))
+  }, [containerRef, canvasRef, shownTurn])
+
+  // Sync record canvas size when chrome arrives, or the device turns — never mid-take: `MediaRecorder` fixed
+  // the size when it started, and the composer fits whatever the device has become into it.
   useEffect(() => {
-    const rc = recordCanvasRef.current; const container = containerRef.current
-    if (rc && container) { rc.width = container.clientWidth; rc.height = container.clientHeight }
-  }, [chrome, recordCanvasRef, containerRef])
+    const rc = recordCanvasRef.current; const size = shownDeviceSize()
+    if (rc && size && recordState !== 'recording') { rc.width = size.width; rc.height = size.height }
+  }, [chrome, recordCanvasRef, shownDeviceSize, recordState])
 
   // ── Recording (composeFrame only — state/refs/lifecycle in useClientRecording) ──
   const composeFrame = useCallback(() => {
@@ -157,25 +203,41 @@ export function IOSViewer({
     const ch = chromeRef.current
     ctx.clearRect(0, 0, rc.width, rc.height)
 
+    // **Drawn in the device's own space, then turned into the canvas** — the way it is shown. Everything
+    // below is measured in that space (the pointer too, `normToRecordCanvas`), so only this transform knows
+    // about the turn. Fitted rather than filled: a fold during a take changes the device under a fixed size.
+    const container = containerRef.current
+    const w = container?.clientWidth || rc.width; const h = container?.clientHeight || rc.height
+    const turn = container?.clientWidth ? shownTurn : 0
+    const { picW, picH, scale, left, top } = placeTurnedFrame(rc.width, rc.height, w, h, turn)
+    ctx.save()
+    ctx.translate(left + (picW * scale) / 2, top + (picH * scale) / 2)
+    ctx.scale(scale, scale)
+    ctx.rotate((turn * Math.PI) / 180)
+    ctx.translate(-w / 2, -h / 2)
+
     if (ch) {
-      if (chromeImgRef.current) ctx.drawImage(chromeImgRef.current, 0, 0, rc.width, rc.height)
-      const r = Math.round((ch.screenCornerRadius / 2) * (rc.height / (ch.compositeHeight / 2)))
+      if (chromeImgRef.current) ctx.drawImage(chromeImgRef.current, 0, 0, w, h)
+      const px = (radius: number) => Math.round((radius / 2) * (h / (ch.compositeHeight / 2)))
+      const r = px(ch.screenCornerRadius)
+      const radii = ch.screenCornerRadii
       ctx.save(); ctx.beginPath()
       if (r > 0) {
-        (ctx as CanvasRenderingContext2D & { roundRect: (x: number, y: number, w: number, h: number, r: number) => void })
-          .roundRect(fc.offsetLeft, fc.offsetTop, fc.clientWidth, fc.clientHeight, r)
+        (ctx as CanvasRenderingContext2D & { roundRect: (x: number, y: number, w: number, h: number, r: number | number[]) => void })
+          .roundRect(fc.offsetLeft, fc.offsetTop, fc.clientWidth, fc.clientHeight,
+            radii ? [px(radii.topLeft), px(radii.topRight), px(radii.bottomRight), px(radii.bottomLeft)] : r)
       } else { ctx.rect(fc.offsetLeft, fc.offsetTop, fc.clientWidth, fc.clientHeight) }
       ctx.clip(); ctx.drawImage(fc, fc.offsetLeft, fc.offsetTop, fc.clientWidth, fc.clientHeight); ctx.restore()
     } else {
-      ctx.drawImage(fc, 0, 0, rc.width, rc.height)
+      ctx.drawImage(fc, 0, 0, w, h)
     }
 
     // Pinch hint
     const ph = pinchHintRef.current
     if (ph) {
       for (const f of [ph.f0, ph.f1]) {
-        const cx = ch ? fc.offsetLeft + f.x * fc.clientWidth : f.x * rc.width
-        const cy = ch ? fc.offsetTop  + f.y * fc.clientHeight : f.y * rc.height
+        const cx = ch ? fc.offsetLeft + f.x * fc.clientWidth : f.x * w
+        const cy = ch ? fc.offsetTop  + f.y * fc.clientHeight : f.y * h
         if (isPinchMode.current) {
           ctx.beginPath(); ctx.arc(cx, cy, CURSOR_DOT_R, 0, Math.PI * 2)
           ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.fill()
@@ -211,18 +273,13 @@ export function IOSViewer({
       }
       ctx.restore()
     }
-  }, [recordCanvasRef, canvasRef])
+    ctx.restore()
+  }, [recordCanvasRef, canvasRef, containerRef, shownTurn])
 
-  // **Registered once, and the difference from Android is worth stating.** `composeFrame` here
-  // depends only on `recordCanvasRef` and `canvasRef`, ref objects whose identity never changes, so this fires on
-  // mount and never again — there is no newest composer on this platform. A rotation still reaches
-  // the frames, because the composer reads `chromeRef`, `canvasRef.current` and the canvas's own
-  // layout live on every draw, exactly as it did before the setter existed.
-  //
-  // So the layout effect is not load-bearing here the way it is in `AndroidViewer`, where the
-  // composer is rebuilt on every turn and `requestAnimationFrame` would otherwise see the old one
-  // for a tick. It matches that file on purpose: the two viewers should register the same way, and
-  // this is the shape that is already correct if iOS ever composes by a turn of its own.
+  // **Re-registered on every turn, as `AndroidViewer`'s is.** `composeFrame` depends on `shownTurn`, so a
+  // rotation builds a new composer, and the layout effect hands it over before `requestAnimationFrame` can
+  // draw a frame with the old turn. Everything else it reads — `chromeRef`, `canvasRef.current`, the
+  // canvas's layout — is read live on every draw.
   useLayoutEffect(() => { setComposeFrame(composeFrame) }, [composeFrame, setComposeFrame])
 
   const handleScreenshot = useCallback(() => {
@@ -240,14 +297,14 @@ export function IOSViewer({
   const handleRecordToggle = useCallback(() => {
     if (recordState === 'idle') {
       const rc = recordCanvasRef.current; if (!rc) return
-      const container = containerRef.current
-      if (container && container.clientWidth > 0) { rc.width = container.clientWidth; rc.height = container.clientHeight }
+      const size = shownDeviceSize()
+      if (size) { rc.width = size.width; rc.height = size.height }
       else { const fc = canvasRef.current; if (fc && fc.width > 0) { rc.width = fc.width; rc.height = fc.height } else return }
       startClientRecording()
     } else if (recordState === 'recording') {
       stopClientRecording()
     }
-  }, [recordState, startClientRecording, stopClientRecording, recordCanvasRef, containerRef, canvasRef])
+  }, [recordState, startClientRecording, stopClientRecording, recordCanvasRef, shownDeviceSize, canvasRef])
 
   // **The orientation last sent, kept beside the state rather than read from it** (#910). The agent is
   // sent a target, not "turn", and two presses before a re-render must still send landscape then
@@ -255,6 +312,26 @@ export function IOSViewer({
   // StrictMode calls twice: that would flip it twice and send twice.
   const landscapeRef = useRef(false)
   const handleRotate = useCallback(() => {
+    spinUntil.current = performance.now() + SPIN_MS
+    const reported = chromeRef.current?.streamRotation
+    if (reported !== undefined) {
+      // **A device that reports how it is held turns a quarter clockwise from there** — DeviceHub's rotate
+      // button. The frame turns now and the screen inside follows when the device does; the turn the device
+      // reports back confirms it, and one that never comes puts the frame back where the device said it was.
+      // Counted from a turn still on its way, so pressing twice turns twice.
+      const ahead = pendingTurnRef.current
+      const from = ahead && ahead.deadline > Date.now() ? ahead.target : reported
+      const next = { target: ((from + 90) % 360) as Turn, deadline: Date.now() + PENDING_TURN_MS }
+      pendingTurnRef.current = next
+      setPendingTurn(next)
+      // **Sent once the frame has finished turning.** Sent at once, a device that answers inside the
+      // animation redraws its screen turned while the frame is still on its way, and the screen visibly
+      // turns first — seen on the Duo. DeviceHub's order is the frame, then the screen.
+      const sendNow = () => send({ type: 'input:rotate', sessionId, payload: { direction: 'clockwise' } })
+      const t = setTimeout(() => { rotateTimers.current.delete(t); sendNow() }, SPIN_MS)
+      rotateTimers.current.set(t, sendNow)
+      return
+    }
     const next = !landscapeRef.current
     landscapeRef.current = next
     setIsLandscape(next)
@@ -273,10 +350,28 @@ export function IOSViewer({
   const undoRotateRef = useRef<(() => void) | null>(null)
   useEffect(() => {
     undoRotateRef.current = () => {
+      // Not for a device that reports its own turn: its orientation is the device's, shared with every
+      // other viewer and DeviceHub, and this viewer leaving is no reason to turn it under them.
+      if (chromeRef.current?.streamRotation !== undefined) return
       if (landscapeRef.current) send({ type: 'input:rotate', sessionId, payload: { orientation: 'portrait' } })
     }
   }, [send, sessionId])
   useEffect(() => () => { undoRotateRef.current?.() }, [])
+
+  // Released when the device reports the turn asked for, or at the deadline — whichever comes first.
+  // The deadline is fixed at the press, so a report that does not match cannot push it further out
+  // (the same rule as `usePostureControl`).
+  useEffect(() => {
+    if (!pendingTurn) return
+    const arrived = chrome.streamRotation === pendingTurn.target
+    // The ref goes with it: a press inside the old deadline would otherwise count from a target already
+    // reached or abandoned, not from where the device now reports it — after a fold had moved it, by a quarter.
+    const t = setTimeout(() => {
+      if (pendingTurnRef.current === pendingTurn) pendingTurnRef.current = null
+      setPendingTurn(null)
+    }, arrived ? 0 : remaining(pendingTurn.deadline, Date.now()))
+    return () => clearTimeout(t)
+  }, [pendingTurn, chrome.streamRotation])
 
   const sendChord = useCallback((code: 'KeyC' | 'KeyV' | 'KeyX', modifiers: number) => {
     send({ type: 'input:key', sessionId, requestId: newRequestId(), payload: { code, modifiers } })
@@ -340,9 +435,10 @@ export function IOSViewer({
 
   // ── Coordinate helpers ────────────────────────────────────────────────────
   const toNormScreen = useCallback((e: { clientX: number; clientY: number }) => {
-    // In landscape, use the outer wrapper div (no CSS transform) to avoid
+    // Turned, use the outer wrapper div (no CSS transform) to avoid
     // getBoundingClientRect inaccuracies on CSS-rotated elements.
-    const target = (isLandscape ? screenAreaRef.current : null) ?? containerRef.current
+    const turn = shownTurn
+    const target = (turn !== 0 ? screenAreaRef.current : null) ?? containerRef.current
     if (!target) return null
     const rect = target.getBoundingClientRect()
     const cw = chrome.compositeWidth / 2; const ch2 = chrome.compositeHeight / 2
@@ -353,9 +449,9 @@ export function IOSViewer({
       rect,
       cw, ch2,
       { x: sx, y: sy, width: sw, height: sh },
-      isLandscape,
+      turn,
     )
-  }, [chrome, isLandscape, containerRef, screenAreaRef])
+  }, [chrome, shownTurn, containerRef, screenAreaRef])
 
   const toPinchFingers = useCallback((e: { clientX: number; clientY: number }) => {
     const f1 = toNormScreen(e); if (!f1) return null
@@ -370,6 +466,7 @@ export function IOSViewer({
 
   // ── Pointer interaction ───────────────────────────────────────────────────
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (performance.now() < spinUntil.current) return
     setKeyboardActive(true)
     if (isOptionHeld.current) {
       const fingers = toPinchFingers(e); if (!fingers) return
@@ -403,7 +500,7 @@ export function IOSViewer({
   // render scope, and the compiler then cannot keep the three pointer callbacks below that read it,
   // so it skips the whole component (`noSuppressedCompilation.test.ts` fails, measured).
   const pressFrameButton = useCallback((name: string, e: React.PointerEvent) => {
-    if (isOptionHeld.current) return
+    if (isOptionHeld.current || performance.now() < spinUntil.current) return
     e.stopPropagation()
     if (pressedButton.current) { refusedButtonPointers.current.add(e.pointerId); return }
     setKeyboardActive(true)
@@ -615,6 +712,7 @@ export function IOSViewer({
         onRecordToggle={handleRecordToggle}
         recordState={recordState}
         onRotate={handleRotate}
+        posture={postures && postures.postures.length > 1 ? { postures: postures.postures, currentId: postures.currentId, pending: posture.pending, onSelect: posture.select } : undefined}
         navigationSlot={navigationSlot}
         deviceSlot={deviceSlot}
         launchSlot={launchSlot}
@@ -627,7 +725,8 @@ export function IOSViewer({
           screen={screen}
           chrome={chrome}
           formFactor={formFactor}
-          isLandscape={isLandscape}
+          turn={shownTurn}
+          folding={posture.folding}
           joined={joined}
           fps={fps}
           containerHandlers={{

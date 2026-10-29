@@ -88,6 +88,45 @@ queued moves would bound it, and is unmeasured and undecided.
 - SDK binaries resolve through `sdk.ts`: `ADB_PATH` (adb only), then `ANDROID_HOME`, `ANDROID_SDK_ROOT`, the standard macOS/Linux SDK directories, then `PATH` — the SDK candidates `tapflow doctor` uses, so an SDK doctor finds is one the agent finds (#903). Not the same order: doctor's `resolveAdb` tries `PATH` first, so with two adbs installed the two can name different ones. Nothing found → a `ValidationError` naming `ANDROID_HOME`, and `listAvds` says so once instead of reporting an empty list silently.
 - Apple Silicon Mac: `system-images;android-35;google_apis;arm64-v8a` image required — the level `tapflow setup android` installs (`AVD_IMAGE_API` in the CLI's `setup.ts`).
 
+### Rotation turns the emulator's body (gRPC), and a touch names the picture it is in
+
+An emulator streaming over gRPC is drawn **as its body is held**, the iOS model: `AndroidChrome.bodyRotation`
+says how far the body is turned clockwise, and Rotate turns the body. scrcpy (real devices, the fallback) keeps
+the portrait/landscape toggle and never sends `bodyRotation` — its frames are the natural panel.
+
+- **Measured, and what the design rests on** (Pixel_9_API_36, Pixel_9_Pro_Fold_API_36, `-read-only`):
+  `adb emu rotate` turns the body a quarter **clockwise**, relative; the gRPC frame follows within 53 ms, even
+  on a portrait-locked screen; that frame is the device *as held* (body a quarter clockwise: frame (0,0) is the
+  screen's (0,1)); `SkinRotation` `REVERSE_LANDSCAPE` is that quarter, so `bodyRotation = 360 − SKIN_DEGREES`;
+  folding does not move the body; the Fold AVD boots with its body already a quarter round.
+- **Read before every turn, confirm every step** (`turnBodyTo`): the console accelerometer
+  (`readBodyRotation`, no gRPC needed) says where the body is, `emu rotate` runs the needed number of times,
+  and each step is read back. A remembered start is #910's shape; a lost step is put right by the next read.
+  `state.body` is whichever came last of that read and a frame's skin.
+- **Touches stay in the display's space unless they say otherwise.** MCP's `tap` divides by `adb screencap`
+  (the display), flows tap uiautomator bounds (the display), and older dashboards send the display, so a point
+  with no `space` goes through `toDevicePx`'s `toNaturalPoint(rotation)` as before. A first design inverted
+  every point by the skin and would have moved every one of those taps.
+- **The dashboard's body mode sends the frame's own point, marked `space: 'frame'`** (`fromFrame`). The agent
+  turns it by the newest frame's skin (`state.latestFrame`), which follows a turn within a frame, rather than
+  by the chrome's correction, which follows 0.6–3.6 s later. Turned in the dashboard by that correction instead,
+  a touch in that window landed a quarter off, so the dashboard dropped them, and the tester felt input stall
+  after every turn. `fromFrame` turns by `skin − rotation` and `toDevicePx` by `rotation`, so the two compose
+  to the skin and the lag of `rotation` cancels on the channel path too.
+- **No `wm user-rotation lock` on this path** — not on Rotate, not on a foldable's boot, not carried across
+  a fold (`finishPosture`). The lock is what kept apps from following the body. Earlier versions wrote one
+  and a lock tapflow wrote cannot be told from one a person chose, so `prepareBody` frees it **once per AVD**
+  (`RotationLockMemory`, a marker beside the AVD; never the real AVD directories under vitest). The toggle on an
+  emulator streaming without gRPC still writes a lock, so writing one **forgets** the AVD (`lockWritten`) and the
+  next gRPC session frees it again: that lock is tapflow's, not a person's.
+- **A `direction` never takes the toggle.** Only a viewer drawing the body sends one, and it can arrive with no
+  gRPC client — a stream restarting, a step queued behind a turn that outlived its session. The body is turned
+  through the console then (no gRPC needed), and a device with no body ignores it; answering with the toggle
+  wrote `wm user-rotation lock 3`.
+- **Who stands the body up**: a boot that started the emulator (`launched`) and a run (`runReset`), console
+  only and ahead of the backend split, so an emulator that falls back to scrcpy starts upright for its
+  toggle too. Any other session joins the body where it is held. Real devices keep `uprightOnBoot`.
+
 ### An entry point with no session refuses rather than choosing
 
 The members that take no session id — `screenshot`, `installApp`, `launchApp`, `queryUITree`,

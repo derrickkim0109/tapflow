@@ -131,3 +131,28 @@ describe('WebCodecsDecoder — close', () => {
     expect(dec.closed).toBe(true)
   })
 })
+
+describe('WebCodecsDecoder — onPresented', () => {
+  it('tells every listener once per drawn frame, and stops telling one that was removed', () => {
+    const renderer = mockRenderer()
+    const d = new WebCodecsDecoder(() => renderer)
+    const a = vi.fn(), b = vi.fn()
+    d.onPresented(a)
+    const offB = d.onPresented(b)
+    feedReady(d)
+    emitFrame(); emitFrame()
+    offB()
+    emitFrame()
+    expect(a).toHaveBeenCalledTimes(3)
+    expect(b).toHaveBeenCalledTimes(2)
+  })
+
+  it('says nothing for a frame the renderer did not draw', () => {
+    const d = new WebCodecsDecoder(() => mockRenderer(null))
+    const a = vi.fn()
+    d.onPresented(a)
+    feedReady(d)
+    emitFrame()
+    expect(a).not.toHaveBeenCalled()
+  })
+})

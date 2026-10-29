@@ -56,8 +56,8 @@ QA 세션은 Mac에서 실행 중인 iOS 시뮬레이터나 Android 에뮬레이
 | [앱 실행](/ko/testing/device-controls#launch-the-app) | 설치된 빌드를 **Launch app**으로 실행합니다. |
 | [기기 버튼](/ko/testing/device-controls#device-buttons) | iOS의 Home과 기기 테두리의 측면 버튼, Android의 **Home**·**Back**·**Recent Apps**·**Volume Up**·**Volume Down**·**Power**를 누릅니다. |
 | [소프트웨어 키보드](/ko/testing/device-controls#software-keyboard) | iOS 화면 키보드를 올리거나 내립니다. |
-| [회전](/ko/testing/device-controls#rotate) | 기기를 가로·세로로 돌립니다. |
-| [접기와 펼치기](/ko/testing/device-controls#fold) | 폴더블 Android 에뮬레이터를 접거나 펼칩니다. |
+| [회전](/ko/testing/device-controls#rotate) | iOS와 gRPC로 켠 Android 에뮬레이터는 시계 방향으로 90°씩 돌립니다. Android 실기기와 gRPC 없이 켠 에뮬레이터는 세로와 가로를 오갑니다. |
+| [접기와 펼치기](/ko/testing/device-controls#fold) | 폴더블 Android 에뮬레이터나 iPhone Duo를 접거나 펼칩니다. |
 | [기기 재시작](/ko/testing/device-controls#restart) | 기기를 다시 켭니다. 테스트 중인 빌드는 새로 설치되고 다른 앱의 데이터는 남습니다. |
 | [클립보드](/ko/testing/device-controls#clipboard) | 기기와 내 컴퓨터 사이에서 텍스트를 복사하고 붙여 넣습니다. |
 | [딥 링크](/ko/testing/deep-links) | URL을 입력해 앱의 특정 화면을 바로 엽니다. |

@@ -23,15 +23,24 @@ function ensureCompiled(): void {
     throw new PlatformError('screencapture-helper binary missing and Swift source not found — reinstall @tapflowio/ios-agent')
   }
   logger.info('compiling screencapture-helper...')
+  // -O: the helper runs per frame for the whole session; unoptimised it cost ~2 points of a core more while a video
+  // played (11–12% against ~10%, measured).
   execFileSync('swiftc', [
     SWIFT_SRC,
+    '-O',
     '-o', BINARY,
     '-framework', 'CoreVideo',
     '-framework', 'ImageIO',
     '-framework', 'VideoToolbox',
     '-framework', 'CoreMedia',
+    '-framework', 'Metal',
   ], { stdio: ['ignore', 'ignore', 'inherit'] })
   logger.info('compiled OK')
+}
+
+export interface PanelSize {
+  width: number
+  height: number
 }
 
 export interface StreamFrame {
@@ -73,7 +82,22 @@ export class ScreenCaptureStreamer {
     // Downscale cap (longest side, px) the helper encodes at; 0 = native. Passed to the Swift helper
     // as TAPFLOW_IOS_MAX_SIZE so the per-session tier wins over any inherited env value.
     private readonly maxSize: number = 0,
+    // A multi-panel device's panel, by framebuffer size; null captures the largest surface, which is the
+    // only panel of every other device. See `selectPanel`.
+    private panel: PanelSize | null = null,
   ) {}
+
+  /**
+   * Switch a multi-panel device's capture to another panel (a fold), as a text line on the helper's stdin.
+   * The helper restarts the H.264 session at the new size with a keyframe first. Remembered, so it is
+   * never sent twice in a row; a restarted streamer is built with the panel instead (`--panel`).
+   */
+  selectPanel(panel: PanelSize): void {
+    if (this.panel?.width === panel.width && this.panel?.height === panel.height) return
+    this.panel = panel
+    const stdin = this.proc?.stdin
+    if (stdin?.writable) stdin.write(`panel ${panel.width}x${panel.height}\n`)
+  }
 
   /**
    * Forces an IDR on the next H.264 frame (1-byte stdin command to the helper).
@@ -88,7 +112,8 @@ export class ScreenCaptureStreamer {
   start(): ReadableStream<StreamFrame> {
     ensureCompiled()
 
-    const proc = spawn(BINARY, [String(this.fps), this.udid, this.codec], {
+    const panelArgs = this.panel ? ['--panel', `${this.panel.width}x${this.panel.height}`] : []
+    const proc = spawn(BINARY, [String(this.fps), this.udid, this.codec, ...panelArgs], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, TAPFLOW_IOS_MAX_SIZE: String(this.maxSize) },
     })
@@ -118,7 +143,9 @@ export class ScreenCaptureStreamer {
 
         proc.stdout.on('data', (chunk: Buffer) => {
           if (done) return
-          buf = Buffer.concat([buf, chunk])
+          // Most chunks start a frame with nothing left over; `concat` would copy each one anyway. The frames point
+          // into `chunk` then, which the stream never reuses.
+          buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk])
           const { frames, rest } = parseStreamFrames(buf, h264)
           for (const f of frames) controller.enqueue(f)
           buf = rest

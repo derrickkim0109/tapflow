@@ -1,14 +1,21 @@
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { CSSProperties, MutableRefObject } from 'react'
 import { useDecoderStream } from '@/hooks/useDecoderStream'
 import type { Decoder } from '@/lib/decoders/types'
 import type { BinaryFrameHandler } from '@/lib/envelope'
 import type { PerfHook } from '@/components/perf/types'
-import { composeTurn, framesAgree, showsPicture, surfaceBox } from '@/lib/coordinate-transform'
+import { composeTurn, framesAgree, showsPicture, surfaceBox, turnedSize, type Turn } from '@/lib/coordinate-transform'
 
 /** The longest side the device is drawn at, in CSS px. The recording composer scales its cursor
  *  rings by the same number, so the two have to stay one constant. */
 export const MAX_ANDROID_LONG = 720
+
+/** How long a turn this viewer asked for may wait for its frame before the device is put back where the frames
+ *  say it is. A body turn's frame comes ~53 ms after the turn (measured); this is for one that never comes. */
+export const PENDING_TURN_MS = 4_000
+/** How long the device takes to spin a quarter — the 300 ms transition, with room for it to land. iOS's, so both
+ *  turn alike; a press is sent after it, and input waits it out. */
+export const SPIN_MS = 350
 
 interface UseAndroidScreenOptions {
   binaryFrameHandlerRef: { current: BinaryFrameHandler | undefined }
@@ -27,6 +34,12 @@ interface UseAndroidScreenOptions {
   userWantsLandscape: boolean
   /** A rotation is in flight — the picture is held back until it lands. */
   rotatePending: boolean
+  /** How far the emulator's body is turned (`AndroidChrome.bodyRotation`). Present means **body mode**: the frame
+   *  is drawn as it arrives — already as the body is held — and the shell takes the frame's shape. */
+  bodyRotation?: Turn
+  /** How many turns this viewer has asked for — a count, so each press is one. A page that cannot turn the device
+   *  passes nothing, and draws every turn as the frame brings it. */
+  turnsAsked?: number
 }
 
 /**
@@ -41,8 +54,9 @@ interface UseAndroidScreenOptions {
  */
 export function useAndroidScreen({
   binaryFrameHandlerRef, perfHookRef, frameCount,
-  screenWidth, screenHeight, streamRotation, cornerRadius, userWantsLandscape, rotatePending,
+  screenWidth, screenHeight, streamRotation, cornerRadius, userWantsLandscape, rotatePending, bodyRotation, turnsAsked = 0,
 }: UseAndroidScreenOptions) {
+  const bodyMode = bodyRotation !== undefined
   const surfaceHostRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const decoderRef = useRef<Decoder | null>(null)
@@ -102,12 +116,46 @@ export function useAndroidScreen({
     },
   })
 
+  // **A turn this viewer asked for spins the device, and the frame ends the spin** — DeviceHub's order, as on iOS:
+  // the device turns, then the screen. Each press owes a quarter, drawn as a CSS turn of the whole device; the
+  // turned body's frame pays it, and is the same picture the spin ended on (the body as held), so the swap is
+  // seamless. That frame is recognised by its shape flipping: a quarter turn of the body always swaps the frame's
+  // sides, while a quality tier only scales them. The description is no use here — it follows 0.6–3.6 s later.
+  const frameLandscape = videoSize ? videoSize.width > videoSize.height : null
+  const [spin, setSpin] = useState({ asked: turnsAsked, owed: 0, frameLandscape, animate: false })
+  if (spin.asked !== turnsAsked || spin.frameLandscape !== frameLandscape) {
+    const flipped = spin.frameLandscape !== null && frameLandscape !== null && spin.frameLandscape !== frameLandscape
+    const paid = flipped && spin.owed > 0 ? 1 : 0
+    const asked = Math.max(0, turnsAsked - spin.asked)
+    setSpin({ asked: turnsAsked, owed: spin.owed + asked - paid, frameLandscape, animate: asked > 0 })
+  }
+  // A turn whose frame never came is undone, turning back as visibly as it went — and the device is still drawn
+  // turned while it does, so input stays closed until the way back has finished (`settling`).
+  const owed = bodyMode ? spin.owed : 0
+  const [settling, setSettling] = useState(false)
+  useEffect(() => {
+    if (owed === 0) return
+    const t = setTimeout(() => { setSpin((s) => ({ ...s, owed: 0, animate: true })); setSettling(true) }, PENDING_TURN_MS)
+    return () => clearTimeout(t)
+  }, [owed, turnsAsked])
+  useEffect(() => {
+    if (!settling) return
+    const t = setTimeout(() => setSettling(false), SPIN_MS)
+    return () => clearTimeout(t)
+  }, [settling])
+
   // **What Android draws, not what the stream carries.** `session:chrome` reports the display's
   // current size; the emulator's gRPC capture arrives in the device's *physical* orientation, and on
   // a folded foldable those differ — measured: Android draws 1080x2424 while the frame is 2424x1080.
   // Framing the stream's dimensions is what laid the folded screen on its side.
   const shownSize = screenWidth && screenHeight ? { width: screenWidth, height: screenHeight } : null
-  const effectiveSize = shownSize ?? videoSize
+  // **Body mode frames the frame, as it arrives.** The frame already is the body as held, and it turns 53 ms after
+  // the body does while the description follows 0.6–3.6 s later (the agent settles the display first). Framed by
+  // the description, the picture was hidden behind "Changing posture…" for that long on every turn, and a
+  // description that lost a race framed a landscape frame in a portrait shell.
+  const effectiveSize = bodyMode
+    ? (videoSize ?? (shownSize ? turnedSize(shownSize.width, shownSize.height, streamRotation) : null))
+    : (shownSize ?? videoSize)
   const isLandscapeContent = effectiveSize ? effectiveSize.width > effectiveSize.height : false
   // CSS rotation: applied when the user requested landscape but the video content is still
   // portrait (portrait-locked app). Matches native Android emulator — the shell rotates even
@@ -120,7 +168,7 @@ export function useAndroidScreen({
   // captures the display as it actually is — measured on a Pixel 9 Pro Fold: 2152x2076 while
   // `wm size` reported the natural 2076x2152 — so there the frame is already landscape and
   // `isLandscapeContent` turns this off by itself.
-  const needsCSSRotation = userWantsLandscape && !isLandscapeContent
+  const needsCSSRotation = !bodyMode && userWantsLandscape && !isLandscapeContent
   // **The device frame is never rotated — the video inside it is.** A foldable's frame follows the
   // screen Android draws, and turning the whole shell was what put the bezel on its side. The
   // quarter turn comes from the agent rather than from comparing the two sizes here: they update on
@@ -136,7 +184,12 @@ export function useAndroidScreen({
   //
   // What differs between them is the *shell*: only the user's request changes the frame's shape,
   // because the device's screen has not actually rotated.
-  const totalTurn = composeTurn(streamRotation, needsCSSRotation)
+  const totalTurn: Turn = bodyMode ? 0 : composeTurn(streamRotation, needsCSSRotation)
+  /** From the shell's space to the screen Android draws, for a pointer: body mode's frame turned by the capture's
+   *  correction (`turnPoint`), nothing otherwise. A ref for the reason `needsCSSRotationRef` gives. */
+  const screenTurn: Turn = bodyMode ? streamRotation : 0
+  const screenTurnRef = useRef<Turn>(0)
+  useLayoutEffect(() => { screenTurnRef.current = screenTurn }, [screenTurn])
 
   // **One ref, and only because a pointer event is not a render.** `toNorm` runs from a pointer
   // handler and wants whatever is true at the moment of the event, not at the render that built
@@ -162,10 +215,21 @@ export function useAndroidScreen({
   // black, round the screen container to that radius so overflow:hidden clips the black away (the
   // content rounds at the same radius → no dark corner). Falls back to the design default 22px.
   // `cornerRadius == null` = unknown → design default; an explicit 0 (square screen) must stay 0.
-  const screenRadius = cornerRadius != null ? Math.round(cornerRadius * androidDisplayW) : 22
+  // **The corner is the panel's, and no turn changes it.** It arrives as a fraction of the width Android draws, which
+  // does change with a turn; its product with that width is the radius in device pixels. Body mode scales that by the
+  // shell's long side over the device's — not by the stream's scale, which a quality tier shrinks, and not by a side
+  // chosen by the description's correction, which lags a turn and made the corners jump on every one.
+  const deviceLong = screenWidth && screenHeight ? Math.max(screenWidth, screenHeight) : 0
+  const screenRadius = cornerRadius == null ? 22
+    : bodyMode && screenWidth && deviceLong
+      ? Math.round((cornerRadius * screenWidth * Math.max(androidDisplayW, androidDisplayH)) / deviceLong)
+      : Math.round(cornerRadius * androidDisplayW)
   // Whether the frame and the agent's description are talking about the same screen; the
   // reasoning, and why the user's quarter is deliberately not part of it, is in `framesAgree`.
-  const frameMatchesScreen = framesAgree(videoSize, shownSize, streamRotation)
+  const descriptionAgrees = framesAgree(videoSize, shownSize, streamRotation)
+  // Body mode draws the frame in its own shape, so the picture never disagrees with its shell, and a pointer goes
+  // out in the frame's own space — nothing waits on the description there.
+  const frameMatchesScreen = bodyMode ? true : descriptionAgrees
   const pictureVisible = showsPicture({
     ready: canvasReady, aspectAgrees: frameMatchesScreen, frameIsAhead, rotating: rotatePending,
   })
@@ -185,9 +249,15 @@ export function useAndroidScreen({
   }
 
   return {
-    surfaceHostRef, containerRef, decoderRef, videoSizeRef, needsCSSRotationRef,
+    surfaceHostRef, containerRef, decoderRef, videoSizeRef, needsCSSRotationRef, screenTurnRef, screenTurn, bodyMode,
     decoderUnsupported, totalTurn,
     containerW, containerH, screenRadius, frameMatchesScreen, pictureVisible, canvasStyle,
+    /** Degrees the whole device is drawn turned by while turns this viewer asked for wait for their frame, and
+     *  whether getting there animates: a press and an undo do, a frame paying its quarter does not. */
+    spinDeg: owed * 90, spinAnimates: spin.animate,
+    /** The device is drawn mid-turn — turned for a press, or on its way back from one — so a pointer means nothing
+     *  and the viewer takes none. */
+    spinning: owed !== 0 || settling,
   }
 }
 

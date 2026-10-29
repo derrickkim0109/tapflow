@@ -478,6 +478,43 @@ describe('AdbWrapper', () => {
     })
   })
 
+  // The console's accelerometer, as `emu sensor get acceleration` printed it on Pixel_9_API_36 for each
+  // `emu rotate` (measured): gravity +9.81 on the axis pointing up. Mutations: swap the landscapes; read an
+  // axis below the threshold as a turn.
+  describe('readBodyRotation', () => {
+    const at = async (out: string) => {
+      const runner = mockRunner()
+      vi.mocked(runner.exec).mockResolvedValue(out)
+      return new AdbWrapper(runner).readBodyRotation('emulator-5554')
+    }
+    it('reads the four quarters the emulator turns through', async () => {
+      expect(await at('acceleration = 0:9.77631:0.812349\r\nOK')).toBe(0)
+      expect(await at('acceleration = -9.81:-1.90735e-06:0')).toBe(90)
+      expect(await at('acceleration = -8.57617e-07:-9.81:0')).toBe(180)
+      expect(await at('acceleration = 9.81:-1.90735e-06:0')).toBe(270)
+    })
+    it('gives no answer lying flat, or for output it cannot read', async () => {
+      expect(await at('acceleration = 0:0:9.81')).toBeNull()
+      expect(await at('KO: unknown command')).toBeNull()
+    })
+  })
+
+  describe('rotateBodyClockwise / freeRotation', () => {
+    it('turns the body through the console and refuses a KO', async () => {
+      const runner = mockRunner()
+      const wrapper = new AdbWrapper(runner)
+      await wrapper.rotateBodyClockwise('emulator-5554')
+      expect(runner.exec).toHaveBeenCalledWith('-s', 'emulator-5554', 'emu', 'rotate')
+      vi.mocked(runner.exec).mockResolvedValueOnce('KO: not an emulator')
+      await expect(wrapper.rotateBodyClockwise('emulator-5554')).rejects.toThrow('emu rotate refused')
+    })
+    it('frees the rotation lock', async () => {
+      const runner = mockRunner()
+      await new AdbWrapper(runner).freeRotation('emulator-5554')
+      expect(runner.exec).toHaveBeenCalledWith('-s', 'emulator-5554', 'shell', 'wm', 'user-rotation', 'free')
+    })
+  })
+
   describe('setRotation', () => {
     it('locks display to landscape via wm user-rotation', async () => {
       const runner = mockRunner()

@@ -108,10 +108,12 @@ interface ButtonDrawData {
   topLeftX: number   // 1× pts, in expanded canvas (top-left origin)
   topLeftY: number
   onTop: boolean
+  turn: ArtTurn
 }
 
 interface PressedData {
   pdfPath: string
+  turn: ArtTurn
   topLeftX: number  // 1× pts, same coordinate space as ButtonDrawData
   topLeftY: number
   pdfW: number      // 1× pts (natural PDF size)
@@ -125,13 +127,18 @@ interface ButtonLayout {
   pressedData: (PressedData | null)[]  // parallel to buttons[]
 }
 
+/** Quarter turns clockwise to draw a button's artwork at, so it lies in the frame's own space. */
+type ArtTurn = 0 | 90 | 180 | 270
+
 // Mirrors baguette's LiveChromes.computeMargins + buttonTopLeft.
 // compositeW/H = device body dimensions in 1× PDF pts (before button margin expansion).
 // For composite PDF: pdfSize.width / pdfSize.height.
 // For nine-slice: leftWidth+screenW+rightWidth / topHeight+screenH+bottomHeight.
-// leftWidth/rightWidth: bezel sizes; top/bottom-anchor x offsets are measured from
-//   the screen edge (after bezel), so we add leftWidth for leading and subtract
-//   rightWidth for trailing to convert to canvas coordinates.
+// rightWidth: the trailing bezel, which a trailing top-anchor x offset is measured from.
+// artTurn: how far to turn every button's artwork — a frame drawn in its panel's native orientation
+//   (`nativeOrientation` in capabilities.plist) still ships its buttons drawn upright for the person holding
+//   the device. Measured on the iPhone Duo's unfolded frame (phone14, native 270): its volume art is 63×16 on
+//   a left anchor and its power 16×107 on a top one, each a quarter turn from the edge it is placed on.
 async function computeButtonLayout(
   ctx: Ctx,
   inputs: RawInput[],
@@ -139,9 +146,12 @@ async function computeButtonLayout(
   compositeW: number,
   compositeH: number,
   scale = 2,
-  leftWidth = 0,
   rightWidth = 0,
+  artTurn: ArtTurn = 0,
 ): Promise<ButtonLayout> {
+  // A quarter-turned artwork swaps its sides, and every margin and offset below is measured on the turned one.
+  const quarter = artTurn === 90 || artTurn === 270
+  const turned = (size: { width: number; height: number }) => quarter ? { width: size.height, height: size.width } : size
   const margins = { left: 0, top: 0, right: 0, bottom: 0 }
 
   interface BtnInfo { input: RawInput; w: number; h: number; roll: { x: number; y: number } }
@@ -152,7 +162,7 @@ async function computeButtonLayout(
     const pdfPath = join(resourcesDir, `${inp.image}.pdf`)
     if (!existsSync(pdfPath)) continue
     try {
-      const size = await getSipsSize(ctx, pdfPath)
+      const size = turned(await getSipsSize(ctx, pdfPath))
       const roll = inp.offsets.rollover ?? inp.offsets.normal
       infos.push({ input: inp, w: size.width, h: size.height, roll })
     } catch { ctx.incomplete = true /* skip unmeasurable assets */ }
@@ -198,10 +208,14 @@ async function computeButtonLayout(
         break
       }
       case 'top': {
+        // Leading: roll.x is the button's leading edge from the frame's own, as roll.y is for a left-anchored
+        // one. Measured against DeviceHub on the iPhone Duo's unfolded frame (phone14), whose power button sits
+        // at 243 ±8 pt: this puts it at 249.5, where the previous reading (leftWidth + roll.x − w/2, fitted by
+        // eye to an iPad's nine-slice frame) put it at 159.5. On that iPad the two differ by w − leftWidth, 5 pt.
         const align = inp.align ?? 'leading'
         centerX = align === 'center'   ? mL + compositeW / 2 + roll.x
                 : align === 'trailing' ? mL + (compositeW - rightWidth) + roll.x
-                :                        mL + leftWidth + roll.x - w / 2
+                :                        mL + roll.x + w / 2
         topY = mT + roll.y
         break
       }
@@ -219,6 +233,7 @@ async function computeButtonLayout(
       topLeftX: btnTopLeftX,
       topLeftY: btnTopLeftY,
       onTop:    inp.onTop ?? false,
+      turn:     artTurn,
     })
 
     // imageDown: pressed state PDF at the same position as the normal button
@@ -227,9 +242,10 @@ async function computeButtonLayout(
       const downPath = join(resourcesDir, `${inp.imageDown}.pdf`)
       if (existsSync(downPath)) {
         try {
-          const downSize = await getSipsSize(ctx, downPath)
+          const downSize = turned(await getSipsSize(ctx, downPath))
           pressed = {
             pdfPath:  downPath,
+            turn:     artTurn,
             topLeftX: btnTopLeftX,
             topLeftY: btnTopLeftY,
             pdfW:     downSize.width,
@@ -263,7 +279,7 @@ async function computeButtonLayout(
         const align = inp.align ?? 'leading'
         normalCX = align === 'center'   ? mL + compositeW / 2 + nx
                  : align === 'trailing' ? mL + (compositeW - rightWidth) + nx
-                 :                        mL + leftWidth + nx - w / 2
+                 :                        mL + nx + w / 2
         normalCY = mT + ny - h / 2
         break
       }
@@ -303,22 +319,24 @@ async function computeButtonLayout(
 // Single PDF → PNG at 2× (used for pressed-state button images)
 // ---------------------------------------------------------------------------
 
-function renderPdfToPng(ctx: Ctx, pdfPath: string, outPath: string): Promise<void> {
+function renderPdfToPng(ctx: Ctx, pdfPath: string, outPath: string, turn: ArtTurn = 0): Promise<void> {
   const SCRIPT = `
 import Foundation
 import CoreGraphics
 import ImageIO
 
 let src = CommandLine.arguments[1]
-let dst = CommandLine.arguments[2]
+let turn = Int(CommandLine.arguments[2]) ?? 0
+let dst = CommandLine.arguments[3]
 let scale: CGFloat = 2
 
 guard let doc = CGPDFDocument(URL(fileURLWithPath: src) as CFURL),
       let page = doc.page(at: 1) else { exit(1) }
 
 let box = page.getBoxRect(.mediaBox)
-let w = max(1, Int(ceil(box.width  * scale)))
-let h = max(1, Int(ceil(box.height * scale)))
+let quarter = turn == 90 || turn == 270
+let w = max(1, Int(ceil((quarter ? box.height : box.width)  * scale)))
+let h = max(1, Int(ceil((quarter ? box.width  : box.height) * scale)))
 
 let ctx = CGContext(
   data: nil, width: w, height: h,
@@ -327,6 +345,13 @@ let ctx = CGContext(
   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue).rawValue
 )!
 ctx.scaleBy(x: scale, y: scale)
+// Clockwise as the picture is seen. CoreGraphics' y axis points up, so a positive angle turns it counterclockwise.
+switch turn {
+case 90:  ctx.translateBy(x: 0, y: box.width);          ctx.rotate(by: -.pi / 2)
+case 180: ctx.translateBy(x: box.width, y: box.height); ctx.rotate(by: .pi)
+case 270: ctx.translateBy(x: box.height, y: 0);         ctx.rotate(by: .pi / 2)
+default:  break
+}
 ctx.drawPDFPage(page)
 
 let img  = ctx.makeImage()!
@@ -334,7 +359,7 @@ let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: dst) as CFURL, "
 CGImageDestinationAddImage(dest, img, nil)
 CGImageDestinationFinalize(dest)
 `
-  return renderSwift(ctx, SCRIPT, [pdfPath], outPath)
+  return renderSwift(ctx, SCRIPT, [pdfPath, String(turn)], outPath)
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +651,64 @@ export function screenSizeFromDeviceType(profile: unknown, capabilities: unknown
   return null
 }
 
+type CornerRadii = { topLeft: number; topRight: number; bottomRight: number; bottomLeft: number }
+
+/** What a device type's `capabilities.plist` says about one of its panels, found by that panel's frame. */
+export interface PanelDisplay {
+  /** The panel's `nativeOrientation`, which its frame is drawn in and its buttons' artwork is not. */
+  artTurn: ArtTurn
+  /** Its screen's corners in points, or null when the plist does not state all four. */
+  cornerRadii: CornerRadii | null
+}
+
+// Xcode 27 states per display what a multi-panel device needs and the frame does not: each corner's radius,
+// and the orientation the panel is natively drawn in. Matched on `chromeIdentifier`, the same id
+// `simctl io enumerate` reports for the panel. An orientation that is not a quarter turn reads as none, which
+// is what every frame was drawn with before this.
+export function panelDisplayFromCapabilities(capabilities: unknown, chromeId: string): PanelDisplay | null {
+  const displays = (capabilities as { capabilities?: { displays?: unknown } } | null)?.capabilities?.displays
+  if (!Array.isArray(displays)) return null
+  const display = displays.find((d) => (d as { chromeIdentifier?: unknown } | null)?.chromeIdentifier === chromeId) as
+    Record<string, unknown> | undefined
+  if (!display) return null
+  const turn = display.nativeOrientation
+  const artTurn: ArtTurn = turn === 90 || turn === 180 || turn === 270 ? turn : 0
+  const corner = (key: string) => typeof display[key] === 'number' && (display[key] as number) >= 0 ? display[key] as number : null
+  const [topLeft, topRight, bottomRight, bottomLeft] = ['cornerRadiusUL', 'cornerRadiusUR', 'cornerRadiusLR', 'cornerRadiusLL'].map(corner)
+  const cornerRadii = topLeft !== null && topRight !== null && bottomRight !== null && bottomLeft !== null
+    ? { topLeft, topRight, bottomRight, bottomLeft }
+    : null
+  return { artTurn, cornerRadii }
+}
+
+async function loadPanelDisplay(ctx: Ctx, profilesDir: string, name: string | undefined, chromeId: string): Promise<PanelDisplay | null> {
+  try {
+    if (!name) return null
+    const path = join(profilesDir, `${name}.simdevicetype`, 'Contents', 'Resources', 'capabilities.plist')
+    return existsSync(path) ? panelDisplayFromCapabilities(await readPlistAsJson(ctx, path), chromeId) : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The screen's corner fields. With the panel's own corners known they win over the frame's outline less its
+ * bezel, which holds for an ordinary iPhone (phone11: 80 − 18 = 62, its stated 62) and not for the Duo
+ * (phone14: 100 − 17 = 83 against 55; phone15: one 54 against 8 at the hinge and 59 outside). The stated
+ * points are scaled into the frame's space, which on phone14 is 626 wide for a 669 pt screen.
+ */
+function cornerFields(
+  display: PanelDisplay | null, fromFrame1x: number, framePerPoint: number, scale: number,
+): Pick<ChromeData, 'screenCornerRadius' | 'screenCornerRadii'> {
+  const stated = display?.cornerRadii
+  if (!stated) return { screenCornerRadius: Math.round(fromFrame1x * scale) }
+  const px = (r: number) => Math.round(r * framePerPoint * scale)
+  const radii = { topLeft: px(stated.topLeft), topRight: px(stated.topRight), bottomRight: px(stated.bottomRight), bottomLeft: px(stated.bottomLeft) }
+  const largest = Math.max(radii.topLeft, radii.topRight, radii.bottomRight, radii.bottomLeft)
+  const uniform = Object.values(radii).every((r) => r === largest)
+  return uniform ? { screenCornerRadius: largest } : { screenCornerRadius: largest, screenCornerRadii: radii }
+}
+
 async function loadProfileScreenSize(ctx: Ctx, profilesDir: string, name: string | undefined): Promise<ScreenSize | null> {
   try {
     if (!name) return null
@@ -655,12 +738,12 @@ async function attachButtonPngs(
 ): Promise<void> {
   for (let i = 0; i < buttons.length; i++) {
     if (i >= drawData.length) continue
-    const pdfPath = drawData[i].pdfPath
-    const cacheKey = `tapflow-btn-normal-${chromeName}-${i}.png`
+    const { pdfPath, turn } = drawData[i]
+    const cacheKey = `tapflow-btn-normal-${chromeName}-${i}${turn ? `-t${turn}` : ''}.png`
     const outPath = join(ctx.cacheDir, cacheKey)
     try {
       if (!existsSync(outPath) || statSync(pdfPath).mtimeMs > statSync(outPath).mtimeMs) {
-        await renderPdfToPng(ctx, pdfPath, outPath)
+        await renderPdfToPng(ctx, pdfPath, outPath, turn)
       }
       buttons[i].buttonPng = readFileSync(outPath).toString('base64')
     } catch { ctx.incomplete = true /* skip if rendering fails */ }
@@ -682,12 +765,12 @@ async function attachPressedPngs(
     const pd = pressedData[i]
     if (!pd) continue
 
-    const cacheKey = `tapflow-btn-pressed-${chromeName}-${i}.png`
+    const cacheKey = `tapflow-btn-pressed-${chromeName}-${i}${pd.turn ? `-t${pd.turn}` : ''}.png`
     const outPath  = join(ctx.cacheDir, cacheKey)
 
     try {
       if (!existsSync(outPath) || statSync(pd.pdfPath).mtimeMs > statSync(outPath).mtimeMs) {
-        await renderPdfToPng(ctx, pd.pdfPath, outPath)
+        await renderPdfToPng(ctx, pd.pdfPath, outPath, pd.turn)
       }
       buttons[i].pressedPng  = readFileSync(outPath).toString('base64')
       buttons[i].pressedRect = {
@@ -714,6 +797,13 @@ export interface DeviceChromeLoaderOptions {
   loadBudgetMs?: number
 }
 
+/** One panel of a multi-panel device, for `DeviceChromeLoader.load`. `width`/`height` are points. */
+export interface ChromePanel {
+  chromeId: string
+  width: number
+  height: number
+}
+
 export class DeviceChromeLoader {
   private readonly run: ChromeRunner
   private readonly chromeMapPath: string
@@ -737,19 +827,26 @@ export class DeviceChromeLoader {
     this.loadBudgetMs = options.loadBudgetMs ?? LOAD_BUDGET_MS
   }
 
-  load(typeIdentifier: string): Promise<ChromeData | null> {
-    const pending = this.loads.get(typeIdentifier)
+  /**
+   * `panel` picks one panel of a multi-panel device (iPhone Duo): its own DeviceKit frame and its size in
+   * points, from `simctl io enumerate`. Without it the frame is the device model's, which is the only one
+   * every other device has.
+   */
+  load(typeIdentifier: string, panel?: ChromePanel): Promise<ChromeData | null> {
+    // Keyed by the panel's frame too: the Duo's two panels are two chromes of one device type.
+    const key = panel ? `${typeIdentifier}#${panel.chromeId}` : typeIdentifier
+    const pending = this.loads.get(key)
     if (pending) return pending
     const budget = new AbortController()
     const timer = setTimeout(() => budget.abort(), this.loadBudgetMs)
     timer.unref?.()
     const ctx: Ctx = { run: this.run, signal: budget.signal, cacheDir: this.cacheDir, incomplete: false }
-    const loading = this.loadUncached(typeIdentifier, ctx).catch(() => null).finally(() => clearTimeout(timer))
-    this.loads.set(typeIdentifier, loading)
+    const loading = this.loadUncached(typeIdentifier, ctx, panel).catch(() => null).finally(() => clearTimeout(timer))
+    this.loads.set(key, loading)
     // A load that skipped a button still gives this boot a device, but is not kept: the budget usually runs
     // out in the button renders, and remembering that result would hide those buttons until a restart. What
     // did render is on disk, so the next boot picks up where this one stopped.
-    void loading.then((chrome) => { if (!chrome || ctx.incomplete) this.loads.delete(typeIdentifier) })
+    void loading.then((chrome) => { if (!chrome || ctx.incomplete) this.loads.delete(key) })
     return loading
   }
 
@@ -762,18 +859,23 @@ export class DeviceChromeLoader {
     return types
   }
 
-  private async loadUncached(typeIdentifier: string, ctx: Ctx): Promise<ChromeData | null> {
+  private async loadUncached(typeIdentifier: string, ctx: Ctx, panel?: ChromePanel): Promise<ChromeData | null> {
     try {
       const types = await this.listDeviceTypes(ctx)
       const typeInfo = types.find(t => t.identifier === typeIdentifier)
-      const modelId = typeInfo?.modelIdentifier
-      if (!modelId) return null
+      let chromeIdentifier = panel?.chromeId
+      if (!chromeIdentifier) {
+        const modelId = typeInfo?.modelIdentifier
+        if (!modelId) return null
+        const chromeMap = await readPlistAsJson(ctx, this.chromeMapPath) as Record<string, { ChromeIdentifier: string }>
+        const entry = chromeMap[modelId]
+        if (!entry) return null
+        chromeIdentifier = entry.ChromeIdentifier
+      }
 
-      const chromeMap = await readPlistAsJson(ctx, this.chromeMapPath) as Record<string, { ChromeIdentifier: string }>
-      const entry = chromeMap[modelId]
-      if (!entry) return null
-
-      const chromeName = entry.ChromeIdentifier.split('.').pop()!
+      const chromeName = chromeIdentifier.split('.').pop()!
+      // Only a panel load asks: a single-panel device keeps the frame-derived corners it always had.
+      const display = panel ? await loadPanelDisplay(ctx, this.profilesDir, typeInfo?.name, panel.chromeId) : null
       const resourcesDir = join(this.chromeDir, `${chromeName}.devicechrome`, 'Contents', 'Resources')
       const chromeJsonPath = join(resourcesDir, 'chrome.json')
       if (!existsSync(chromeJsonPath)) return null
@@ -819,7 +921,7 @@ export class DeviceChromeLoader {
         const screenCornerRadius1x = Math.max(0, outerRadius - bezelInset)
 
         const { margins: btnM, drawData, buttons, pressedData } = await computeButtonLayout(
-          ctx, rawInputs, resourcesDir, pdfSize.width, pdfSize.height, scale, leftWidth, rightWidth,
+          ctx, rawInputs, resourcesDir, pdfSize.width, pdfSize.height, scale, rightWidth, display?.artTurn,
         )
 
         const expandedW = pdfSize.width  + btnM.left + btnM.right
@@ -856,7 +958,7 @@ export class DeviceChromeLoader {
             bottom: Math.round(paddingBottom * scale),
           },
           screenRect,
-          screenCornerRadius: Math.round(screenCornerRadius1x * scale),
+          ...cornerFields(display, screenCornerRadius1x, panel ? screenW / panel.width : 1, scale),
           logicalWidth:  Math.round(screenW),
           logicalHeight: Math.round(screenH),
           buttons,
@@ -897,7 +999,8 @@ export class DeviceChromeLoader {
       const cornerH = cornerSize.height  // should equal topHeight from sizing
 
       // Get logical screen dimensions from the device type's plists
-      const screenSize = await loadProfileScreenSize(ctx, this.profilesDir, typeInfo?.name)
+      // A panel brings its own size: the device type's plists describe one panel, and on the Duo the cover.
+      const screenSize = panel ? { width: panel.width, height: panel.height } : await loadProfileScreenSize(ctx, this.profilesDir, typeInfo?.name)
       if (!screenSize) return null
       const screenW = screenSize.width
       const screenH = screenSize.height
@@ -910,7 +1013,7 @@ export class DeviceChromeLoader {
       const screenCornerRadius1x = Math.max(0, outerRadius - bezelInset)
 
       const { margins: btnM, drawData, buttons, pressedData } = await computeButtonLayout(
-        ctx, rawInputs, resourcesDir, compositeW, compositeH, scale, leftWidth, rightWidth,
+        ctx, rawInputs, resourcesDir, compositeW, compositeH, scale, rightWidth, display?.artTurn,
       )
 
       const expandedW = compositeW + btnM.left + btnM.right
@@ -954,7 +1057,7 @@ export class DeviceChromeLoader {
           bottom: Math.round(paddingBottom * scale),
         },
         screenRect,
-        screenCornerRadius: Math.round(screenCornerRadius1x * scale),
+        ...cornerFields(display, screenCornerRadius1x, 1, scale),
         logicalWidth:  screenW,
         logicalHeight: screenH,
         buttons,

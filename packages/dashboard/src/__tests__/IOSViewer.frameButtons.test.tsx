@@ -277,7 +277,11 @@ describe('IOSViewer — frame buttons are pressed through their own elements', (
       fireEvent.pointerEnter(target(container, 'volume-up'))
       expect(screen.getByText('Volume Down')).toBeTruthy()
 
+      // Past the turn's animation, which holds input while it runs.
+      const now = performance.now()
+      const clock = vi.spyOn(performance, 'now').mockReturnValue(now + 1_000)
       fireEvent.pointerDown(target(container, 'volume-up'), { pointerId: 1, button: 0 })
+      clock.mockRestore()
       expect(phases(send)).toEqual(['volume-up:down'])
     })
 

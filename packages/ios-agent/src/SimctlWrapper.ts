@@ -75,6 +75,7 @@ import type { Device, DeviceStatus } from '@tapflowio/agent-core'
 import type { FormFactor } from '@tapflowio/protocol'
 import { defaultRunner, OutputTooLargeError, type SimctlRunner } from './simctl.js'
 import { KeyboardHelperDaemon } from './KeyboardHelperDaemon.js'
+import { parseIntegratedScreens, countIntegratedPanels, typePanels, type IntegratedScreen, type TypePanel } from './panels.js'
 
 interface SimctlDevice {
   udid: string
@@ -117,11 +118,21 @@ export class ClipboardTooLargeError extends PlatformError {}
 
 /** Bounds the device-type lookup in `formFactorsByType`. Generous: it runs once per connect. */
 const DEVICE_TYPES_TIMEOUT_MS = 10_000
+const IO_ENUMERATE_TIMEOUT_MS = 10_000
+const PLUTIL_TIMEOUT_MS = 5_000
+
+/** A plist as JSON, the way `plutil` converts it. Injectable so tests never read the host's device types. */
+export type PlistReader = (path: string) => Promise<unknown>
+const defaultPlistReader: PlistReader = async (path) =>
+  JSON.parse((await execFileAsync('plutil', ['-convert', 'json', '-o', '-', path], { timeout: PLUTIL_TIMEOUT_MS })).stdout)
 
 export class SimctlWrapper {
   private readonly kbd = new KeyboardHelperDaemon()
 
-  constructor(private readonly runner: SimctlRunner = defaultRunner) {}
+  constructor(
+    private readonly runner: SimctlRunner = defaultRunner,
+    private readonly readPlist: PlistReader = defaultPlistReader,
+  ) {}
 
   /**
    * `timeoutMs` bounds the underlying `xcrun simctl list`. Left off everywhere except the boot poll:
@@ -172,6 +183,42 @@ export class SimctlWrapper {
       if (t.identifier && f) map.set(t.identifier, f)
     }
     return map
+  }
+
+  /**
+   * How many integrated panels each of `typeIds` has, from its `capabilities.plist`. A type whose plist
+   * cannot be read counts as one panel: that is every device type before the Duo, and a wrong "one" leaves
+   * a multi-panel device on the Indigo path, which is how it behaved before this existed.
+   */
+  async integratedPanelCounts(typeIds: string[]): Promise<Map<string, number>> {
+    const wanted = new Set(typeIds)
+    const counts = new Map<string, number>()
+    if (wanted.size === 0) return counts
+    const out = await this.runner.execWithOpts({ timeoutMs: DEVICE_TYPES_TIMEOUT_MS }, 'list', 'devicetypes', '-j')
+    const parsed = JSON.parse(out) as { devicetypes?: Array<{ identifier?: string; bundlePath?: string }> }
+    await Promise.all((parsed.devicetypes ?? []).map(async (t) => {
+      if (!t.identifier || !t.bundlePath || !wanted.has(t.identifier)) return
+      const plist = await this.readPlist(join(t.bundlePath, 'Contents', 'Resources', 'capabilities.plist')).catch(() => null)
+      counts.set(t.identifier, countIntegratedPanels(plist))
+    }))
+    return counts
+  }
+
+  /** The integrated panels of `typeId` — empty when the type or its plist lists none (Xcode 26). **Rejects when
+   *  the plist cannot be read**, unlike `integratedPanelCounts`: `TypePanels` keeps an answer for the life of the
+   *  process and drops only a rejection, so a slow `plutil` read as "no panels" stood until the agent restarted —
+   *  the unfolded panel drawn a quarter off, and the panels at two scales. */
+  async typePanels(typeId: string): Promise<TypePanel[]> {
+    const out = await this.runner.execWithOpts({ timeoutMs: DEVICE_TYPES_TIMEOUT_MS }, 'list', 'devicetypes', '-j')
+    const parsed = JSON.parse(out) as { devicetypes?: Array<{ identifier?: string; bundlePath?: string }> }
+    const type = (parsed.devicetypes ?? []).find((t) => t.identifier === typeId)
+    if (!type?.bundlePath) return []
+    return typePanels(await this.readPlist(join(type.bundlePath, 'Contents', 'Resources', 'capabilities.plist')))
+  }
+
+  /** The integrated panels of a booted device. Their UUIDs change on every boot, so this is read per boot. */
+  async integratedScreens(udid: string): Promise<IntegratedScreen[]> {
+    return parseIntegratedScreens(await this.runner.execWithOpts({ timeoutMs: IO_ENUMERATE_TIMEOUT_MS }, 'io', udid, 'enumerate'))
   }
 
   async boot(deviceId: string): Promise<void> {

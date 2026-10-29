@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest'
-import { avdHomes, classifyAvd, formFactorOf, parseIni } from '../avdConfig'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { afterEach, describe, expect, it } from 'vitest'
+import { avdHomes, avdRotationLockMemory, classifyAvd, formFactorOf, parseIni } from '../avdConfig'
 
 // What kind of device an AVD is, read from its config.ini before it boots — the dashboard draws the
 // boot skeleton from it. Fixtures are the keys that matter, copied from AVDs on a real Mac on
@@ -147,5 +150,31 @@ describe('formFactorOf', () => {
   it('says nothing, without throwing, when the files are not there', () => {
     expect(formFactorOf('Ghost', {}, '/h', files({}))).toBeUndefined()
     expect(formFactorOf('NoConfig', {}, '/h', files({ '/h/.android/avd/NoConfig.ini': 'path=/x\n' }))).toBeUndefined()
+  })
+})
+
+// Freed once per AVD, remembered beside it — a recreated AVD starts over. Mutations: keep it anywhere else;
+// treat an AVD that cannot be found as one to free (it would be freed on every boot, with nowhere to remember).
+describe('avdRotationLockMemory', () => {
+  const saved = process.env.ANDROID_AVD_HOME
+  let home = ''
+  afterEach(() => {
+    if (saved === undefined) delete process.env.ANDROID_AVD_HOME
+    else process.env.ANDROID_AVD_HOME = saved
+    if (home) rmSync(home, { recursive: true, force: true })
+  })
+  it('remembers freeing an AVD beside it, and never frees one it cannot find', () => {
+    home = mkdtempSync(join(tmpdir(), 'tapflow-avd-'))
+    process.env.ANDROID_AVD_HOME = home
+    mkdirSync(join(home, 'Pixel.avd'))
+    writeFileSync(join(home, 'Pixel.ini'), `path=${join(home, 'Pixel.avd')}\n`)
+    expect(avdRotationLockMemory.freed('Pixel')).toBe(false)
+    avdRotationLockMemory.markFreed('Pixel')
+    expect(avdRotationLockMemory.freed('Pixel')).toBe(true)
+    expect(avdRotationLockMemory.freed('Missing')).toBe(true)
+    // A lock tapflow writes later is tapflow's again. Mutation: forget nothing.
+    avdRotationLockMemory.forget('Pixel')
+    expect(avdRotationLockMemory.freed('Pixel')).toBe(false)
+    avdRotationLockMemory.forget('Missing')
   })
 })

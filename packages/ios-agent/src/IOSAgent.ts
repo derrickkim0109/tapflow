@@ -5,7 +5,7 @@ import { tmpdir } from 'os'
 import { randomUUID } from 'crypto'
 import { spawn } from 'child_process'
 import { WebSocket } from 'ws'
-import type { BootAbandonReason, ClipboardErrorPayload, Device, DeviceAgent, NetworkControlCapability, NetworkStatePayload, UIElement } from '@tapflowio/agent-core'
+import type { BootAbandonReason, ClipboardErrorPayload, Device, DeviceAgent, DevicePosture, NetworkControlCapability, NetworkStatePayload, PosturableAgent, UIElement } from '@tapflowio/agent-core'
 import type { RunResetStep } from '@tapflowio/agent-core/utils'
 import { createLogger, PlatformError, ValidationError, bootAbandonMessage, BOOT_NO_SESSION_STATE, SHUTDOWN_NO_SESSION_STATE, downloadBuild } from '@tapflowio/agent-core'
 import type {
@@ -98,8 +98,16 @@ import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio
 import { enumerateSimPids } from './SimProcessTree.js'
 import { MjpegStreamer } from './MjpegStreamer.js'
 import { TouchHelper } from './TouchHelper.js'
+import type { InputChannel } from './InputChannel.js'
+import { FoldableInput } from './FoldableInput.js'
+import { GuestHelper, defaultGuestHelperNative, type GuestHelperNative } from './GuestHelper.js'
+import { PanelState, FOLD_SETTLE_MS, type PanelReading, type Rotation } from './PanelState.js'
+import { PhysicalOrientation, ORIENTATION_DEGREES, turned, type DeviceOrientation } from './PhysicalOrientation.js'
+import type { GuestOrientation } from './GuestHelper.js'
+import type { IntegratedScreen } from './panels.js'
 import { XCUITreeReader } from './XCUITreeReader.js'
-import { DeviceChromeLoader, type ChromeData } from './DeviceChromeLoader.js'
+import { DeviceChromeLoader, type ChromeData, type ChromePanel } from './DeviceChromeLoader.js'
+import { TypePanels, panelFrame } from './TypePanels.js'
 import { KEY_CODE_MAP, MODIFIER_BITS } from './KeyCodeMap.js'
 
 // whole-sim audio: how often to re-enumerate the simulator's process tree for new audio-producing
@@ -142,7 +150,59 @@ export interface IOSAgentOptions {
   /** Device frame loading. Under vitest the default points at directories that do not exist, so a suite never
    *  reads the developer's Xcode chrome or spends seconds rendering it. */
   chromeLoader?: DeviceChromeLoader
+  /** Which panel a multi-panel device shows (devicectl). Injectable so a suite never runs devicectl. */
+  panelState?: PanelState
+  /** Which way a multi-panel device is held (devicectl). Injectable for the same reason. */
+  physicalOrientation?: PhysicalOrientation
+  /** How a multi-panel device's in-simulator helper is spawned and found. Injectable for the same reason. */
+  guestHelperNative?: GuestHelperNative
+  /** How long a fold may take to light its panel before it counts as failed. Injectable so a suite does not
+   *  wait the real 10 s on the path where it never does. */
+  foldSettleMs?: number
+  /** How often a multi-panel device's lit panel is read while a session is on it, to follow a fold made
+   *  outside tapflow (DeviceHub). Injectable for the same reason. */
+  panelPollMs?: number
+  /** The same, once nothing has moved for `panelQuietMs`. Injectable for the same reason. */
+  panelIdlePollMs?: number
+  panelQuietMs?: number
+  /** How long a boot waits for a multi-panel device's helper to be ready. Injectable for the same reason. */
+  helperBootReadyMs?: number
 }
+
+// The postures of a multi-panel device (iPhone Duo), most closed first as the protocol requires. Two, not
+// DeviceHub's three: its `flat` (180°) lights the same panel as `open`, and a step between them would read
+// as a press that did nothing — the reason Android's list leaves out HALF_OPENED's twin. Labels match Android's.
+const FOLDABLE_POSTURES: DevicePosture[] = [{ id: 'closed', label: 'Folded' }, { id: 'open', label: 'Unfolded' }]
+// The angles DeviceHub's pose picker sweeps to (closed reads ≈3° after it). Unfolded is its flat pose, 180°, not
+// its half-open 130°: both light the same panel, and unfolded means opened all the way — 130 left DeviceHub
+// showing the device half open after tapflow unfolded it.
+const POSTURE_DEGREES: Record<string, number> = { closed: 0, open: 180 }
+// devicectl costs ~0.23 s a read, so this is a fold made outside tapflow showing up within a few seconds,
+// not a frame-rate watch. And only while something is moving: each read also costs ~0.2 s of CPU, so a 2 s
+// poll held ~18% of a core for as long as a session was open (measured, 8 GB Mac mini). Once nothing has
+// changed for PANEL_QUIET_MS it reads every PANEL_IDLE_POLL_MS — a fold in DeviceHub on a device left alone
+// shows within 6 s rather than 2 — and the first change it sees, or a fold or turn sent from tapflow, brings
+// it back.
+const PANEL_POLL_MS = 2_000
+const PANEL_IDLE_POLL_MS = 6_000
+const PANEL_QUIET_MS = 30_000
+// How long a boot waits for a multi-panel device's helper. A helper that dies without saying `fatal` is
+// relaunched on a rolling budget for ever, which is right for a session already on the device and wrong for a
+// boot, which would otherwise never answer. Four of the helper's own 15 s start-up deadlines.
+const HELPER_BOOT_READY_MS = 60_000
+// How long a turn sent through the helper has to show up in `devicectl device orientation get`. M1 read each
+// one back 2.5 s after sending and every one had landed; the wait ends as soon as it does.
+const ROTATE_SETTLE_MS = 3_000
+// `rotation-helper` takes UIInterfaceOrientation's names, whose landscapes are the device's the other way round:
+// what it calls `landscapeRight` devicectl reads back as `landscapeLeft` (measured, Xcode 27 host, iOS 26.5).
+const PURPLE_ARGS: Record<DeviceOrientation, 'portrait' | 'landscapeLeft' | 'landscapeRight' | 'portraitUpsideDown'> = {
+  portrait: 'portrait', landscapeRight: 'landscapeLeft', portraitUpsideDown: 'portraitUpsideDown', landscapeLeft: 'landscapeRight',
+}
+// The helper's labels are the physical orientations' own names, on both of the Duo's panels (measured).
+const ORIENT_LABELS: Record<DeviceOrientation, GuestOrientation> = {
+  portrait: 'portrait', landscapeRight: 'landscape-right', portraitUpsideDown: 'pud', landscapeLeft: 'landscape-left',
+}
+
 
 interface DeviceState {
   sessionId: string
@@ -158,7 +218,8 @@ interface DeviceState {
   /** Seqs held by a `handleDeviceBoot` that has not returned yet. */
   bootsInFlight: Set<number>
   deviceId: string
-  touchHelper: TouchHelper | null
+  /** The device's input channel — `TouchHelper` or `FoldableInput`, chosen in `createInputChannel` only. */
+  touchHelper: InputChannel | null
   // Device-booted flag for truthful input acks — set on device:boot, cleared on shutdown; false after a reconnect until the ack path re-verifies once via simctl.
   booted: boolean
   streamWs: WebSocket | null
@@ -167,8 +228,14 @@ interface DeviceState {
   // request an on-demand IDR for drop-to-keyframe recovery. null on the MjpegStreamer path.
   captureStreamer: ScreenCaptureStreamer | null
   bootSeq: number
-  orientation: 'portrait' | 'landscapeRight'
   loadedChrome: ChromeData | null
+  /** The boot's first frame load has finished, whatever it returned — `resendChrome`'s gate. Not `loadedChrome`:
+   *  a model frame that failed to load left it null, and the lit panel's frame was then never sent. */
+  chromeSettled: boolean
+  /** The `streamRotation` the last `session:chrome` carried — a turn within one panel re-sends the same frame. */
+  sentRotation: ChromeData['streamRotation']
+  /** The `scaleBasis` the last `session:chrome` carried. */
+  sentBasis: number | undefined
   // tracks whether the software keyboard is currently visible so we can send ⌘K
   // in the correct direction. reset to false on any hardware key event because
   // iOS auto-hides the software keyboard whenever a hardware key is pressed.
@@ -192,7 +259,7 @@ interface DeviceState {
   audioVolume: number
 }
 
-export class IOSAgent implements DeviceAgent, NetworkControlCapability {
+export class IOSAgent implements DeviceAgent, NetworkControlCapability, PosturableAgent {
   private readonly simctl: SimctlWrapper
   private readonly network: SimulatorNetwork
   private readonly fps: number
@@ -266,6 +333,37 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
   // queries by bundleId; kept outside DeviceState so it survives a relay reconnect
   // (which clears deviceStates) while the app keeps running in the simulator.
   private lastBundleIds = new Map<string, string>()
+  // **A multi-panel device (iPhone Duo) is known per device id, from the connect, not from a boot.** A
+  // reconnect re-seeds sessions with no `device:boot`, and `ensureTouchHelper` then builds the channel with
+  // nothing else to go on — so the answer must already be here, or an agent restart would hand the Duo an
+  // Indigo channel that answers success and lands nowhere.
+  private multiPanelDevices = new Set<string>()
+  // Each device's type, from the connect: re-sending a panel's frame after a fold has no boot to read it from.
+  private deviceTypeIds = new Map<string, string>()
+  // The guest helper and the panels' display UUIDs are keyed by device and live outside `DeviceState`:
+  // every relay reconnect rebuilds that map, and stopping the helper there would hide the fold control
+  // (no helper, no postures) until something respawned it. They are stopped by the device's own teardown
+  // — `stopGuest` — and nowhere else.
+  private readonly guests = new Map<string, GuestHelper>()
+  private readonly guestScreens = new Map<string, Map<number, IntegratedScreen>>()
+  private readonly panelState: PanelState
+  private readonly physical: PhysicalOrientation
+  // A multi-panel device type's panels: each one's native turn, and the scale every panel is drawn at.
+  private readonly typePanels: TypePanels
+  private readonly guestHelperNative: GuestHelperNative
+  private readonly foldSettleMs: number
+  private readonly panelPollMs: number
+  private readonly panelIdlePollMs: number
+  private readonly panelQuietMs: number
+  private readonly helperBootReadyMs: number
+  private readonly panelPolls = new Map<string, ReturnType<typeof setTimeout>>()
+  // When each device's panel or orientation last moved, or tapflow last moved it: the poll is fast after that.
+  private readonly panelActivity = new Map<string, number>()
+  private readonly panelRechecks = new Map<string, ReturnType<typeof setTimeout>>()
+  // A posture change in flight per device: a second press during a fold is a double-press, dropped like Android's.
+  private readonly posturing = new Set<string>()
+  // The posture last reported per device, so the poll reports only a change.
+  private readonly reportedPosture = new Map<string, string | null>()
   private readonly uiTreeReader = new XCUITreeReader()
   // Holds a macOS power assertion while connected so the host doesn't idle-throttle the
   // simulator capture/encode when the Mac is unattended. No-op off macOS.
@@ -308,6 +406,18 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
     // reason, as `sleepBlocker` below.
     this.lean = options.lean ?? false
     // Never the host's real store under vitest, for the reason given for `network` just below.
+    this.panelState = options.panelState ?? new PanelState()
+    // Never the host's devicectl under vitest: every single-panel boot reads the orientation, and on an Xcode 27
+    // host a real call would read whatever simulator the developer has under that udid. A suite gets the
+    // Xcode 26 answer — unreadable, so tapflow remembers — unless it injects one.
+    this.physical = options.physicalOrientation ?? new PhysicalOrientation(process.env.VITEST
+      ? { readOrientation: () => Promise.reject(new Error('no devicectl under vitest')) } : undefined)
+    this.guestHelperNative = options.guestHelperNative ?? defaultGuestHelperNative
+    this.foldSettleMs = options.foldSettleMs ?? FOLD_SETTLE_MS
+    this.panelPollMs = options.panelPollMs ?? PANEL_POLL_MS
+    this.panelIdlePollMs = options.panelIdlePollMs ?? PANEL_IDLE_POLL_MS
+    this.panelQuietMs = options.panelQuietMs ?? PANEL_QUIET_MS
+    this.helperBootReadyMs = options.helperBootReadyMs ?? HELPER_BOOT_READY_MS
     this.leanStore = options.leanStore ?? new LeanStore(process.env.VITEST ? path.join(tmpdir(), 'tapflow-no-lean-store') : undefined, MANAGED_LABELS)
     this.network = options.network ?? new SimulatorNetwork(
       this.simctl,
@@ -324,6 +434,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
     this.chromeLoader = options.chromeLoader ?? new DeviceChromeLoader(process.env.VITEST
       ? { run: () => Promise.reject(new Error('no chrome under vitest')) }
       : {})
+    this.typePanels = new TypePanels(this.simctl, this.chromeLoader)
     this.deviceFilter = options.deviceFilter
     this.token = options.token
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000
@@ -371,6 +482,28 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
         return this.formFactors
       },
     )
+    // Whether each device has more than one integrated panel. A failed lookup keeps the last answer, like the
+    // form factors above; with no answer at all every device stays on the Indigo path, which is how a
+    // multi-panel device behaved before this existed. Wrapped so a simctl without the method cannot throw here.
+    await Promise.resolve()
+      .then(() => this.simctl.integratedPanelCounts([...new Set(allDevices.flatMap((d) => (d.typeId ? [d.typeId] : [])))]))
+      .then(
+        (counts) => {
+          this.multiPanelDevices = new Set(allDevices.filter((d) => d.typeId && (counts.get(d.typeId) ?? 1) > 1).map((d) => d.id))
+          this.deviceTypeIds = new Map(allDevices.flatMap((d) => (d.typeId ? [[d.id, d.typeId] as const] : [])))
+        },
+        (e: unknown) => logger.warn(`could not read the devices' panels, keeping the last answer: ${e instanceof Error ? e.message : String(e)}`),
+      )
+    // **A multi-panel device this Mac cannot drive is not offered.** Its input has no other path, so listing it
+    // would let a tester — or an MCP agent's `list_devices` — pick a device that boots and then refuses.
+    let offered = devices
+    if (devices.some((d) => this.multiPanelDevices.has(d.id))) {
+      const reason = await this.guestHelperNative.unavailableReason().catch((e: unknown) => String(e))
+      if (reason) {
+        logger.warn(`not offering ${devices.filter((d) => this.multiPanelDevices.has(d.id)).map((d) => d.name).join(', ')}: ${reason}`)
+        offered = devices.filter((d) => !this.multiPanelDevices.has(d.id))
+      }
+    }
 
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(relayUrl, this.wsClientOptions())
@@ -392,13 +525,14 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
           capabilities: AGENT_CAPABILITIES,
           agentId: getMachineId(),
           agentName: os.hostname(),
-          devices: devices.map((d) => ({
+          devices: offered.map((d) => ({
             id: d.id,
             name: d.name,
             platform: d.platform,
             status: d.status,
             osVersion: d.osVersion,
-            formFactor: d.typeId ? formFactors.get(d.typeId) : undefined,
+            // A device with more than one panel folds, whatever its product family says (the Duo is an iPhone).
+            formFactor: this.multiPanelDevices.has(d.id) ? 'foldable' : d.typeId ? formFactors.get(d.typeId) : undefined,
             serviceTier: this.reportedTier(d),
           })),
         })
@@ -492,8 +626,10 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
         bootSeq: 0,
         bootAbandon: new Map(),
         bootsInFlight: new Set(),
-        orientation: 'portrait',
         loadedChrome: null,
+        chromeSettled: false,
+        sentRotation: undefined,
+        sentBasis: undefined,
         softKeyboardVisible: false,
         acceptH264: false,
         secureContext: false,
@@ -517,6 +653,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
       this.cleanupDeviceState(state)
     }
     this.deviceStates.clear()
+    for (const deviceId of [...this.guests.keys()]) this.stopGuest(deviceId)
     this.uiTreeReader.stop()
     // The liveness watcher outlives every device it was started for, so it is stopped here with the
     // other things that tick. It is `unref`'d, which is why nobody noticed it had no caller.
@@ -640,7 +777,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
     // now that a helper revives itself on death, an orphan would also keep respawning with
     // nobody left holding a reference to stop it.
     state.touchHelper?.stop()
-    state.touchHelper = new TouchHelper(device.id)
+    state.touchHelper = this.createInputChannel(device.id)
     state.touchHelper.start()
     this.sendOn(this.ws, {
       type: 'session:deviceInfo',
@@ -653,17 +790,35 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
     // Awaited where it used to block: a cold load is seconds of swift renders. A newer boot or a shutdown can
     // land meanwhile, so the result is stored only after the seq is checked — otherwise a slow stale load
     // would overwrite the chrome a faster newer boot already set, and the button path reads it.
-    const chrome = await this.chromeLoader.load(device.typeId ?? device.name)
+    // A multi-panel device shows its lit panel's frame; until the panels are known it gets the model's, and
+    // `applyLitPanel` replaces it once they are.
+    // A multi-panel device's scale comes with its first frame, from its type, so a viewer sizes it once.
+    const multiPanel = this.multiPanelDevices.has(device.id) && device.typeId
+    const [chrome, basis] = await Promise.all([
+      this.chromeLoader.load(device.typeId ?? device.name, this.chromePanel(device.id)),
+      multiPanel ? this.typePanels.scaleBasis(multiPanel) : undefined,
+    ])
     if (seq !== state.bootSeq) return false
     const ws = this.ws
     if (ws?.readyState !== WebSocket.OPEN) return true
     state.loadedChrome = chrome
-    if (!chrome) return true
+    state.chromeSettled = true
+    if (!chrome) {
+      // The model's frame did not load; the lit panel's has its own and may.
+      if (this.multiPanelDevices.has(device.id)) void this.resendChrome(device.id)
+      return true
+    }
+    state.sentRotation = this.chromeRotation(device.id)
+    state.sentBasis = basis
     this.sendOn(ws, {
       type: 'session:chrome',
       sessionId: state.sessionId,
-      payload: chrome,
+      payload: this.forViewer(chrome, state.sentRotation, state.sentBasis),
     })
+    // A multi-panel device's panels can become known while the load above was running — the helper reads them
+    // in parallel with the boot — and the frame just sent may be the model's. Settled here, from whichever
+    // side finishes last: `resendChrome` replaces it only if the lit panel's frame differs.
+    if (this.multiPanelDevices.has(device.id)) void this.resendChrome(device.id)
     return true
   }
 
@@ -687,7 +842,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
         external: state.external,
         override: process.env.TAPFLOW_IOS_MAX_SIZE ?? process.env.TAPFLOW_MAX_SIZE,
       })
-      const capture = new ScreenCaptureStreamer(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize)
+      // A multi-panel device is captured at its lit panel; a restart re-applies it here, since a stdin switch
+      // lives only as long as the helper it was written to.
+      const panel = this.multiPanelDevices.has(state.deviceId) ? this.litPanel(state.deviceId) : null
+      const capture = new ScreenCaptureStreamer(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize,
+        panel ? { width: panel.width, height: panel.height } : null)
       state.captureStreamer = capture
       stream = capture.start()
     }
@@ -869,6 +1028,10 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
       // Read before anything below changes it: a Full reset shuts the device down itself, and `unknown`
       // (booting, shutting down) is a device paying a boot's cost now.
       const cold = fullErase || retier || target.status !== 'booted'
+      // A device this boot brings up gets a new helper and fresh readings. One left from before was serving a
+      // simulator that is gone — shut down outside tapflow (DeviceHub quitting takes every one), or about to be
+      // — and kept, the boot waited out its respawn cooldown and started from the panel lit before.
+      if (cold) this.stopGuest(deviceId)
 
       if (fullErase) {
         // `simctl erase` only accepts a shut-down device, and a device is often already running —
@@ -964,21 +1127,63 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
       await this.network.arm(deviceId).catch((e: unknown) => {
         logger.warn('could not arm the network injection:', (e as Error).message)
       })
-      // **Stand it up (#910).** A fresh viewer always starts portrait, and a simulator left turned —
-      // by a session whose undo never arrived, or one an agent restart reset the memory of — would
-      // otherwise stream sideways under an upright frame, with every later press inverted. Queued with
-      // the rotations, so one still in flight from before a re-register lands first and is overridden.
-      // Best-effort: a failure leaves the simulator where it was, and the boot goes on.
-      await this.enqueueRotation(deviceId, async () => {
-        await this.simctl.rotate(deviceId, 'portrait')
-        state.orientation = 'portrait'
-      })
+      // **Where it is held, before the first frame says so** (#910). The orientation is the device's, shared with
+      // DeviceHub and every viewer, so it is read and reported as it is, and a reload or a second viewer joins it
+      // there rather than turning it under the first. It is stood up only when there is nothing to report — no
+      // reading and nothing remembered — and **for a run**: a flow replays from the same orientation every time,
+      // whatever a person left the device in (`runReset` is a run's boot; review finding). Queued with the
+      // rotations, so one still in flight lands first. A multi-panel device reads its own through its helper.
+      if (!this.multiPanelDevices.has(deviceId)) {
+        await this.enqueueRotation(deviceId, async () => {
+          if (runReset || !(await this.heldSingle(deviceId))) await this.standUp(deviceId)
+        })
+      }
       // Another await — a multi-second one — and `sendChromeData` below starts a helper process. A
       // shutdown or a newer boot arriving in this gap would otherwise get a helper installed for the
       // device it is taking down — and one that revives itself, so the stale reference outlives the
       // boot that returns just below.
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
       if (!(await this.sendChromeData(state, bootedDevice, seq))) { this.abandonBoot(state, seq, sessionId, requestId); return }
+      // **A session with no frame cannot be told the turn**: no `session:chrome` goes out, and its viewer draws
+      // the device upright, as one always started. So that device is stood up, the old guarantee for the one
+      // viewer that still relies on it (review finding).
+      if (!this.multiPanelDevices.has(deviceId) && !state.loadedChrome && this.physical.last(deviceId) !== 'portrait') {
+        await this.enqueueRotation(deviceId, async () => { await this.standUp(deviceId) })
+      }
+      // **A multi-panel device is usable only through its helper**, so the boot is not ready until the helper
+      // is, and a runtime that refuses it fails the boot with the reason. The device is shut down only if this
+      // boot brought it up: one that was already running (DeviceHub, another session) is left as it was found.
+      //
+      // No helper at all is a socket that closed before `sendChromeData` built the channel: the boot carries on
+      // as a single-panel one does, and the relay loss that follows retires it — not a refusal to shut down for.
+      const guest = this.multiPanelDevices.has(deviceId) ? this.guests.get(deviceId) : undefined
+      if (guest) {
+        let limit: ReturnType<typeof setTimeout> | undefined
+        const ready = await Promise.race([
+          guest.whenReady(),
+          new Promise<boolean>((resolve) => { limit = setTimeout(() => resolve(false), this.helperBootReadyMs) }),
+        ]).finally(() => clearTimeout(limit))
+        if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+        if (!ready) {
+          const reason = guest.unavailableReason() ?? `the input helper was not ready within ${this.helperBootReadyMs / 1000}s`
+          this.stopGuest(deviceId)
+          if (cold) await this.simctl.shutdown(deviceId).catch(() => { /* reported below either way */ })
+          throw new PlatformError(`${bootedDevice.name} cannot be used on this Mac: ${reason}`)
+        }
+        // A run replays from the same orientation, as a single-panel device's does (the stand-up above); the Duo
+        // turns through its helper, so only once the helper is up.
+        // Re-described afterwards, as `input:rotate` does: the chrome sent while the helper came up carried the old
+        // turn. The panel poll the turn re-arms would correct it too, but up to its interval later.
+        // A newer boot can arrive while the turn waits in the queue: it neither turns for a boot already superseded
+        // nor goes on to open a stream over the newer one's.
+        if (runReset) {
+          await this.enqueueRotation(deviceId, async () => {
+            if (seq === state.bootSeq) await this.turnHeld(deviceId, undefined, 'portrait', () => seq !== state.bootSeq)
+          })
+          if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+          this.applyLitPanel(deviceId)
+        }
+      }
 
       const streamWs = await this.openStreamWs(state)
       if (seq !== state.bootSeq) {
@@ -1002,6 +1207,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
       // riding inside it: a tester whose device just came up can arm the toggle in the same breath, and
       // a boot that armed nothing still has to say so rather than leaving the control blank.
       void this.reportNetworkState(sessionId)
+      if (this.multiPanelDevices.has(deviceId)) void this.sendPostures(state)
       // An automation client's first selector step would otherwise spend the runner's cold start inside its timeout.
       if (automation) this.uiTreeReader.warm(deviceId)
 
@@ -1128,6 +1334,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
     state.captureStreamer = null // reader.cancel() kills the helper proc; drop the ref so a stale requestKeyframe() no-ops
     state.touchHelper?.stop()
     state.touchHelper = null
+    this.stopGuest(deviceId)
     state.booted = false
     state.streamWs?.close()
     state.streamWs = null
@@ -1217,8 +1424,349 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
   // Lazily set up the touch channel: a reconnect re-issues the session with touchHelper=null while the sim stays booted, so input self-heals without a fresh device:boot. Sync so a tap's start+end stay paired (async would drop touchEnd → stuck finger).
   private ensureTouchHelper(state: DeviceState): void {
     if (state.touchHelper) return
-    state.touchHelper = new TouchHelper(state.deviceId)
+    state.touchHelper = this.createInputChannel(state.deviceId)
     state.touchHelper.start()
+  }
+
+  /**
+   * **The one place a device's input path is chosen** (see `InputChannel`). A device with more than one
+   * integrated panel gets `FoldableInput` over its in-simulator helper; every other device gets the Indigo
+   * `TouchHelper` it always had. A multi-panel device is never given a `TouchHelper`: its writes would
+   * answer success and land on a dark panel or nowhere.
+   */
+  private createInputChannel(deviceId: string): InputChannel {
+    if (!this.multiPanelDevices.has(deviceId)) return new TouchHelper(deviceId)
+    this.ensureGuest(deviceId)
+    return new FoldableInput({
+      guest: () => this.guests.get(deviceId) ?? null,
+      litScreen: () => this.litScreen(deviceId),
+    })
+  }
+
+  private ensureGuest(deviceId: string): void {
+    if (this.guests.has(deviceId)) return
+    const guest = new GuestHelper(
+      deviceId,
+      async () => {
+        const screens = await this.simctl.integratedScreens(deviceId)
+        this.guestScreens.set(deviceId, new Map(screens.map((s) => [s.screenId, s])))
+        const typeId = this.deviceTypeIds.get(deviceId)
+        if (typeId) await this.typePanels.load(typeId)
+        return screens.map((s) => s.uuid)
+      },
+      this.guestHelperNative,
+      {
+        onUnavailable: (reason) => {
+          logger.error(`input for ${deviceId} is unavailable: ${reason}`)
+          // Hide the fold control everywhere, and in the relay's replay cache: a control left up would do nothing.
+          for (const state of this.deviceStates.values()) if (state.deviceId === deviceId) void this.sendPostures(state)
+        },
+        // Back after an outage (the respawn window cleared): show it again, from the device's real posture.
+        onAvailable: () => {
+          for (const state of this.deviceStates.values()) if (state.deviceId === deviceId) void this.sendPostures(state)
+        },
+      },
+    )
+    this.guests.set(deviceId, guest)
+    void guest.start()
+    this.startPanelPoll(deviceId)
+    // Which panel is lit decides where every touch goes and which panel is captured; until a reading arrives
+    // the channel says `starting`. The panels are known once the helper has read them (`whenReady`), and a
+    // stream that started before that captured the largest panel — dark while folded — so it is corrected here.
+    // The way it is held is read alongside, so the first frame a viewer gets after the helper is up is
+    // already turned rather than corrected a poll later.
+    void this.panelState.read(deviceId)
+    void this.physical.read(deviceId)
+    void guest.whenReady()
+      .then((ready) => (ready ? Promise.all([this.panelState.read(deviceId), this.physical.read(deviceId)]) : null))
+      .then(() => this.applyLitPanel(deviceId))
+  }
+
+  /** The lit panel of a multi-panel device, from the last devicectl reading and this boot's panels. */
+  private litPanel(deviceId: string): IntegratedScreen | null {
+    const lit = this.panelState.last(deviceId)?.lit
+    return lit ? this.guestScreens.get(deviceId)?.get(lit.displayId) ?? null : null
+  }
+
+  /**
+   * How far the viewer turns a multi-panel device (`ChromeData.streamRotation`): the way it is held, plus the
+   * lit panel's own native turn — the Duo's unfolded panel is drawn turned 270, so a device held upright
+   * shows it turned 90 (measured: portrait → rot90 … landscapeLeft → rot0). Undefined for a single-panel
+   * device, and until both the orientation and the lit panel have been read.
+   */
+  private chromeRotation(deviceId: string): ChromeData['streamRotation'] {
+    if (!this.multiPanelDevices.has(deviceId)) {
+      const single = this.physical.last(deviceId)
+      return single ? ORIENTATION_DEGREES[single] : undefined
+    }
+    const held = this.physical.last(deviceId)
+    const panel = this.litPanel(deviceId)
+    if (!held || !panel) return undefined
+    const typeId = this.deviceTypeIds.get(deviceId)
+    const native = typeId ? this.typePanels.nativeOrientation(typeId, panel.deviceName) : 0
+    return ((ORIENTATION_DEGREES[held] + 360 - native) % 360) as Rotation
+  }
+
+  /** The cached frame with this send's turn and scale — never written into the loader's shared object. */
+  private forViewer(chrome: ChromeData, streamRotation: ChromeData['streamRotation'], scaleBasis?: number): ChromeData {
+    if (streamRotation === undefined && scaleBasis === undefined) return chrome
+    return {
+      ...chrome,
+      ...(streamRotation === undefined ? {} : { streamRotation }),
+      ...(scaleBasis === undefined ? {} : { scaleBasis }),
+    }
+  }
+
+  /** The lit panel's frame for `DeviceChromeLoader`, or undefined for a single-panel device or an unknown panel. */
+  private chromePanel(deviceId: string): ChromePanel | undefined {
+    if (!this.multiPanelDevices.has(deviceId)) return undefined
+    const panel = this.litPanel(deviceId)
+    return panel ? panelFrame(panel) : undefined
+  }
+
+  /** Point every stream of this device at its lit panel, and give its viewers that panel's frame. */
+  private applyLitPanel(deviceId: string): void {
+    const panel = this.litPanel(deviceId)
+    if (!panel) return
+    for (const state of this.deviceStates.values()) {
+      if (state.deviceId === deviceId) state.captureStreamer?.selectPanel({ width: panel.width, height: panel.height })
+    }
+    void this.resendChrome(deviceId)
+  }
+
+  /**
+   * Load the lit panel's frame and send it as `session:chrome` to every session on this device whose frame
+   * it is not already. `session:chrome` is re-sendable by contract (protocol `InputPosture`), and the relay
+   * caches the last one for a re-joining viewer.
+   */
+  private async resendChrome(deviceId: string): Promise<void> {
+    const typeId = this.deviceTypeIds.get(deviceId)
+    const panel = this.chromePanel(deviceId)
+    if (!typeId || !panel) return
+    const [chrome, basis] = await Promise.all([this.chromeLoader.load(typeId, panel), this.typePanels.scaleBasis(typeId)])
+    const ws = this.ws
+    if (!chrome || ws?.readyState !== WebSocket.OPEN) return
+    for (const state of this.deviceStates.values()) {
+      // Only a session whose boot has finished loading its first frame: one still loading gets the lit panel's
+      // frame from the tail of `sendChromeData`, and sending it here first would be overwritten by the model's.
+      const rotation = this.chromeRotation(deviceId)
+      if (state.deviceId !== deviceId || !state.chromeSettled) continue
+      if (state.loadedChrome === chrome && state.sentRotation === rotation && state.sentBasis === basis) continue
+      state.loadedChrome = chrome
+      state.sentRotation = rotation
+      state.sentBasis = basis
+      this.sendOn(ws, { type: 'session:chrome', sessionId: state.sessionId, payload: this.forViewer(chrome, rotation, basis) })
+    }
+  }
+
+  /** The display UUID of the panel a multi-panel device is showing, or null if not known yet. */
+  private litScreen(deviceId: string): string | null {
+    return this.litPanel(deviceId)?.uuid ?? null
+  }
+
+  /**
+   * Follow a fold made outside tapflow (DeviceHub's picker) while a session is on the device: read the lit
+   * panel, re-point the capture and the frame, and report the posture if it moved. Skipped while tapflow's own
+   * fold is in flight, which reports for itself.
+   */
+  private startPanelPoll(deviceId: string): void {
+    if (this.panelPolls.has(deviceId)) return
+    this.panelActivity.set(deviceId, Date.now())
+    this.schedulePanelPoll(deviceId)
+  }
+
+  private schedulePanelPoll(deviceId: string): void {
+    const quiet = Date.now() - (this.panelActivity.get(deviceId) ?? 0) >= this.panelQuietMs
+    const timer = setTimeout(() => {
+      this.followPanel(deviceId)
+      // Stopped while it ran (`stopGuest`) is stopped for good.
+      if (this.panelPolls.get(deviceId) === timer) this.schedulePanelPoll(deviceId)
+    }, quiet ? this.panelIdlePollMs : this.panelPollMs)
+    timer.unref?.()
+    this.panelPolls.set(deviceId, timer)
+  }
+
+  /** The device's panel or orientation is moving, or about to: the poll goes back to its fast rate now, not
+   *  after the slow wait already scheduled. */
+  private panelMoved(deviceId: string): void {
+    if (!this.panelPolls.has(deviceId)) return
+    this.panelActivity.set(deviceId, Date.now())
+    clearTimeout(this.panelPolls.get(deviceId))
+    this.schedulePanelPoll(deviceId)
+  }
+
+  private followPanel(deviceId: string): void {
+    if (this.posturing.has(deviceId) || this.guests.get(deviceId)?.inputState() !== 'ready') return
+    if (![...this.deviceStates.values()].some((s) => s.deviceId === deviceId && s.booted)) return
+    const pose = () => `${this.panelState.last(deviceId)?.lit?.displayId}:${this.physical.last(deviceId)}`
+    const before = pose()
+    void Promise.all([this.panelState.read(deviceId), this.physical.read(deviceId)]).then(() => {
+      if (pose() !== before) this.panelMoved(deviceId)
+      // The panel it has settled on, not the one just read: one lit only for a moment is not followed.
+      const settled = this.panelState.last(deviceId)
+      if (!settled?.lit || this.posturing.has(deviceId)) return
+      // A new panel is read again once it has had time to hold, rather than at the next poll or two.
+      if (this.panelState.changing(deviceId) && !this.panelRechecks.has(deviceId)) {
+        const recheck = setTimeout(() => { this.panelRechecks.delete(deviceId); this.followPanel(deviceId) }, this.panelState.holdMs)
+        recheck.unref?.()
+        this.panelRechecks.set(deviceId, recheck)
+      }
+      this.applyLitPanel(deviceId)
+      const posture = this.postureOf(deviceId, settled)
+      if (posture !== this.reportedPosture.get(deviceId)) {
+        for (const state of this.deviceStates.values()) if (state.deviceId === deviceId) void this.sendPostures(state)
+      }
+    })
+  }
+
+  /** The device's teardown: shut down, erased, or the agent leaving. Not a relay reconnect — see `guests`. */
+  private stopGuest(deviceId: string): void {
+    clearTimeout(this.panelPolls.get(deviceId))
+    this.panelPolls.delete(deviceId)
+    this.panelActivity.delete(deviceId)
+    clearTimeout(this.panelRechecks.get(deviceId))
+    this.panelRechecks.delete(deviceId)
+    this.reportedPosture.delete(deviceId)
+    this.guests.get(deviceId)?.stop()
+    this.guests.delete(deviceId)
+    this.guestScreens.delete(deviceId)
+    this.panelState.forget(deviceId)
+    this.physical.forget(deviceId)
+  }
+
+  // ── PosturableAgent ────────────────────────────────────────────────────────
+  // A multi-panel device (iPhone Duo) folds through its in-simulator helper's hinge, and which panel is lit
+  // is read back from devicectl — never inferred from the angle sent.
+
+  async listPostures(deviceId: string): Promise<DevicePosture[]> {
+    // The list's length is the capability's real gate: a device that cannot fold, or whose helper is not up
+    // to fold it, answers none, and the viewer shows no control.
+    return this.multiPanelDevices.has(deviceId) && this.guests.get(deviceId)?.inputState() === 'ready' ? FOLDABLE_POSTURES : []
+  }
+
+  async getPosture(deviceId: string): Promise<DevicePosture | null> {
+    if ((await this.listPostures(deviceId)).length === 0) return null
+    const reading = (await this.panelState.read(deviceId)) ?? this.panelState.last(deviceId)
+    const id = reading ? this.postureOf(deviceId, reading) : null
+    return FOLDABLE_POSTURES.find((p) => p.id === id) ?? null
+  }
+
+  async setPosture(deviceId: string, postureId: string): Promise<void> {
+    if (!(await this.listPostures(deviceId)).some((p) => p.id === postureId)) {
+      throw new PlatformError(`Unknown posture "${postureId}" for ${deviceId}`)
+    }
+    const guest = this.guests.get(deviceId)!
+    this.panelMoved(deviceId)
+    const target = [...(this.guestScreens.get(deviceId)?.values() ?? [])]
+      .find((s) => s.deviceName === (postureId === 'closed' ? 'primary' : 'primary-1'))
+    if (!target) throw new PlatformError(`${deviceId} has no ${postureId === 'closed' ? 'cover' : 'unfolded'} panel`)
+    const from = POSTURE_DEGREES[(await this.getPosture(deviceId))?.id ?? (postureId === 'closed' ? 'open' : 'closed')]
+    // **The panel is the answer, not the helper's.** The sweep ending is not the panel changing — measured, the
+    // new panel lights 4–6 s after the command — and on a loaded Mac the helper's answer came after the panel
+    // had lit. So both are watched at once, and a lit panel is success however late the answer.
+    const swept = guest.hinge(from, POSTURE_DEGREES[postureId], 800)
+    const settled = await this.panelState.awaitLit(deviceId, (r) => r.lit?.displayId === target.screenId, this.foldSettleMs)
+    if (!settled) {
+      if (!(await swept)) throw new PlatformError('the hinge did not move')
+      throw new PlatformError(`the ${postureId === 'closed' ? 'cover' : 'unfolded panel'} did not light within ${this.foldSettleMs}ms`)
+    }
+    // Nothing is turned: a fold does not change the way the device is held (measured), so only the frame and
+    // the lit panel's native turn change — which is what DeviceHub shows.
+    this.applyLitPanel(deviceId)
+  }
+
+  /**
+   * Turn a multi-panel device the way it is held, through the helper (Purple and `devicectl orientation set`
+   * do nothing on the Duo — measured). From the orientation read back now, never one remembered: a quarter
+   * turn `direction`, or an older viewer's `target` — where either landscape meets landscape, so asking for
+   * it never flips one into the other, and portrait means upright. Then waits for devicectl to say so, which
+   * is what the re-sent chrome reports; a turn that does not land is logged and the chrome says where the
+   * device really is.
+   */
+  private async turnHeld(deviceId: string, direction?: 'clockwise' | 'counterclockwise', target?: 'portrait' | 'landscape', isStale?: () => boolean): Promise<void> {
+    const guest = this.guests.get(deviceId)
+    this.panelMoved(deviceId)
+    const held = (await this.physical.read(deviceId)) ?? this.physical.last(deviceId)
+    // The read takes a moment, and a caller whose boot was superseded in it must not turn the shared device.
+    if (isStale?.()) return
+    if (!guest || !held) { logger.warn(`rotate ${deviceId}: ${guest ? 'its orientation could not be read' : 'no helper'}, not turning`); return }
+    const landscape = held === 'landscapeLeft' || held === 'landscapeRight'
+    const want: DeviceOrientation | null = direction ? turned(held, direction)
+      : target === 'portrait' ? (held === 'portrait' ? null : 'portrait')
+      : target === 'landscape' ? (landscape ? null : 'landscapeRight')
+      : (landscape ? 'portrait' : 'landscapeRight')
+    if (!want) return
+    if (!(await guest.orient(ORIENT_LABELS[want]))) { logger.warn(`rotate ${deviceId}: the helper did not take ${want}`); return }
+    if (!(await this.physical.await(deviceId, (o) => o === want, ROTATE_SETTLE_MS))) {
+      logger.warn(`rotate ${deviceId}: asked for ${want}, still ${this.physical.last(deviceId) ?? 'unread'} after ${ROTATE_SETTLE_MS}ms`)
+    }
+  }
+
+  /**
+   * Where a single-panel device is held: read (devicectl on Xcode 27, the guest helper before — see
+   * `defaultPhysicalOrientationNative`), else the last known — the last reading, or what tapflow last set on a
+   * host where neither source answers. Read every time, never marked unreadable: one failure right after a
+   * boot would otherwise have left the device on memory for the life of the agent (review finding).
+   */
+  private async heldSingle(deviceId: string): Promise<DeviceOrientation | null> {
+    return (await this.physical.read(deviceId)) ?? this.physical.last(deviceId)
+  }
+
+  /** Turn a device nobody can say the orientation of upright, so there is one to turn from. */
+  private async standUp(deviceId: string): Promise<DeviceOrientation> {
+    await this.simctl.rotate(deviceId, PURPLE_ARGS.portrait)
+    this.physical.note(deviceId, 'portrait')
+    return 'portrait'
+  }
+
+  /**
+   * Turn a single-panel device, through Purple: a quarter turn `direction` from where it is held, or an older
+   * viewer's `target`. **That viewer draws landscape as 270**, so `landscape` means exactly `landscapeLeft` —
+   * the other landscape would show it upside down — and is met only there; `portrait` means upright. A device
+   * whose orientation cannot be read or remembered (an agent restarted under it) is stood up first.
+   */
+  private async turnSingle(deviceId: string, direction?: 'clockwise' | 'counterclockwise', target?: 'portrait' | 'landscape'): Promise<void> {
+    const held = (await this.heldSingle(deviceId)) ?? (await this.standUp(deviceId))
+    const want: DeviceOrientation | null = direction ? turned(held, direction)
+      : target === 'portrait' ? (held === 'portrait' ? null : 'portrait')
+      : target === 'landscape' ? (held === 'landscapeLeft' ? null : 'landscapeLeft')
+      : (held === 'portrait' ? 'landscapeLeft' : 'portrait')
+    if (!want) return
+    await this.simctl.rotate(deviceId, PURPLE_ARGS[want])
+    // Read back once; a host that cannot read at all remembers what it set instead of waiting out the settle.
+    const back = await this.physical.read(deviceId)
+    if (!back) { this.physical.note(deviceId, want); return }
+    if (back !== want && !(await this.physical.await(deviceId, (o) => o === want, ROTATE_SETTLE_MS))) {
+      logger.warn(`rotate ${deviceId}: asked for ${want}, still ${this.physical.last(deviceId) ?? 'unread'} after ${ROTATE_SETTLE_MS}ms`)
+    }
+  }
+
+  /** Re-send the frame each session on this device already has, with the turn it is held at now. */
+  private resendTurn(deviceId: string): void {
+    const ws = this.ws
+    if (ws?.readyState !== WebSocket.OPEN) return
+    const rotation = this.chromeRotation(deviceId)
+    for (const state of this.deviceStates.values()) {
+      // Not to a session whose boot is still running: its frame is the last boot's, and that boot sends its own.
+      if (state.deviceId !== deviceId || !state.loadedChrome || state.bootsInFlight.size > 0 || state.sentRotation === rotation) continue
+      state.sentRotation = rotation
+      this.sendOn(ws, { type: 'session:chrome', sessionId: state.sessionId, payload: this.forViewer(state.loadedChrome, rotation, state.sentBasis) })
+    }
+  }
+
+  /** `closed` while the cover is lit, `open` while the unfolded panel is. */
+  private postureOf(deviceId: string, reading: PanelReading): string | null {
+    const lit = reading.lit && this.guestScreens.get(deviceId)?.get(reading.lit.displayId)
+    if (!lit) return null
+    return lit.deviceName === 'primary' ? 'closed' : 'open'
+  }
+
+  /** Tell the viewer which postures exist and which one the device is in — read from the device, so a fold
+   *  made outside tapflow shows too. Sent at boot, after a change (failed or not), and on the helper dying. */
+  private async sendPostures(state: DeviceState): Promise<void> {
+    const [postures, current] = await Promise.all([this.listPostures(state.deviceId), this.getPosture(state.deviceId)])
+    this.reportedPosture.set(state.deviceId, current?.id ?? null)
+    this.sendMsg({ type: 'device:postures', sessionId: state.sessionId, payload: { postures, currentId: current?.id ?? null } })
   }
 
   // Clipboard work parks a sentinel on the device while it waits, so two operations on the same
@@ -1291,7 +1839,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
    * Safe to read at the ack site rather than inside the write, because iOS writes are synchronous —
    * but only for the question readiness answers. That is why ownership is asked separately.
    */
-  private refusalReason(helper: TouchHelper | null, kind: 'continuation' | 'standalone'): InputErrorReason {
+  private refusalReason(helper: InputChannel | null, kind: 'continuation' | 'standalone'): InputErrorReason {
     const state = helper?.inputState() ?? 'unavailable'
     // No channel at all dominates: the caller must reconnect, and telling it to re-open a gesture
     // would send it round a loop that cannot succeed.
@@ -1500,15 +2048,35 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability {
         // dashboard's. The memory is read when the step runs, not when it was queued, and written only
         // once the simulator took it: a step queued behind another toggles from what that one applied.
         const sessionId = msg.sessionId
-        const target = (msg.payload as { orientation?: 'portrait' | 'landscape' } | undefined)?.orientation
+        const payload = msg.payload as { orientation?: 'portrait' | 'landscape'; direction?: 'clockwise' | 'counterclockwise' } | undefined
+        const target = payload?.orientation
         void this.enqueueRotation(state.deviceId, async () => {
           const live = this.deviceStates.get(sessionId) ?? state
-          const next = target
-            ? (target === 'landscape' ? 'landscapeRight' : 'portrait')
-            : (live.orientation === 'portrait' ? 'landscapeRight' : 'portrait')
-          await this.simctl.rotate(live.deviceId, next)
-          live.orientation = next
+          if (this.multiPanelDevices.has(live.deviceId)) {
+            await this.turnHeld(live.deviceId, payload?.direction, target)
+            this.applyLitPanel(live.deviceId)
+            return
+          }
+          await this.turnSingle(live.deviceId, payload?.direction, target)
+          this.resendTurn(live.deviceId)
         })
+        break
+      }
+      case 'input:posture': {
+        const state = this.deviceStates.get(msg.sessionId)
+        if (!state) break
+        const { postureId } = msg.payload as { postureId: string }
+        // No ack by declaration (like `input:rotate`): a fold that fails is reported by the posture list that
+        // follows saying where the device really is. One at a time per device, like Android's.
+        if (this.posturing.has(state.deviceId)) {
+          logger.info(`posture ${postureId}: a change is already in flight, ignoring`)
+          break
+        }
+        this.posturing.add(state.deviceId)
+        void this.setPosture(state.deviceId, postureId)
+          .catch((e: unknown) => logger.warn(`setPosture(${postureId}): ${(e as Error).message}`))
+          .then(() => this.sendPostures(state))
+          .finally(() => this.posturing.delete(state.deviceId))
         break
       }
       case 'stream:request-idr': {

@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import { join } from 'path'
 import { createLogger } from '@tapflowio/agent-core'
 import { killWithSigkillFallback } from './childProcessKill.js'
+import { MIN_CONTACT_MS, type InputChannel } from './InputChannel.js'
 
 const logger = createLogger('ios-agent:touch-helper')
 
@@ -31,14 +32,11 @@ const READY_MARKER = 'touch-helper ready'
 // observed rather than a tight bound.
 const READY_DEADLINE_MS = 5_000
 
-// The shortest contact a tap is given. Clients that drive a device — flow-runner, the MCP server — send
-// the touch's down and up back to back. Measured on iPhone 17 Pro / iOS 26.5, 20 taps each on a
-// `UISwitch`: 3 toggled with the up sent at once, 20 with this 50ms hold (a button took every tap either
-// way). A person's tap and a swipe usually last longer already, so they are rarely held, and one that is
-// held only gains contact time.
-export const MIN_CONTACT_MS = 50
+// Defined beside the interface both input channels implement, so FoldableInput does not reach into this
+// module for it; re-exported because callers and tests have always imported it from here.
+export { MIN_CONTACT_MS }
 
-export class TouchHelper {
+export class TouchHelper implements InputChannel {
   private proc: ChildProcess | null = null
   // The process that received the current gesture's opening frame. Mid-gesture frames are only
   // meaningful to that one, so they are checked against it rather than against liveness alone.

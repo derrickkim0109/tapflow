@@ -30,6 +30,7 @@ export class WebCodecsDecoder implements Decoder {
   private resizeCb?: (size: DecoderSize) => void
   private decodedCb?: (presentTime: number, sample?: DecodeSample) => void
   private lastSample?: DecodeSample
+  private readonly presented = new Set<() => void>()
 
   constructor(createRenderer: (canvas: HTMLCanvasElement) => FrameRenderer = defaultRenderer) {
     this.canvas = document.createElement('canvas')
@@ -46,6 +47,11 @@ export class WebCodecsDecoder implements Decoder {
     this.core.setDecodeSampler((s) => { this.lastSample = s })
   }
 
+  onPresented(cb: () => void): () => void {
+    this.presented.add(cb)
+    return () => { this.presented.delete(cb) }
+  }
+
   decode(data: ArrayBuffer): void { this.core.decode(data) }
 
   flush(): void { this.core.flush() }
@@ -60,6 +66,7 @@ export class WebCodecsDecoder implements Decoder {
     if (!size) return
     this.decodedCb?.(performance.now(), this.lastSample)
     this.lastSample = undefined
+    for (const cb of this.presented) cb()
     if (!this._size || this._size.width !== size.width || this._size.height !== size.height) {
       this._size = size
       this.resizeCb?.(size)

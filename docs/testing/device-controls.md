@@ -40,15 +40,49 @@ The keyboard button in the toolbar (**Software keyboard**, <kbd>⌘</kbd> <kbd>�
 
 ## Rotate {#rotate}
 
-Each press of **Rotate** (<kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>O</kbd>) turns the device between portrait and landscape. Holding the shortcut down turns it once. If you leave the session in landscape, the device is turned back to portrait before it shuts down.
+**Rotate** (<kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>O</kbd>) turns the device. Holding the shortcut down turns it once. iOS simulators and Android emulators turn the device's body clockwise; a real Android device, or an emulator started without gRPC, switches between portrait and landscape.
 
-A session starts in portrait. If the device was left in landscape, for example after you reloaded the page or the agent restarted, it is turned upright when the session starts. The exception is an Android emulator set to auto-rotate that you turned outside tapflow, which is left as it is.
+### Rotate on iOS {#rotate-ios}
 
-## Fold and unfold {#fold}
+<Badge type="info" text="iOS" />
+
+<a id="rotate-iphone-duo"></a>
+
+An iOS simulator turns a quarter turn clockwise on each press of **Rotate**, so four presses bring it back to where it started and you can check both the left and the right landscape. The frame turns first and the screen follows.
+
+The screen turns with the device, as it does in your hand. An app that supports the new orientation stands its screen back up; one that does not stays on its side.
+
+The device's orientation is shared by everyone looking at it. tapflow does not change it when a session starts or ends, and reloading the page or a teammate joining finds the device where it was left. A flow run is the exception: it starts the device upright, so it replays the same way every time. An iPhone Duo is not stood up yet and starts a run where it was left.
+
+A turn made in Xcode's DeviceHub or Simulator.app shows in tapflow when a session starts and on the next press of **Rotate**. An iPhone Duo shows it within about 6 seconds.
+
+### Rotate on Android {#rotate-android}
 
 <Badge type="info" text="Android" />
 
-A foldable Android emulator gets a fold button in the toolbar. Each press switches between folded and unfolded, and the button's name is **Unfold** or **Fold** followed by the current posture and the one it will change to. While the posture changes, the button shows a spinner.
+An Android emulator turns like an iOS simulator: each press of **Rotate** turns the device's body a quarter turn clockwise. The device turns first and the screen follows. An app that supports the new orientation stands its screen back up; one that does not stays on its side. A turn made with the rotate buttons of an emulator window you started yourself shows in tapflow too. An emulator started by tapflow runs without a window, so it has none.
+
+tapflow does not change the orientation when a session starts or ends. The exceptions are a boot where tapflow starts the emulator itself and a flow run: those stand the body upright first.
+
+tapflow frees an emulator's rotation lock (auto-rotate off) once per AVD, the first time it sees it, to clear the lock earlier versions of tapflow set. A lock you set after that is left alone.
+
+The dashboard's screenshots and recordings keep the orientation the body is shown in. The MCP server's screenshots follow the screen Android draws, so they can be turned differently.
+
+A real device, and an emulator started without gRPC, still turn between portrait and landscape on each press of **Rotate**. If you leave the session with one of them in landscape, it is turned back to portrait before it shuts down.
+
+## Fold and unfold {#fold}
+
+A foldable Android emulator and the iPhone Duo simulator get a fold button in the toolbar. Each press switches between folded (**Folded**) and unfolded (**Unfolded**), and the button's name is **Unfold** or **Fold** followed by the current posture and the one it will change to. While the posture changes, the button shows a spinner.
+
+### Fold an iPhone Duo {#fold-iphone-duo}
+
+<Badge type="info" text="iOS" />
+
+An iPhone Duo takes 4–6 seconds to fold or unfold. Meanwhile the device screen shows **Folding...** or **Unfolding...**, and the new screen fades in once it lights. Unfolding opens the device all the way (180°).
+
+A fold made in Xcode's DeviceHub shows in tapflow too. tapflow follows a new screen only once it has stayed lit for 4 seconds, so the change usually shows 4–6 seconds later, and up to about 10 seconds if the device had been left alone for more than 30 seconds. This keeps tapflow from following a screen that lights for a moment while the device starts up.
+
+The iPhone Duo simulator needs Xcode 27.1 or later on an Apple silicon Mac. Its input goes through a helper tapflow runs inside the simulator, and on a Mac that cannot run it the iPhone Duo is either left out of the device list or fails with an error when you pick it.
 
 ## Restart the device {#restart}
 
@@ -76,8 +110,8 @@ If the dashboard is open over plain HTTP, text copied on the device stays on the
 | Tap, swipe, pinch, typing | Yes | Yes |
 | Device buttons | Home, side buttons on the device frame | Home, Back, Recent Apps, Volume Up, Volume Down, Power |
 | Software keyboard button | Yes | No |
-| Rotate | Yes | Yes |
-| Fold and unfold | No | Foldable emulators with two postures |
+| Rotate | A quarter clockwise, all four ways | gRPC emulators a quarter clockwise; real devices and emulators without gRPC portrait and landscape |
+| Fold and unfold | iPhone Duo (Xcode 27.1 or later) | Foldable emulators with two postures |
 | Restart, clipboard | Yes | Yes |
 
 ## Limits {#limits}
@@ -92,6 +126,8 @@ If the dashboard is open over plain HTTP, text copied on the device stays on the
 - **Keys do not reach the device.** Click the device screen once and check that **Focus** is green.
 - **Text copied on the device is not on your clipboard.** If the dashboard address starts with `http://`, the copy stays on the device, as described under [Clipboard](#clipboard).
 - **The device is taking too long — try again** appears. The device did not answer in time; try again.
+- **The iPhone Duo is not in the device list.** Check that the operator's Mac has Xcode 27.1 or later. If the agent log has a `not offering` line, the reason is on it.
+- **Picking an iPhone Duo fails with `cannot be used on this Mac`.** tapflow's input helper could not be used on this Mac: the simulator refused it, or it was not ready in time. Pass the reason after the message on to the operator.
 - **The stream lags, or inputs arrive late.** See [Stream & sessions](/troubleshooting/streaming#stream-lag).
 
 ## Related {#related}

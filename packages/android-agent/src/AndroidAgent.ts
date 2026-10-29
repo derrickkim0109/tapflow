@@ -5,10 +5,11 @@ import type {
   AndroidButton, BootAbandonReason, ClipboardErrorPayload, Device, DeviceAgent,
   NetworkControlCapability, NetworkStatePayload, UIElement,
 } from '@tapflowio/agent-core'
-import { formFactorOf } from './avdConfig.js'
+import { avdRotationLockMemory, formFactorOf, type RotationLockMemory } from './avdConfig.js'
 import type {
   AgentControlOutbound, ClipboardReplyBody, OpenUrlReplyBody,
   AppInstallReplyBody, AppLaunchReplyBody, AppLaunchToAgent, LaunchOptions, AppClearStateReplyBody, DevicePosture, FormFactor, RunResetReport, RunResetRequest,
+  InputPinchStart, InputTouchStart, PointSpace,
 } from '@tapflowio/protocol'
 import { appliedKeys, compactLaunchOptions, launchOptionsProblem } from '@tapflowio/protocol/launch'
 import fs from 'fs'
@@ -147,6 +148,10 @@ const METRICS_SAMPLE_GAP_MS = 300
 // never commits should still end with an honest report rather than a spinner.
 const POSTURE_COMMIT_POLL_MS = 50
 const POSTURE_COMMIT_TIMEOUT_MS = 3_000
+// `emu rotate` lands at once (the next gRPC frame came 53 ms later, measured); the console read that confirms it
+// is tens of ms. The stop is for an emulator that took the command and did not turn.
+const BODY_TURN_POLL_MS = 50
+const BODY_TURN_SETTLE_MS = 2_000
 
 const SKIN_DEGREES: Record<SkinRotation, 0 | 90 | 180 | 270> = {
   PORTRAIT: 0,
@@ -308,6 +313,12 @@ interface DeviceState {
   /** The skin orientation the last frame reported, so a reconcile triggered by something other
    *  than a frame — a rotation, the watcher — can still compute the correction. */
   skin: SkinRotation | null
+  /** How far the emulator's body is turned clockwise, from the console accelerometer — read at boot and after a
+   *  turn, so a chrome sent before the first frame (which carries the skin) already says where the body is. */
+  body: 0 | 90 | 180 | 270 | null
+  /** The newest frame's size and skin, recorded the moment it arrives — not when a reconcile commits it. A reconcile
+   *  reads this when it starts, whoever asked for it: see `startReconcile`. */
+  latestFrame: { w: number; h: number; skin: SkinRotation | null } | null
   /** The size the **emulator** has display 0 configured at, which is what it divides injected
    *  touch pixels by — see `EmulatorGrpcClient.getDisplaySize`. Not the panel the guest is drawing
    *  on: on a foldable those differ, and this is the one input is measured in. Read once per
@@ -373,6 +384,9 @@ export interface AndroidAgentOptions {
   avdFormFactor?: (avdName: string) => FormFactor | undefined
   /** Each run reset command's bound, in ms. `RUN_RESET_CMD_TIMEOUT_MS` by default; injectable for tests. */
   runResetCmdTimeoutMs?: number
+  /** Which AVDs have had their rotation lock freed once. Beside each AVD by default (`avdRotationLockMemory`);
+   *  never the real AVD directories under vitest. */
+  rotationLockMemory?: RotationLockMemory
 }
 
 /** One `pm clear` or clipboard write of a run reset. */
@@ -492,6 +506,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   private readonly runResetCmdTimeoutMs: number
   private readonly lean: boolean
   private readonly avdFormFactor: (avdName: string) => FormFactor | undefined
+  private readonly rotationLock: RotationLockMemory
   /** How long a shutdown whose kill failed watches for the emulator to finish exiting. A field so tests can
    *  shorten it — see `handleDeviceShutdown` for why it waits at all. */
   private shutdownSettleMs = 3_000
@@ -505,6 +520,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     this.runResetCmdTimeoutMs = options.runResetCmdTimeoutMs ?? RUN_RESET_CMD_TIMEOUT_MS
     this.lean = options.lean ?? false
     this.avdFormFactor = options.avdFormFactor ?? ((name) => formFactorOf(name))
+    this.rotationLock = options.rotationLockMemory
+      ?? (process.env.VITEST ? { freed: () => true, markFreed: () => {}, forget: () => {} } : avdRotationLockMemory)
     this.reconnectDelays = options.reconnectDelays ?? [1000, 2000, 4000, 8000, 16000, 30000]
     // No-op under vitest so the suite never spawns real `caffeinate` processes.
     this.sleepBlocker = options.sleepBlocker ?? (process.env.VITEST ? { acquire() {}, release() {} } : createSleepBlocker())
@@ -664,6 +681,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         rotation: null,
         streamRotation: 0,
         skin: null,
+        body: null,
+        latestFrame: null,
         touchRange: null,
         posturing: false,
         screenWatch: null,
@@ -821,6 +840,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     state.rotation = null
     state.streamRotation = 0
     state.skin = null
+    state.latestFrame = null
     state.touchRange = null
   }
 
@@ -830,6 +850,20 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    *  physical display is on, so the size it carries is not settled once per boot the way it was when
    *  this payload only ever described a phone. The relay re-caches it (`setChromeData`) and the
    *  viewer replaces its copy, so re-sending is the whole update path. */
+  /** A point the dashboard measured on the frame (`space: 'frame'`), as the screen Android draws — the space
+   *  everything below takes. **Turned by the newest frame's skin, not by the chrome's correction**, which lags a
+   *  turn by 0.6–3.6 s; a touch turned by that was a quarter off until it caught up, so the dashboard had to drop
+   *  every touch in between. With `toDevicePx`'s own turn by `rotation` the two compose to the skin alone, so on
+   *  the channel the rotation's lag cancels too. No skin known means the frame is the screen, as the chrome says. */
+  private fromFrame(state: DeviceState, x: number, y: number, space: PointSpace | undefined): { x: number; y: number } {
+    if (space !== 'frame') return { x, y }
+    const skin = state.latestFrame?.skin ?? null
+    const skinDegrees = skin === null ? null : SKIN_DEGREES[skin] ?? null
+    if (skinDegrees === null) return { x, y }
+    const turn = ((((skinDegrees - (state.rotation ?? 0)) % 360) + 360) % 360) as 0 | 90 | 180 | 270
+    return toNaturalPoint(turn, x, y)
+  }
+
   /** A normalised viewer point in device pixels, applying the display rotation when one is known.
    *
    *  Only the gRPC backend sets `state.rotation`. scrcpy captures with `capture_orientation=@0`, so
@@ -906,9 +940,11 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    */
   async setPosture(deviceId: string, postureId: string): Promise<void> {
     const { serial, before } = await this.beginPosture(deviceId, postureId)
-    // No state: `deviceStates` is keyed by session and this entry point takes a device. The
-    // capability's callers do not hold a viewer, so there is nothing to re-describe to.
-    await this.finishPosture(null, serial, before)
+    // `deviceStates` is keyed by session and this entry point takes a device, so the device's live state is looked
+    // up: `finishPosture` needs it to tell a body-drawn (gRPC) emulator, which must never get a lock, from one on
+    // scrcpy. The capability's callers hold no viewer, so nothing is re-described to them here.
+    const live = [...this.deviceStates.values()].find((s) => s.deviceId === deviceId && s.booted) ?? null
+    await this.finishPosture(live, serial, before)
   }
 
   /**
@@ -971,12 +1007,23 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    * sees. Left deliberately rather than by omission.
    */
   private async finishPosture(state: DeviceState | null, serial: string, before: 0 | 90 | 180 | 270 | null): Promise<void> {
+    // Not on gRPC: its viewer draws the body, which a fold does not move, and Android picks the new panel's
+    // rotation from the sensor; carrying a lock across is what made apps stop following the body.
+    // **On an emulator, only a scrcpy session carries a lock** — the one backend whose viewer toggles. Asked as "is it
+    // scrcpy", not "is it gRPC": a gRPC stream that is restarting has no client for a moment, and an emulator with
+    // no session streams over gRPC when it next streams; both draw the body, and a lock there is what made apps stop
+    // following it. A real device has no body and keeps the carry.
     if (before === null) return
+    if (serial.startsWith('emulator-') && !state?.scrcpySession) return
     const after = await this.stableDisplayMetrics(serial)
     if (!after || after.rotation === before) return
+    // Asked again after the settling read: a boot can replace scrcpy with gRPC in that second, after its
+    // `prepareBody` has freed the lock this would write back.
+    if (serial.startsWith('emulator-') && !state?.scrcpySession) return
     const quarter = (before / 90) as 0 | 1 | 2 | 3
     logger.info(`posture: carrying rotation ${before} across`)
     await this.adb.setRotation(serial, quarter)
+      .then(() => { if (state) this.lockWritten(state, serial) })
       .catch((e: unknown) => logger.warn(`could not carry the rotation across: ${(e as Error).message}`))
     // **And say so, for the same reason `input:rotate` does.** A rotation changes the correction
     // the viewer applies but not the frame's dimensions — the capture is the skin, which does not
@@ -1019,8 +1066,18 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         // stored, so a rotation re-sends the right one without anything having to remember to.
         cornerRadius: state.displayWidth > 0 ? state.cornerRadiusPx / state.displayWidth : 0,
         streamRotation: state.streamRotation,
+        // Body mode is the gRPC backend: its frames arrive as the body is held. Never on scrcpy, whose frames are
+        // the natural panel and whose viewer toggles.
+        ...(state.grpcClient ? { bodyRotation: this.bodyRotationOf(state) } : {}),
       },
     })
+  }
+
+  /** The body's clockwise turn: whichever came last of a console reading (boot, a turn) and a frame's skin
+   *  inverted (REVERSE_LANDSCAPE is a quarter clockwise — measured; `reconcileScreen` writes it). Upright when
+   *  neither has answered — the body is never sent as "not known". */
+  private bodyRotationOf(state: DeviceState): 0 | 90 | 180 | 270 {
+    return state.body ?? 0
   }
 
   /**
@@ -1108,15 +1165,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       // — the settling read is what kept the stream waiting when it ran on every boot.
       await this.stableDisplayMetrics(serial)
     }
-    // **Only a device that folds.** The reason for standing it upright is that a posture change
-    // is unreadable from an unknown starting state — it does not apply to a phone, and
-    // `wm user-rotation lock` is persistent device state that nothing here ever frees. Writing it
-    // on every emulator would leave a plain AVD unable to auto-rotate, in this session and in
-    // every later one, including outside tapflow.
-    if (postures.length === 0 || !owns()) return
-    await this.adb.setRotation(serial, 0)
-      .catch((e: unknown) => logger.warn(`could not set the boot rotation: ${(e as Error).message}`))
-    if (owns()) state.landscape = false
+    // **No rotation lock any more.** This used to lock a foldable to 0, because a posture change was unreadable
+    // from an unknown starting state while the viewer drew Android's display. A gRPC viewer now draws the body,
+    // which folding does not move (measured), and Android rotates the display itself; the body was stood up
+    // before the stream started (`prepareBody`), and the lock is what kept apps from following it.
   }
 
   /** Re-read the display on a timer for as long as the session lives, and tell the viewer when it
@@ -1204,7 +1256,13 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     const running = (async () => {
       state.reconciling = true
       try {
-        return await this.reconcileScreen(state, serial, w, h, skin, true, owns)
+        // **The newest frame, not the asker's.** A pass started by a rotate or the watcher carries the skin last
+        // *committed*, and a trailing pass carries whatever its first joiner brought — so a frame's new skin that
+        // joined the queue second, or arrived while a rotate's pass was being asked for, was lost, and that pass
+        // committed the old skin: the viewer framed a turned body the old way (measured on a Galaxy S23, a
+        // landscape frame stretched into a portrait shell). The latest frame is always the right question.
+        const latest = state.latestFrame
+        return await this.reconcileScreen(state, serial, latest?.w ?? w, latest?.h ?? h, latest ? latest.skin : skin, true, owns)
       } finally {
         state.reconciling = false
         // Only if this is still the current one: a trailing pass may already have replaced it.
@@ -1280,7 +1338,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       : ((((skinDegrees - rotation) % 360) + 360) % 360) as 0 | 90 | 180 | 270
     const same = natural.width === state.videoWidth && natural.height === state.videoHeight
       && current.width === state.displayWidth && current.height === state.displayHeight
-      && rotation === state.rotation && streamRotation === state.streamRotation
+      && rotation === state.rotation && streamRotation === state.streamRotation && skin === state.skin
     if (same) return false
     state.videoWidth = natural.width
     state.videoHeight = natural.height
@@ -1298,6 +1356,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     if (radius !== null) state.cornerRadiusPx = radius
     state.streamRotation = streamRotation
     state.skin = skin
+    // The frame's skin is the body too, and newer than a console read when it lands — a turn made in the
+    // emulator's own controls reaches the agent only this way.
+    if (skinDegrees !== null) state.body = ((360 - skinDegrees) % 360) as 0 | 90 | 180 | 270
     logger.info(`screen → touch ${natural.width}×${natural.height}, shown ${current.width}×${current.height}, rot ${rotation}, correct ${state.streamRotation}`)
     return true
   }
@@ -1408,16 +1469,22 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    */
   private async startVideoStream(
     state: DeviceState, streamWs: WebSocket,
-    owns: () => boolean = () => true, opts: { restart: boolean } = { restart: false },
+    owns: () => boolean = () => true, opts: { restart: boolean; upright?: boolean } = { restart: false },
   ): Promise<void> {
     const serial = this.adb.getSerial(state.deviceId)
     // Was a silent return, and the boot went on to answer `device:ready` for a stream that never
     // started (#611). The boot checks this before describing the device or declaring it ready; this is the backstop.
     if (!serial) throw new PlatformError(EMULATOR_GONE)
-    // Ahead of the backend split, so scrcpy stands the device up too: `normaliseOnBoot` runs on the
-    // gRPC path only. Queued with the rotations, so an undo from the viewer this boot replaced lands
-    // first and is then overridden, rather than racing the read.
-    if (!opts.restart) await this.enqueueRotation(state.deviceId, () => this.uprightOnBoot(serial))
+    // Ahead of the backend split, so it covers an emulator that ends up on scrcpy too. Queued with the
+    // rotations, so an undo from the viewer this boot replaced lands first. An emulator turns its **body**
+    // (console only — no gRPC needed): its rotation lock is freed once per AVD, and the body is stood up
+    // only for a boot that brought it up or a run — the orientation is otherwise the device's. A real
+    // device keeps #910's stand-up of a locked rotation.
+    if (!opts.restart) {
+      await this.enqueueRotation(state.deviceId, () => (serial.startsWith('emulator-')
+        ? this.prepareBody(state, serial, opts.upright === true)
+        : this.uprightOnBoot(serial)))
+    }
 
     // Emulator: capture via gRPC streamScreenshot + Mac VideoToolbox (bypasses the guest SW H.264
     // encoder). On any failure (e.g. an externally-booted emulator without `-grpc`), fall back to
@@ -1446,6 +1513,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       created.touchHelper = touchHelper
       state.touchHelper = touchHelper
 
+      // **An emulator on scrcpy is not in body mode**: its frames are the natural panel and its viewer toggles,
+      // starting upright — so its body is stood up, or a Fold that boots turned a quarter would show sideways.
+      if (serial.startsWith('emulator-')) await this.enqueueRotation(state.deviceId, async () => { await this.turnBodyTo(state, serial, 0) })
+      if (!owns()) throw new StreamSuperseded()
       const session = new ScrcpySession()
       created.scrcpySession = session
       const info = await session.start(serial)
@@ -1633,6 +1704,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         // the stream can be replaced in that time.
         const mine = () => state.emulatorVideo === video
         if (!mine()) return
+        state.latestFrame = { w, h, skin }
         void this.reconcileSerial(state, serial, w, h, skin, mine)
           .then((changed) => { if (changed && state.booted) this.sendChrome(state) })
           .catch((e: unknown) => logger.warn(`screen reconcile failed: ${(e as Error).message}`))
@@ -2065,7 +2137,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         return
       }
 
-      await this.startVideoStream(state, streamWs, () => seq === state.bootSeq)
+      // A boot that brought the emulator up, or a run (which replays from the same orientation every time), stands
+      // its body up; any other joins it where it is held.
+      await this.startVideoStream(state, streamWs, () => seq === state.bootSeq, { restart: false, upright: launched || runReset !== undefined })
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
       // After the stream, which is what opens the gRPC client the clipboard goes through; before the ready, since the
       // run installs its app after it and the report rides on it.
@@ -2609,6 +2683,64 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    * auto-rotating AVD would take auto-rotate away from it outside tapflow too (see `normaliseOnBoot`).
    * Replacing one lock with another takes nothing away. An unreadable lock is left alone.
    */
+  /**
+   * An emulator's boot: free the rotation lock the first time tapflow sees the AVD (earlier versions wrote one;
+   * a person's later lock is theirs — `RotationLockMemory`), stand the body up when `upright`, and read where it
+   * is held so the first chrome can say so. Best-effort: a failed step leaves the device as it was.
+   */
+  private async prepareBody(state: DeviceState, serial: string, upright: boolean): Promise<void> {
+    const avd = state.deviceId.replace(/^avd:/, '')
+    if (!this.rotationLock.freed(avd)) {
+      const freed = await this.adb.freeRotation(serial).then(() => true, (e: unknown) => {
+        logger.warn(`could not free the rotation lock on ${avd}: ${(e as Error).message}`)
+        return false
+      })
+      // Apart from the free: a marker that cannot be written is not a lock that stayed, and saying so would send
+      // someone after the wrong problem. The cost is freeing it again next time, a person's later lock with it.
+      if (freed) {
+        logger.info(`rotation: freed the rotation lock on ${avd} (once per AVD)`)
+        try { this.rotationLock.markFreed(avd) } catch (e) {
+          logger.warn(`freed the rotation lock on ${avd}, but could not remember it beside the AVD: ${(e as Error).message}`)
+        }
+      }
+    }
+    if (upright) await this.turnBodyTo(state, serial, 0)
+    else state.body = await this.adb.readBodyRotation(serial).catch(() => null)
+  }
+
+  /**
+   * Turn an emulator's body to `want`, a quarter clockwise at a time (`emu rotate` is relative), **from a fresh
+   * reading** and confirming each step — a remembered start is what #910 was, and a lost step is put right by
+   * the next turn's read. Returns where the body ended up, also kept in `state.body`.
+   */
+  private async turnBodyTo(state: DeviceState, serial: string, want: 0 | 90 | 180 | 270): Promise<0 | 90 | 180 | 270 | null> {
+    let held = await this.adb.readBodyRotation(serial).catch(() => null)
+    if (held === null) { logger.warn(`rotate ${serial}: could not read where the body is, not turning`); return null }
+    for (let steps = ((want - held + 360) % 360) / 90; steps > 0; steps--) {
+      const next = ((held + 90) % 360) as 0 | 90 | 180 | 270
+      await this.adb.rotateBodyClockwise(serial)
+      const deadline = Date.now() + BODY_TURN_SETTLE_MS
+      let read: 0 | 90 | 180 | 270 | null = held
+      while (read !== next && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, BODY_TURN_POLL_MS))
+        read = await this.adb.readBodyRotation(serial).catch(() => null)
+      }
+      if (read !== next) { logger.warn(`rotate ${serial}: asked for ${next}, body reads ${read ?? 'unreadable'}`); held = read ?? held; break }
+      held = next
+    }
+    state.body = held
+    return held
+  }
+
+  /** tapflow just wrote a rotation lock. On an emulator that makes the lock tapflow's again, so the AVD is
+   *  forgotten and the next gRPC session frees it (`RotationLockMemory`). A real device has no AVD to remember. */
+  private lockWritten(state: DeviceState, serial: string): void {
+    if (!serial.startsWith('emulator-')) return
+    try { this.rotationLock.forget(state.deviceId.replace(/^avd:/, '')) } catch (e) {
+      logger.warn(`could not forget freeing ${state.deviceId}'s rotation lock: ${(e as Error).message}`)
+    }
+  }
+
   private async uprightOnBoot(serial: string): Promise<void> {
     const lock = await this.adb.getUserRotation(serial)
     if (lock.mode !== 'lock' || lock.rotation === 0) return
@@ -2738,7 +2870,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       case 'input:touch:start': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
-        const { x, y } = msg.payload as { x: number; y: number }
+        const p = msg.payload as InputTouchStart['payload']
+        const { x, y } = this.fromFrame(state, p.x, p.y, p.space)
         const g = this.openGesture(state, 'touch')
         if (g?.via === 'helper') {
           g.owner.touchStart(x, y)
@@ -2752,7 +2885,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       case 'input:touch:move': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
-        const { x, y } = msg.payload as { x: number; y: number }
+        const p = msg.payload as InputTouchStart['payload']
+        const { x, y } = this.fromFrame(state, p.x, p.y, p.space)
         // A move with no gesture behind it — or one whose backend has since been replaced — is not the
         // gesture the tester made. Dropped, as iOS drops it.
         const g = this.gestureOwner(state, 'touch')
@@ -2785,7 +2919,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       case 'input:pinch:start': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
-        const { f0, f1 } = msg.payload as { f0: { x: number; y: number }; f1: { x: number; y: number } }
+        const p = msg.payload as InputPinchStart['payload']
+        const f0 = this.fromFrame(state, p.f0.x, p.f0.y, p.space)
+        const f1 = this.fromFrame(state, p.f1.x, p.f1.y, p.space)
         const g = this.openGesture(state, 'pinch')
         if (g?.via === 'helper') {
           g.owner.pinchStart(f0.x, f0.y, f1.x, f1.y)
@@ -2799,7 +2935,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       case 'input:pinch:move': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
-        const { f0, f1 } = msg.payload as { f0: { x: number; y: number }; f1: { x: number; y: number } }
+        const p = msg.payload as InputPinchStart['payload']
+        const f0 = this.fromFrame(state, p.f0.x, p.f0.y, p.space)
+        const f1 = this.fromFrame(state, p.f1.x, p.f1.y, p.space)
         const g = this.gestureOwner(state, 'pinch')
         if (g?.via === 'helper') {
           g.owner.pinchMove(f0.x, f0.y, f1.x, f1.y)
@@ -2840,18 +2978,42 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         // only once the device took it: a step queued behind another toggles from what that one
         // applied, and a failed one leaves the memory where the device still is.
         const sessionId = msg.sessionId
-        const target = (msg.payload as { orientation?: 'portrait' | 'landscape' } | undefined)?.orientation
+        const payload = msg.payload as { orientation?: 'portrait' | 'landscape'; direction?: 'clockwise' | 'counterclockwise' } | undefined
+        const target = payload?.orientation
         void this.enqueueRotation(state.deviceId, async () => {
           const live = this.deviceStates.get(sessionId) ?? state
-          const next = target ? target === 'landscape' : !live.landscape
-          await this.adb.setRotation(serial, next ? 3 : 0)
-          live.landscape = next
-          // **Report it, rather than leaving it to the watcher's next tick.** A rotation changes
-          // the correction the viewer applies but *not* the frame's dimensions — the capture is
-          // the skin, which does not move — so the viewer cannot tell from the stream that
-          // anything happened, and an idle screen sends no new frame to reveal it either. Until
-          // this lands the viewer is holding the picture back; up to two seconds of that reads as
-          // the rotate button doing nothing.
+          // **Body mode (gRPC): turn the emulator's body**, a quarter at a time from where it is read to be held —
+          // a `direction`, or an older viewer's target, met by either landscape since that viewer stands the picture
+          // up by `streamRotation` whichever it is. No lock: the app follows the body if it supports the turn.
+          //
+          // **A `direction` is a body turn even with no gRPC client** — the gap while a stream restarts, or a step
+          // that ran after its session was cleaned up. Only a viewer drawing the body sends one, and the toggle below
+          // would answer it with `wm user-rotation lock`, the state this model exists to remove. The console needs
+          // no gRPC. A device with no body has nothing to turn.
+          const bodyTurn = !!live.grpcClient || (payload?.direction !== undefined && serial.startsWith('emulator-'))
+          if (!bodyTurn && payload?.direction !== undefined) {
+            logger.warn(`rotate ${serial}: a ${payload.direction} turn for a device with no body to turn, ignoring`)
+            return
+          }
+          if (bodyTurn) {
+            const held = await this.adb.readBodyRotation(serial).catch(() => null) ?? live.body
+            if (held === null) { logger.warn(`rotate ${serial}: could not read where the body is, not turning`); return }
+            const landscape = held === 90 || held === 270
+            const want = payload?.direction === 'clockwise' ? (held + 90) % 360
+              : payload?.direction === 'counterclockwise' ? (held + 270) % 360
+              : target === 'portrait' ? (held === 0 ? null : 0)
+              : target === 'landscape' ? (landscape ? null : 90)
+              : (landscape ? 0 : 90)
+            if (want !== null) await this.turnBodyTo(live, serial, want as 0 | 90 | 180 | 270)
+          } else {
+            const next = target ? target === 'landscape' : !live.landscape
+            await this.adb.setRotation(serial, next ? 3 : 0)
+            live.landscape = next
+            this.lockWritten(live, serial)
+          }
+          // **Report it, rather than leaving it to the watcher's next tick.** The viewer releases its turn
+          // when a chrome says the body got there (`bodyRotation`), and the display's rotation follows the
+          // body a few hundred milliseconds later; this pass reports both without waiting for the watcher.
           // **gRPC only, and the guard is the point.** scrcpy captures with
           // `capture_orientation=@0`, so its frame never changes shape and the viewer's CSS
           // quarter is the only thing that rotates it. Reconciling here would report the

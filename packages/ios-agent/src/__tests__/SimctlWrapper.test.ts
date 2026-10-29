@@ -42,6 +42,63 @@ function mockRunner(outputs: Record<string, string> = {}): SimctlRunner {
 }
 
 describe('SimctlWrapper', () => {
+  // A multi-panel device (iPhone Duo) is told apart by its type's capabilities.plist, read once per connect
+  // and only for the types present. Mutations: count every display (TVOut and CarPlay then make every
+  // phone "multi-panel"); read every type; let one unreadable plist fail the whole lookup.
+  describe('integratedPanelCounts', () => {
+    const TYPES = JSON.stringify({ devicetypes: [
+      { identifier: 'DUO', bundlePath: '/Types/iPhone Duo.simdevicetype' },
+      { identifier: 'PRO', bundlePath: '/Types/iPhone 17 Pro.simdevicetype' },
+      { identifier: 'UNUSED', bundlePath: '/Types/Unused.simdevicetype' },
+      { identifier: 'BROKEN', bundlePath: '/Types/Broken.simdevicetype' },
+    ] })
+    const display = (displayType: string) => ({ displayType })
+    const plists: Record<string, unknown> = {
+      '/Types/iPhone Duo.simdevicetype/Contents/Resources/capabilities.plist':
+        { capabilities: { displays: [display('integrated'), display('integrated'), display('tvOut'), display('carPlay'), display('scene')] } },
+      '/Types/iPhone 17 Pro.simdevicetype/Contents/Resources/capabilities.plist':
+        { capabilities: { displays: [display('integrated'), display('tvOut'), display('carPlay'), display('scene')] } },
+    }
+
+    it('counts integrated panels for the types asked about, and only those', async () => {
+      const read = vi.fn(async (path: string) => {
+        if (!(path in plists)) throw new Error('no such plist')
+        return plists[path]
+      })
+      const counts = await new SimctlWrapper(mockRunner({ list: TYPES }), read).integratedPanelCounts(['DUO', 'PRO', 'BROKEN'])
+      expect(Object.fromEntries(counts)).toEqual({ DUO: 2, PRO: 1, BROKEN: 1 })
+      expect(read.mock.calls.map((c) => c[0])).not.toContain('/Types/Unused.simdevicetype/Contents/Resources/capabilities.plist')
+    })
+
+    it('asks nothing when there are no devices', async () => {
+      const runner = mockRunner({ list: TYPES })
+      expect((await new SimctlWrapper(runner, vi.fn()).integratedPanelCounts([])).size).toBe(0)
+      expect(runner.execWithOpts).not.toHaveBeenCalled()
+    })
+  })
+
+  // Mutation: catch the read failure into "no panels" — TypePanels keeps that for the life of the agent.
+  describe('typePanels', () => {
+    it('rejects when the plist cannot be read, so the answer is asked for again', async () => {
+      const types = JSON.stringify({ devicetypes: [{ identifier: 'DUO', bundlePath: '/Types/iPhone Duo.simdevicetype' }] })
+      const read = vi.fn(async () => { throw new Error('plutil timed out') })
+      await expect(new SimctlWrapper(mockRunner({ list: types }), read).typePanels('DUO')).rejects.toThrow('plutil timed out')
+      // A type that is not there is an answer, not a failure.
+      await expect(new SimctlWrapper(mockRunner({ list: types }), read).typePanels('OTHER')).resolves.toEqual([])
+    })
+  })
+
+  describe('integratedScreens', () => {
+    it('reads the panels from `simctl io <udid> enumerate`, with a timeout', async () => {
+      const text = 'Connected Screens:\n    (1) LCD:\n        Screen ID: 1\n        Unique ID: AAA\n        Device Name: primary\n        Screen Type: Integrated\n        Pixel Size: {1398, 2034}\n'
+      const runner = mockRunner({ io: text })
+      expect(await new SimctlWrapper(runner).integratedScreens('UDID')).toEqual([{ screenId: 1, uuid: 'AAA', deviceName: 'primary', width: 1398, height: 2034, scale: 1, chromeId: null }])
+      const [opts, ...args] = vi.mocked(runner.execWithOpts).mock.calls[0]
+      expect(args).toEqual(['io', 'UDID', 'enumerate'])
+      expect(opts.timeoutMs).toBeGreaterThan(0)
+    })
+  })
+
   // `simctl list devices` carries no device family; `list devicetypes` does, as `productFamily`. The
   // map is read once per connect, never by `listDevices` — that one runs inside the boot poll, whose
   // per-call timeout is the only thing standing between it and a wedged CoreSimulatorService.

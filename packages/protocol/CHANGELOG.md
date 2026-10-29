@@ -1,5 +1,19 @@
 # @tapflowio/protocol
 
+## 0.31.0
+
+### Minor Changes
+
+- 3f53fb4: An Android emulator streaming over gRPC now turns the way it is held, as iOS simulators do. The agent reports `AndroidChrome.bodyRotation` — how far the emulator's body is turned clockwise — and turns the body a quarter at a time on `input:rotate { direction }` with `adb emu rotate`, from a fresh accelerometer reading on the emulator console. It no longer writes `wm user-rotation lock`: the lock earlier versions set is freed once per AVD (a marker file beside the AVD), and a lock set after that is left alone. A boot that starts the emulator, and a flow run, stand the body upright; any other session joins it where it is held. `AndroidChrome.streamRotation` keeps its meaning, and a touch still means the screen Android draws, so MCP, flows and older dashboards are unaffected. `input:touch:start`/`move` and `input:pinch:start`/`move` take an optional `space: 'frame'`, which says the point is on the video frame as it arrives; the agent turns it by that frame's own orientation, so a viewer drawing the body can send a touch the moment a turn lands instead of waiting for the chrome to catch up. A `direction` never answers with a rotation lock, even while the gRPC stream restarts, and a lock tapflow writes on an emulator without gRPC is freed again by its next gRPC session.
+
+  A flow run also stands an iPhone Duo upright, through its helper.
+
+- 990b959: The iOS agent drives the iPhone Duo simulator (Xcode 27.1). It captures whichever panel is lit and sends that panel's frame, and taps, gestures, typing and the hardware buttons reach the lit panel. It folds and unfolds the device through the posture capability Android foldables already use, and follows a fold or turn made in Xcode's DeviceHub. Input goes through a helper the agent runs inside the simulator (`guest-helper`, Apple silicon). An install without the helper or without `devicectl` leaves the iPhone Duo out of the device list, and a runtime that refuses the helper, or a helper not ready within 60 s, fails the boot with the reason. While a session is open the agent reads the device's panel and orientation every 2 s, slowing to every 6 s once nothing has moved for 30 s.
+
+  `ChromeData` gains `streamRotation` (the device's physical orientation, in quarter turns clockwise), `scaleBasis` and `screenCornerRadii`, and `input:rotate` can carry `direction` instead of `orientation`. All are optional. `scaleBasis` and `screenCornerRadii` are sent only for the iPhone Duo; `streamRotation` and `direction` apply to every iOS simulator.
+
+  A button on the top edge of a device frame is now placed by the rule that matches DeviceHub on the Duo. The only single-panel frame with one is the iPad mini's (6th generation and A17 Pro), whose volume buttons move 5 pt along the top edge, the drawn button, its pressed image and where it can be clicked together.
+
 ## 0.30.0
 
 ### Minor Changes

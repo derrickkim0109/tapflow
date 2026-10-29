@@ -64,8 +64,11 @@ export function parseDisplayMetrics(output: string): DisplayMetrics | null {
  * flattening the corners to square.
  */
 export function parseCornerRadius(output: string, width: number, height: number): number | null {
-  // Each panel prints its size and then, further into the same record, its corners.
-  const blocks = output.split('"Built-in Screen"').slice(1)
+  // Each panel prints its size and then, further into the same record, its corners. **Found by the record and a
+  // built-in display's `local:` id, never by its name**: the name is localised — a Korean system calls it
+  // "기본으로 제공되는 화면", measured on Galaxy_S23_API_35 — and keyed on "Built-in Screen" the radius read null on
+  // every non-English device, so its screen was cut square with the emulator's black corners showing.
+  const blocks = output.split('DisplayDeviceInfo{').slice(1).filter((b) => /^"[^"]*": uniqueId="local:/.test(b))
   for (const block of blocks) {
     const size = block.match(/(\d+) x (\d+)/)
     if (!size || Number(size[1]) !== width || Number(size[2]) !== height) continue

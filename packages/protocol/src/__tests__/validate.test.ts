@@ -295,6 +295,29 @@ describe('input:rotate carries a target', () => {
   })
 })
 
+describe('a touch says which picture it is in', () => {
+  // Mutation: leave `space` out of either schema. The door strips the key, and the agent reads a frame point as
+  // the screen — a quarter off on a turned body, with nothing failing.
+  it.each(['input:touch:start', 'input:touch:move'] as const)('keeps the space on %s', (type) => {
+    const r = ok({ type, sessionId: 's', payload: { x: 0.1, y: 0.2, space: 'frame' } })
+    expect(r.msg).toMatchObject({ payload: { x: 0.1, y: 0.2, space: 'frame' } })
+  })
+
+  it.each(['input:pinch:start', 'input:pinch:move'] as const)('keeps the space on %s', (type) => {
+    const r = ok({ type, sessionId: 's', payload: { f0: { x: 0.1, y: 0.2 }, f1: { x: 0.9, y: 0.8 }, space: 'frame' } })
+    expect(r.msg).toMatchObject({ payload: { space: 'frame' } })
+  })
+
+  it('still takes a touch with none, from every other sender', () => {
+    const r = ok({ type: 'input:touch:start', sessionId: 's', payload: { x: 0.1, y: 0.2 } })
+    expect(r.msg).not.toHaveProperty('payload.space')
+  })
+
+  it('refuses a space it does not name', () => {
+    expect(fail({ type: 'input:touch:move', sessionId: 's', payload: { x: 0.1, y: 0.2, space: 'screen' } }).reason).toBe('bad-shape')
+  })
+})
+
 describe('a payload failure the caller can be told about', () => {
   // **The regression this exists to prevent, and it is one the door itself would have shipped.** Today
   // a malformed `open-url` reaches the agent and the agent answers `open-url:error` from its own

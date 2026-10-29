@@ -1,0 +1,14 @@
+{
+  "info": {
+    "commandType": "devicectl.device.orientation.get",
+    "jsonVersion": 5,
+    "outcome": "success",
+    "version": "651.13.5"
+  },
+  "result": {
+    "deviceIdentifier": "0341AD84-C6CF-4DFB-91A7-A33A703EB34B",
+    "deviceIsOrientationLocked": false,
+    "deviceOrientation": "landscapeRight",
+    "deviceOrientationNonFlat": "landscapeRight"
+  }
+}

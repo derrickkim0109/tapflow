@@ -90,6 +90,7 @@ Named imperatively from `AGENTS.md` — these describe a gate you are about to h
 | File | type | topics |
 |------|------|--------|
 | [simkit-internals.md](./simkit-internals.md) | reference | ios, simulator, reverse-engineering |
+| [ios-orientation-sources.md](./ios-orientation-sources.md) | reference | ios, rotation, simulator, reverse-engineering |
 | [simulator-audio.md](./simulator-audio.md) | rationale | audio, ios, android |
 | [ios-device-recovery.md](./ios-device-recovery.md) | rationale | ios, lifecycle, recovery |
 | [macos-settings-deep-link-diagnosis.md](./macos-settings-deep-link-diagnosis.md) | diagnosis | macos, ios, system-extension, setup, cli |

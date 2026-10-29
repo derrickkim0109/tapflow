@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { DeviceChromeLoader, screenSizeFromDeviceType, type ChromeRunner } from '../DeviceChromeLoader'
+import { DeviceChromeLoader, panelDisplayFromCapabilities, screenSizeFromDeviceType, type ChromeRunner } from '../DeviceChromeLoader'
 
 // Shapes as `plutil -convert json` reads the real files. The Xcode 26.6 ones are an iPhone 17 Pro's;
 // the Xcode 27 entries are an iPad Pro 11-inch (M4)'s on Xcode 27.0 (27A266a), trimmed to the keys read.
@@ -110,6 +110,18 @@ describe('DeviceChromeLoader.load', () => {
     expect(fs.readdirSync(cacheDir)).toEqual(['tapflow-frame-v3-phone-c400x800.png'])
   })
 
+  // A multi-panel device (iPhone Duo) has a frame per panel. Mutations: ignore the panel's chrome (both panels
+  // then share the model's frame); key the load by type only (the second panel is served the first's).
+  it('loads a panel\'s own frame, and keeps the panels of one type apart', async () => {
+    const { loader, calls } = fixture()
+    const cover = await loader.load('T', { chromeId: 'com.apple.phone', width: 466, height: 678 })
+    expect(cover).not.toBeNull()
+    expect(calls.filter((c) => c[0] === 'plutil')).toHaveLength(0) // the chrome map is not consulted
+    const other = await loader.load('T', { chromeId: 'com.apple.missing', width: 669, height: 951 })
+    expect(other).toBeNull() // a different panel is a different load, and this one has no chrome on disk
+    expect(await loader.load('T', { chromeId: 'com.apple.phone', width: 466, height: 678 })).toBe(cover)
+  })
+
   it('runs nothing the second time a device type loads', async () => {
     const { loader, calls } = fixture()
     await loader.load('T')
@@ -200,5 +212,119 @@ describe('DeviceChromeLoader.load', () => {
     const { loader, cacheDir } = fixture({ button: true })
     await loader.load('T')
     expect(fs.readdirSync(cacheDir).filter((f) => f.startsWith('tapflow-frame-v3-'))).toEqual(['tapflow-frame-v3-phone-c800x800.png'])
+  })
+})
+
+// The iPhone Duo's two panels on Xcode 27.1, as its capabilities.plist states them.
+const DUO_CAPABILITIES = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', '__fixtures__', 'capabilities-displays-xcode27.1.json'), 'utf8'))['com.apple.CoreSimulator.SimDeviceType.iPhone-Duo'] as unknown
+const COVER = 'com.apple.dt.devicekit.chrome.phone15'
+const UNFOLDED = 'com.apple.dt.devicekit.chrome.phone14'
+
+describe('panelDisplayFromCapabilities', () => {
+  it('reads the cover: drawn upright, nearly square at the hinge and rounded outside', () => {
+    expect(panelDisplayFromCapabilities(DUO_CAPABILITIES, COVER)).toEqual({
+      artTurn: 0, cornerRadii: { topLeft: 8, topRight: 59, bottomRight: 59, bottomLeft: 8 },
+    })
+  })
+
+  it('reads the unfolded panel: drawn a three-quarter turn from how it is held', () => {
+    expect(panelDisplayFromCapabilities(DUO_CAPABILITIES, UNFOLDED)).toEqual({
+      artTurn: 270, cornerRadii: { topLeft: 55, topRight: 55, bottomRight: 55, bottomLeft: 55 },
+    })
+  })
+
+  it('knows nothing about a frame no display names, or a plist with no displays (Xcode 26)', () => {
+    expect(panelDisplayFromCapabilities(DUO_CAPABILITIES, 'com.apple.dt.devicekit.chrome.phone11')).toBeNull()
+    expect(panelDisplayFromCapabilities({ capabilities: {} }, COVER)).toBeNull()
+  })
+
+  it('reads an orientation that is not a quarter turn as none, and three corners as no corners', () => {
+    const display = { chromeIdentifier: COVER, nativeOrientation: 45, cornerRadiusUL: 1, cornerRadiusUR: 2, cornerRadiusLR: 3 }
+    expect(panelDisplayFromCapabilities({ capabilities: { displays: [display] } }, COVER)).toEqual({ artTurn: 0, cornerRadii: null })
+  })
+})
+
+describe('DeviceChromeLoader.load — a panel stated in capabilities', () => {
+  // A composite frame 400×800 with a 10 pt bezel (a 380×780 screen), one left- and one top-anchored button.
+  // The artwork is 60×10: a bar lying flat, which on a left edge is a quarter turn from where it belongs.
+  function panelFixture(display: Record<string, unknown>) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-chrome-panel-'))
+    const res = path.join(root, 'chrome', 'phone14.devicechrome', 'Contents', 'Resources')
+    fs.mkdirSync(res, { recursive: true })
+    const inputs = [
+      { name: 'volume-up', image: 'Vol', anchor: 'left', offsets: { normal: { x: 8, y: 100 }, rollover: { x: 5, y: 100 } } },
+      { name: 'power', image: 'Power', anchor: 'top', align: 'leading', offsets: { normal: { x: 150, y: 8 }, rollover: { x: 150, y: 4 } } },
+    ]
+    fs.writeFileSync(path.join(res, 'chrome.json'), JSON.stringify({ images: { sizing: { leftWidth: 10, rightWidth: 10, topHeight: 10, bottomHeight: 10 } }, inputs }))
+    for (const f of ['PhoneComposite.pdf', 'Vol.pdf', 'Power.pdf']) fs.writeFileSync(path.join(res, f), '')
+    const caps = path.join(root, 'profiles', 'Duo.simdevicetype', 'Contents', 'Resources')
+    fs.mkdirSync(caps, { recursive: true })
+    fs.writeFileSync(path.join(caps, 'capabilities.plist'), '')
+    const cacheDir = path.join(root, 'cache'); fs.mkdirSync(cacheDir, { recursive: true })
+    const swiftArgs: string[][] = []
+    const run: ChromeRunner = async (cmd, args) => {
+      if (cmd === 'xcrun') return Buffer.from(JSON.stringify({ devicetypes: [{ identifier: 'T', modelIdentifier: 'M', name: 'Duo' }] }))
+      if (cmd === 'plutil') return Buffer.from(JSON.stringify({ capabilities: { displays: [{ chromeIdentifier: 'com.apple.x.phone14', ...display }] } }))
+      if (cmd === 'sips') {
+        const f = args[args.length - 1]
+        return Buffer.from(f.endsWith('PhoneComposite.pdf') ? 'pixelWidth: 400\npixelHeight: 800\n' : 'pixelWidth: 60\npixelHeight: 10\n')
+      }
+      if (cmd === 'swift') { swiftArgs.push(args); fs.writeFileSync(args[args.length - 1], 'PNG'); return Buffer.alloc(0) }
+      throw new Error(`unexpected ${cmd}`)
+    }
+    const loader = new DeviceChromeLoader({ run, chromeDir: path.join(root, 'chrome'), profilesDir: path.join(root, 'profiles'), cacheDir, loadBudgetMs: 2000 })
+    // 380 frame points for a 400 pt screen: the frame is drawn at 0.95 of the panel's own size.
+    return { load: () => loader.load('T', { chromeId: 'com.apple.x.phone14', width: 400, height: 820 }), swiftArgs }
+  }
+
+  // Mutation: drop the turn (the margins grow by the bar's length, and the art is drawn flat on a side edge).
+  it('turns the buttons\' artwork into the frame\'s space, and measures them turned', async () => {
+    const { load, swiftArgs } = panelFixture({ nativeOrientation: 270 })
+    const chrome = (await load())!
+    const [vol, power] = chrome.buttons
+    // Turned, each bar is 10×60: it stands 10 − 5 = 5 pt off the left edge, and 60 / 2 − 4 = 26 above the top.
+    expect(chrome.compositeWidth).toBe((400 + 5) * 2)
+    expect(chrome.compositeHeight).toBe((800 + 26) * 2)
+    expect([vol.buttonW, vol.buttonH, power.buttonW, power.buttonH]).toEqual([20, 120, 20, 120])
+    // Every button render is asked for the turn; the frame itself is not a button render.
+    const buttonRenders = swiftArgs.filter((a) => /Vol|Power/.test(a[1]))
+    expect(buttonRenders.length).toBeGreaterThan(0)
+    for (const a of buttonRenders) expect(a[2]).toBe('270')
+  })
+
+  it('leaves the artwork alone for a panel drawn the way it is held', async () => {
+    const { load, swiftArgs } = panelFixture({ nativeOrientation: 0 })
+    const chrome = (await load())!
+    expect([chrome.buttons[0].buttonW, chrome.buttons[0].buttonH]).toEqual([120, 20])
+    for (const a of swiftArgs.filter((x) => /Vol|Power/.test(x[1]))) expect(a[2]).toBe('0')
+  })
+
+  // Mutation: restore leftWidth + roll.x − w/2 (the centre lands 20 pt short of the leading edge plus half the bar).
+  it('places a leading top button by its leading edge from the frame\'s own', async () => {
+    const { load } = panelFixture({ nativeOrientation: 0 })
+    const chrome = (await load())!
+    const power = chrome.buttons[1]
+    // Unturned, the volume bar stands 60 − 5 = 55 off the left edge, and the 60-wide power bar's leading edge
+    // is 150 in from the frame's.
+    expect(chrome.compositeWidth).toBe((55 + 400) * 2)
+    expect(power.rolloverOffset.x).toBe((55 + 150 + 30) * 2)
+    expect(power.normalOffset.x).toBe((55 + 150 + 30) * 2)
+  })
+
+  // Mutations: keep the frame's outline less its bezel; skip the scaling into frame points; send the corners
+  // for a uniform panel too.
+  it('takes the corners from capabilities, scaled into the frame, and spells them out only when they differ', async () => {
+    const asymmetric = (await panelFixture({ cornerRadiusUL: 8, cornerRadiusUR: 60, cornerRadiusLR: 60, cornerRadiusLL: 8 }).load())!
+    expect(asymmetric.screenCornerRadius).toBe(Math.round(60 * 0.95 * 2))
+    expect(asymmetric.screenCornerRadii).toEqual({ topLeft: Math.round(8 * 0.95 * 2), topRight: 114, bottomRight: 114, bottomLeft: 15 })
+    const uniform = (await panelFixture({ cornerRadiusUL: 40, cornerRadiusUR: 40, cornerRadiusLR: 40, cornerRadiusLL: 40 }).load())!
+    expect(uniform.screenCornerRadius).toBe(76)
+    expect('screenCornerRadii' in uniform).toBe(false)
+  })
+
+  it('keeps the frame-derived corner when capabilities states none', async () => {
+    const chrome = (await panelFixture({ nativeOrientation: 0 }).load())!
+    expect(chrome.screenCornerRadius).toBe(0) // the fixture's frame has no outline radius and a 10 pt bezel
+    expect('screenCornerRadii' in chrome).toBe(false)
   })
 })

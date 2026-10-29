@@ -18,6 +18,7 @@ vi.mock('@/hooks/useDecoderStream', () => ({
 }))
 
 import { useIOSScreen } from '@/hooks/useIOSScreen'
+import { iosTurn } from '@/lib/coordinate-transform'
 import { IOSDeviceScreen, type IOSFrameButtonControls } from '@/components/device/IOSDeviceScreen'
 import { useAndroidScreen, type AndroidScreen } from '@/hooks/useAndroidScreen'
 import { AndroidDeviceScreen } from '@/components/device/AndroidDeviceScreen'
@@ -40,17 +41,20 @@ const chrome = {
 } as unknown as React.ComponentProps<typeof IOSDeviceScreen>['chrome']
 
 function IOSHarness(props: {
+  chrome?: typeof chrome
+  isLandscape?: boolean
   buttons?: IOSFrameButtonControls
   onPointerDown?: () => void
   overlay?: ReactNode
   areaOverlay?: ReactNode
 }) {
+  const shown = props.chrome ?? chrome
   const screen = useIOSScreen({
-    chrome, binaryFrameHandlerRef: { current: undefined }, fps: 0, frameCount: { current: 0 },
+    chrome: shown, binaryFrameHandlerRef: { current: undefined }, fps: 0, frameCount: { current: 0 },
   })
   return (
     <IOSDeviceScreen
-      screen={screen} chrome={chrome} isLandscape={false} joined fps={0}
+      screen={screen} chrome={shown} turn={iosTurn(shown.streamRotation, props.isLandscape ?? false)} joined fps={0}
       containerHandlers={props.onPointerDown ? { onPointerDown: props.onPointerDown } : undefined}
       buttons={props.buttons} overlay={props.overlay} areaOverlay={props.areaOverlay}
     />
@@ -58,6 +62,100 @@ function IOSHarness(props: {
 }
 
 describe('IOSDeviceScreen', () => {
+  // The device's container is what turns; the area around it takes the turned size.
+  const container = (root: HTMLElement) => root.firstElementChild!.firstElementChild as HTMLElement
+
+  // Mutation: keep turning by the viewer's own landscape when the agent reports a turn. The Duo's
+  // unfolded panel arrives at 90, which the viewer's -90 would draw upside down.
+  it('turns the device as far as the agent says, whatever the viewer last asked for', () => {
+    for (const [streamRotation, isLandscape, deg] of [[90, false, 90], [180, false, 180], [270, false, 270], [0, true, 0]] as const) {
+      const { container: root, unmount } = render(<IOSHarness chrome={{ ...chrome, streamRotation }} isLandscape={isLandscape} />)
+      expect(container(root).style.transform, String(streamRotation)).toBe(`translate(-50%, -50%) rotate(${deg}deg)`)
+      unmount()
+    }
+  })
+
+  it('keeps its own landscape for a device that reports nothing', () => {
+    const { container: root } = render(<IOSHarness isLandscape />)
+    expect(container(root).style.transform).toBe('translate(-50%, -50%) rotate(270deg)')
+    // The area takes the turned size: the device's height across.
+    const area = root.firstElementChild as HTMLElement
+    expect(parseFloat(area.style.width)).toBeGreaterThan(parseFloat(area.style.height))
+  })
+
+  // Mutation: take the turn mod 360 (270 → 0 animates three quarters the wrong way round).
+  it('turns the short way round, and keeps the running angle', () => {
+    const at = (streamRotation: 0 | 90 | 180 | 270) => ({ ...chrome, streamRotation })
+    const { container: root, rerender } = render(<IOSHarness chrome={at(270)} />)
+    const deg = () => Number(container(root).style.transform.match(/rotate\((-?\d+)deg\)/)![1])
+    expect(deg()).toBe(270)
+    rerender(<IOSHarness chrome={at(0)} />)
+    expect(deg()).toBe(360)
+    rerender(<IOSHarness chrome={at(90)} />)
+    expect(deg()).toBe(450)
+    rerender(<IOSHarness chrome={at(0)} />)
+    expect(deg()).toBe(360)
+  })
+
+  // The Duo's unfolded panel is drawn a quarter round from its cover, so a fold changes the turn with no
+  // turn of the device — and animating it spun a dark panel round. Mutation: animate whenever the turn changes.
+  it('animates a turn, and not a fold that changes the turn with the frame', () => {
+    const turns = (el: HTMLElement) => el.className.includes('transition-transform')
+    const { container: root, rerender } = render(<IOSHarness chrome={{ ...chrome, streamRotation: 0 }} />)
+    rerender(<IOSHarness chrome={{ ...chrome, streamRotation: 90 }} />)
+    expect(turns(container(root))).toBe(true)
+    rerender(<IOSHarness chrome={{ ...chrome, framePng: 'unfolded', streamRotation: 180 }} />)
+    expect(container(root).style.transform).toBe('translate(-50%, -50%) rotate(180deg)')
+    expect(turns(container(root))).toBe(false)
+    rerender(<IOSHarness chrome={{ ...chrome, framePng: 'unfolded', streamRotation: 270 }} />)
+    expect(turns(container(root))).toBe(true)
+  })
+
+  // The overlay is on the screen and turns with the device; its words must not. Mutation: drop the turn back.
+  it('stands the waiting words upright on a turned device', () => {
+    const { container: root } = render(<IOSHarness chrome={{ ...chrome, streamRotation: 90 }} />)
+    const words = root.querySelector('[data-testid="screen-waiting"] span') as HTMLElement
+    expect(words.style.transform).toBe('rotate(-90deg)')
+  })
+
+  // Mutation: drop `usePanelFade` from the screen (a fold would swap panels with no transition at all).
+  it('fades the device in when it changes panel', () => {
+    const animate = vi.fn(() => ({ cancel: vi.fn() }))
+    Object.defineProperty(HTMLElement.prototype, 'animate', { configurable: true, value: animate })
+    try {
+      const { rerender } = render(<IOSHarness chrome={chrome} />)
+      expect(animate).not.toHaveBeenCalled()
+      rerender(<IOSHarness chrome={{ ...chrome, framePng: 'unfolded' }} />)
+      expect(animate).toHaveBeenCalledWith([{ opacity: 0 }, { opacity: 1 }], expect.anything())
+    } finally { delete (HTMLElement.prototype as { animate?: unknown }).animate }
+  })
+
+  // The Duo's cover is half the unfolded device in the hand; sized by its own frame, each panel filled the
+  // same height. Mutation: ignore `scaleBasis`.
+  it('sizes a panel by the device\'s largest panel when the agent says so', () => {
+    const height = (c: typeof chrome) => {
+      const { container: root, unmount } = render(<IOSHarness chrome={c} />)
+      const h = parseFloat((root.firstElementChild as HTMLElement).style.height)
+      unmount()
+      return h
+    }
+    const alone = height(chrome)
+    // 1500 pt against the 750 px the viewer allows: drawn at half, where this frame alone fits as it is.
+    const inTwo = height({ ...chrome, scaleBasis: 3000 })
+    expect(inTwo).toBeCloseTo(alone / 2, 0)
+  })
+
+  // Mutation: ignore `screenCornerRadii`. The Duo's cover would be rounded at the hinge.
+  it('rounds each corner of the screen as the agent states it', () => {
+    const radii = { topLeft: 16, topRight: 118, bottomRight: 118, bottomLeft: 16 }
+    const { container: root } = render(<IOSHarness chrome={{ ...chrome, screenCornerRadius: 118, screenCornerRadii: radii }} />)
+    const canvas = root.querySelector('canvas')!
+    const [tl, tr, br, bl] = canvas.style.borderRadius.split(' ').map(parseFloat)
+    expect(tl).toBe(bl)
+    expect(tr).toBe(br)
+    expect(tr).toBeGreaterThan(tl * 5)
+  })
+
   // A page that only watches passes no button controls; a press target there would be an element
   // that looks pressable and leads nowhere.
   it('draws the frame buttons but no press targets when nobody can press', () => {

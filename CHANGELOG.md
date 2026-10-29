@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-29
+
+### Added
+
+- **The iOS agent drives the iPhone Duo simulator.** On a Mac with Xcode 27.1 and Apple silicon, the agent streams the iPhone Duo's lit panel in that panel's frame, delivers taps, gestures, typing and hardware buttons to it, folds and unfolds it through the same posture capability as a foldable Android emulator, and follows a fold or turn made in Xcode's DeviceHub. An install without the helper or `devicectl` leaves the iPhone Duo out of the device list, and a runtime that refuses the helper fails the boot with the reason. The iPad mini's volume buttons on its top edge sit 5 pt further along it, the one change to a single-panel frame.
+- **The dashboard shows and folds the iPhone Duo.** The fold control appears for it, with **Folding...** or **Unfolding...** on the screen while it folds. Both panels are drawn at one scale, the device is turned the way it is held, and **Rotate** turns it a quarter clockwise. A fold or turn made in Xcode's DeviceHub shows within about 10 seconds. Every iOS device now turns on screen in 0.3 s, during which a tap on the device is not sent.
+
+### Changed
+
+- **Every iOS simulator turns the way it is held, a quarter clockwise per press.** **Rotate** used to switch an iPhone or iPad between portrait and one landscape; four presses now take it all the way round, so both landscapes, and their different safe areas, can be tested. The frame turns with the device, and an app that does not support the orientation shows sideways, as in a hand. The orientation is the device's: tapflow no longer stands it upright when a session starts or turns it back when you leave, so a reload or a second viewer finds it where it was. tapflow reads where the device is held when a session starts and on each press, so a turn made in Xcode's DeviceHub or Simulator.app is picked up then. A flow run still starts the device upright, so it replays from the same orientation. Upgrade the relay with the agent: a dashboard from 0.30.0 or earlier draws every session upright and shows a device left turned on its side. A viewer whose agent is older still toggles.
+
+- **Android emulators turn the way they are held too.** On an emulator streaming over gRPC, **Rotate** spins the device and turns its body a quarter clockwise, as on iOS, and a tap right after the turn lands where it is aimed; an app that does not support the orientation shows on its side, a turn made in an emulator window you started yourself shows in tapflow, and tapflow no longer stands the device upright when a session starts or turns it back when you leave — except when it starts the emulator itself and for a flow run. tapflow frees each AVD's rotation lock once, the first time it sees it, to clear the lock earlier versions set; a lock you set after that stays. Dashboard screenshots and recordings keep the body's orientation, while the MCP server's screenshots still follow the screen Android draws. Real devices and emulators without gRPC still toggle portrait/landscape. Upgrade the relay with the agent: an older dashboard draws Android emulators the old way.
+
+- **Watching an iOS device costs the browser less.** The dashboard kept a full-resolution copy of the picture for recording and screenshots, redrawn on every display refresh, up to 120 times a second for a 30 fps stream. It is now redrawn only when a new frame arrives.
+
+- **Streaming an iOS simulator costs the agent Mac less CPU.** The screen-capture helper no longer looks up the simulator's screen on every frame the simulator draws, copies each frame on the GPU instead of the CPU, and is built with optimisation: about a third of the CPU it used while the screen moves.
+
+### Fixed
+
+- **A recording of an iOS device in landscape is no longer saved sideways.** It is saved the way the device is shown on screen, as Android recordings already were.
+- **Device audio plays without ticking.** The dashboard played the audio at the speakers' rate, which put a tick between audio chunks several times a second wherever the speakers run at 48 kHz, as most do; it now plays it at its own 44.1 kHz. The iOS audio helper also dropped part of a sample every 10 ms, which ticked too and delivered slightly less audio than the dashboard played, so playback ran dry about once a minute; it now resamples without a break. Because the helper changed, macOS asks the agent Mac once more for permission to record audio, which the Android host-mute needs too: until it is allowed, iOS audio is silent in the browser and an Android emulator's sound plays on the agent Mac. Allow it, or run `tapflow agent start` to show the prompt again.
+- **An iOS recording is no longer small.** It was recorded at the size the device was shown on the page, under a third of the simulator's resolution; it is now recorded at up to the stream's resolution, frame included, held to 1920 pixels on its longest side.
+
 ## [0.30.0] - 2026-10-27
 
 ### Added
@@ -1103,7 +1126,8 @@ found out by waiting.
 
 - Automatic `tapflow.config.json` creation as a side effect of `tapflow start` / `tapflow relay start`.
 
-[Unreleased]: https://github.com/jo-duchan/tapflow/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/jo-duchan/tapflow/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/jo-duchan/tapflow/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/jo-duchan/tapflow/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/jo-duchan/tapflow/compare/v0.28.1...v0.29.0
 [0.28.1]: https://github.com/jo-duchan/tapflow/compare/v0.28.0...v0.28.1

@@ -1,3 +1,4 @@
+import type { Turn } from '@/lib/coordinate-transform'
 import type { ChromeButton, FormFactor } from '@tapflowio/protocol'
 
 export interface Rect { left: number; top: number; right: number; bottom: number }
@@ -88,8 +89,8 @@ const VOLUME_DECREMENT = 234
  * usage — the device does the remapping — so only the title follows the effect. An iPhone's volume
  * does not follow orientation, so anything but a `tablet` keeps the physical names.
  *
- * `landscape` is the viewer's `rotate(-90deg)`, counter-clockwise: a composite point (x, y) is seen
- * at (y, width − x). Of the two volume buttons as seen, the one further right wins when they are
+ * `turn` is how far the viewer turns the device, clockwise; the single-panel landscape is 270, the
+ * viewer's `rotate(-90deg)`, where a composite point (x, y) is seen at (y, width − x). Of the two volume buttons as seen, the one further right wins when they are
  * apart side by side, and the one higher up when they are stacked. Measured on 2026-10-01 against the
  * real chrome: an iPad Pro's right-edge pair swaps in landscape, an iPad mini's top-edge pair does not
  * — the pair that would both be wrong if the turn were the other way.
@@ -97,7 +98,7 @@ const VOLUME_DECREMENT = 234
 export function buttonTitles(
   buttons: readonly ChromeButton[],
   box: { width: number; height: number },
-  landscape: boolean,
+  turn: Turn,
   formFactor: FormFactor | undefined,
 ): string[] {
   const titles = buttons.map((b) => b.accessibilityTitle)
@@ -110,7 +111,12 @@ export function buttonTitles(
     const r = buttonHitRect(b)
     const cx = (r.left + r.right) / 2
     const cy = (r.top + r.bottom) / 2
-    return landscape ? { x: cy, y: box.width - cx } : { x: cx, y: cy }
+    switch (turn) {
+      case 90: return { x: box.height - cy, y: cx }
+      case 180: return { x: box.width - cx, y: box.height - cy }
+      case 270: return { x: cy, y: box.width - cx }
+      default: return { x: cx, y: cy }
+    }
   }
   const u = seen(buttons[up])
   const d = seen(buttons[down])

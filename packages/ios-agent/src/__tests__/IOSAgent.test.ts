@@ -75,6 +75,7 @@ vi.mock('../ScreenCaptureStreamer', async (importOriginal) => {
     ScreenCaptureStreamer: vi.fn(function () { return ({
       start: () => new ReadableStream({ start() {} }),
       requestKeyframe: vi.fn(),
+      selectPanel: vi.fn(),
     }) }),
   }
 })
@@ -119,6 +120,10 @@ import type { ServiceTier } from '@tapflowio/protocol'
 import { LEAN_LABELS } from '../leanLabels'
 import { TouchHelper } from '../TouchHelper'
 import { XCUITreeReader } from '../XCUITreeReader'
+import { PanelState } from '../PanelState'
+import { PhysicalOrientation, type DeviceOrientation } from '../PhysicalOrientation'
+import type { GuestHelperNative } from '../GuestHelper'
+import { EventEmitter } from 'events'
 import { barrier, waitForOpen, waitForType, waitForTypeOrNull } from '@tapflowio/test-utils'
 import type { SessionJoined } from '@tapflowio/protocol'
 const MockTouchHelper = vi.mocked(TouchHelper)
@@ -721,6 +726,715 @@ describe('IOSAgent', () => {
       const shutdownOrder = (simctl.shutdown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!
       expect(stopIfDevice.mock.invocationCallOrder[0]!).toBeLessThan(shutdownOrder)
 
+      agent.disconnect()
+      browser.close()
+    })
+  })
+
+  // iPhone Duo (Xcode 27.1): more than one integrated panel. Its input goes through the in-simulator
+  // guest-helper, never the Indigo TouchHelper, whose writes answer success there and land nowhere.
+  describe('a multi-panel device', () => {
+    type GuestProc = EventEmitter & {
+      pid: number; stdout: EventEmitter; stderr: EventEmitter; kill: ReturnType<typeof vi.fn>
+      stdin: EventEmitter & { writable: boolean; write: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> }
+    }
+    const COVER = 'COVER-UUID'
+    const OPEN = 'OPEN-UUID'
+    // A guest-helper that comes up ready and answers every done-command, recording what it was told.
+    // The device the fakes describe: which panel is lit and which way the device is held. The helper's commands
+    // move it the way the Duo does (measured, M1): past 90° the unfolded panel lights, a fold leaves the way it
+    // is held alone, and each `orient` label is the physical orientation of the same name on either panel.
+    const HELD: Record<string, DeviceOrientation> = {
+      portrait: 'portrait', 'landscape-right': 'landscapeRight', pud: 'portraitUpsideDown', 'landscape-left': 'landscapeLeft',
+    }
+    const heldAs = (held: () => string) => new PhysicalOrientation({ readOrientation: async () => ({ result: { deviceOrientation: held() } }) })
+    function duoWorld() {
+      const world: { open: boolean; held: DeviceOrientation; reads: number } = { open: false, held: 'portrait', reads: 0 }
+      const panelState = new PanelState({ readDisplays: async () => (world.reads++, { result: { displays: [
+        { name: 'LCD', displayId: 1, active: !world.open, currentOrientation: 'rot0', type: { integrated: {} } },
+        { name: 'LCD-1', displayId: 3, active: world.open, currentOrientation: 'rot90', type: { integrated: {} } },
+      ] } }) }, 300)
+      const physical = heldAs(() => world.held)
+      const onCommand = (line: string) => {
+        const [cmd, a, b] = line.trim().split(' ')
+        if (cmd === 'hinge') { world.open = Number(b) > 90; void a }
+        if (cmd === 'orient') world.held = HELD[a]
+      }
+      return { world, panelState, physical, onCommand }
+    }
+    function guestNative(opts: { fatal?: string; unavailable?: string; onCommand?: (line: string) => void; unanswered?: string[]; silent?: boolean } = {}) {
+      const procs: GuestProc[] = []
+      let readied = 0
+      const native = {
+        spawn: vi.fn<GuestHelperNative['spawn']>(() => {
+          const proc = new EventEmitter() as GuestProc
+          proc.pid = 50_000 + procs.length
+          proc.stdout = new EventEmitter()
+          proc.stderr = new EventEmitter()
+          proc.kill = vi.fn(() => true)
+          proc.stdin = Object.assign(new EventEmitter(), {
+            writable: true,
+            end: vi.fn(),
+            write: vi.fn((line: string) => {
+              opts.onCommand?.(line)
+              const cmd = line.split(' ')[0]
+              if (cmd !== 'touch' && cmd !== 'pinch' && !opts.unanswered?.includes(cmd)) setImmediate(() => proc.stdout.emit('data', Buffer.from(`done 0 ${cmd}\n`)))
+              return true
+            }),
+          }) as never
+          setImmediate(() => {
+            if (opts.fatal) { proc.stdout.emit('data', Buffer.from(`fatal ${opts.fatal}\n`)); proc.stdin.writable = false; proc.emit('exit', 3); return }
+            // Silent: running, and never ready — what a helper stalled in its device lookup looks like.
+            if (opts.silent) { proc.stdout.emit('data', Buffer.from(`pid ${proc.pid + 1}\n`)); return }
+            proc.stdout.emit('data', Buffer.from(`pid ${proc.pid + 1}\nready\n`)); readied++
+          })
+          procs.push(proc)
+          return proc as never
+        }),
+        findOrphans: vi.fn<GuestHelperNative['findOrphans']>(async () => []),
+        killPid: vi.fn<GuestHelperNative['killPid']>(),
+        unavailableReason: vi.fn<GuestHelperNative['unavailableReason']>(async () => opts.unavailable ?? null),
+      }
+      const lines = () => procs.flatMap((p) => p.stdin.write.mock.calls.map((c) => String(c[0]).trim()))
+      // Ready, and a tick later for the devicectl reading that says which panel is lit.
+      const ready = async () => {
+        await vi.waitFor(() => expect(readied).toBeGreaterThan(0))
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      return { native, procs, lines, ready }
+    }
+    // devicectl: the Duo is folded, so the cover (display 1) is lit.
+    const folded = () => new PanelState({ readDisplays: async () => ({ result: { displays: [
+      { name: 'LCD', displayId: 1, active: true, currentOrientation: 'rot0', type: { integrated: {} } },
+      { name: 'LCD-1', displayId: 3, active: false, currentOrientation: 'rot90', type: { integrated: {} } },
+    ] } }) })
+    const unfolded = (rotation: string) => new PanelState({ readDisplays: async () => ({ result: { displays: [
+      { name: 'LCD', displayId: 1, active: false, currentOrientation: 'rot0', type: { integrated: {} } },
+      { name: 'LCD-1', displayId: 3, active: true, currentOrientation: rotation, type: { integrated: {} } },
+    ] } }) })
+    function duoSimctl(panels = 2, booted = true): SimctlWrapper {
+      const sw = mockSimctl(booted)
+      Object.assign(sw, {
+        integratedPanelCounts: vi.fn(async () => new Map([['type-iphone-15', panels]])),
+        // The Duo's capabilities: the unfolded panel is drawn turned 270.
+        typePanels: vi.fn(async () => [
+          { deviceName: 'primary', chromeId: 'com.apple.dt.devicekit.chrome.phone15', width: 1398, height: 2034, scale: 3, nativeOrientation: 0 },
+          { deviceName: 'primary-1', chromeId: 'com.apple.dt.devicekit.chrome.phone14', width: 2007, height: 2853, scale: 3, nativeOrientation: 270 },
+        ]),
+        integratedScreens: vi.fn(async () => [
+          { screenId: 1, uuid: COVER, deviceName: 'primary', width: 1398, height: 2034, scale: 3, chromeId: 'com.apple.dt.devicekit.chrome.phone15' },
+          { screenId: 3, uuid: OPEN, deviceName: 'primary-1', width: 2007, height: 2853, scale: 3, chromeId: 'com.apple.dt.devicekit.chrome.phone14' },
+        ]),
+      })
+      return sw
+    }
+    // A frame per panel, told apart by the chrome the loader was asked for; the model's frame has none.
+    // Each panel's expanded composite, at 2×: the unfolded frame is drawn turned (native 270), so it is wide.
+    const COMPOSITES: Record<string, [number, number]> = { phone15: [1000, 1450], phone14: [2000, 1420], model: [1000, 1450] }
+    const chromeOf = (name: string) =>
+      ({ framePng: name, compositeWidth: COMPOSITES[name]?.[0], compositeHeight: COMPOSITES[name]?.[1] } as unknown as ChromeData)
+    function panelChromes() {
+      return { load: vi.fn(async (_type: string, panel?: { chromeId: string }) => chromeOf(panel?.chromeId.split('.').pop() ?? 'model')) } as unknown as DeviceChromeLoader
+    }
+    async function bootedDuo(opts: {
+      panels?: number; boot?: boolean; captureHelper?: boolean; chromeLoader?: DeviceChromeLoader
+      panelState?: PanelState; physical?: PhysicalOrientation; world?: ReturnType<typeof duoWorld>
+      fatal?: string; unavailable?: string; booted?: boolean; pollMs?: number; unanswered?: string[]
+      idlePollMs?: number; quietMs?: number; silent?: boolean; helperBootReadyMs?: number
+    } = {}) {
+      const guest = guestNative({ fatal: opts.fatal, unavailable: opts.unavailable, onCommand: opts.world?.onCommand, unanswered: opts.unanswered, silent: opts.silent })
+      const simctl = duoSimctl(opts.panels, opts.booted)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      // Everything the viewer receives, from the start: some messages (a re-sent chrome) can land during the boot.
+      const received: Array<{ type: string; payload?: unknown }> = []
+      browser.on('message', (d, isBinary) => {
+        // Binary frames are the stream; a throw here would break the socket for every other listener.
+        if (isBinary) return
+        try { received.push(JSON.parse(String(d))) } catch { /* not a control message */ }
+      })
+      await waitForOpen(browser)
+      // `intervalMs` selects the MJPEG fallback; leaving it out takes the capture-helper path a real agent uses.
+      const agent = new IOSAgent({
+        ...(opts.captureHelper ? {} : { intervalMs: 50 }), guestHelperNative: guest.native,
+        panelState: opts.panelState ?? opts.world?.panelState ?? folded(), foldSettleMs: 500, panelPollMs: opts.pollMs ?? 50,
+        ...(opts.idlePollMs ? { panelIdlePollMs: opts.idlePollMs } : {}), ...(opts.quietMs ? { panelQuietMs: opts.quietMs } : {}),
+        ...(opts.helperBootReadyMs ? { helperBootReadyMs: opts.helperBootReadyMs } : {}),
+        physicalOrientation: opts.physical ?? opts.world?.physical ?? heldAs(() => 'portrait'),
+        ...(opts.chromeLoader ? { chromeLoader: opts.chromeLoader } : {}),
+      }, simctl)
+      await agent.connect(`ws://localhost:${port}`)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      if (opts.boot !== false && !opts.fatal && !opts.unavailable) {
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+        await waitForType(browser, 'device:ready')
+      }
+      return { agent, browser, guest, simctl, received }
+    }
+    const tap = (browser: WebSocket, sessionId: string, requestId: string) => {
+      browser.send(JSON.stringify({ type: 'input:touch:start', sessionId, payload: { x: 0.5, y: 0.5 } }))
+      browser.send(JSON.stringify({ type: 'input:touch:end', requestId, sessionId, payload: { x: 0.5, y: 0.5 } }))
+    }
+
+    beforeEach(() => { MockTouchHelper.mockClear() })
+
+    it('taps the lit panel through guest-helper and never builds an Indigo channel', async () => {
+      const { agent, browser, guest } = await bootedDuo()
+      await guest.ready()
+      const done = waitForType(browser, 'input:done')
+      tap(browser, agent.sessionId!, 'rq-duo-tap')
+      expect((await done).requestId).toBe('rq-duo-tap')
+      expect(guest.lines()).toEqual(expect.arrayContaining([`touch ${COVER} d 0.5 0.5 0`, `touch ${COVER} u 0.5 0.5 0`]))
+      expect(guest.native.spawn.mock.calls[0][1]).toEqual(['--udid', 'dev-1', '--touchscreen', COVER, '--touchscreen', OPEN])
+      expect(MockTouchHelper).not.toHaveBeenCalled()
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('pastes typed text with a guest ⌘V, not an Indigo key the Duo drops', async () => {
+      const { agent, browser, guest, simctl } = await bootedDuo()
+      await guest.ready()
+      const done = waitForType(browser, 'input:type-done')
+      browser.send(JSON.stringify({ type: 'input:type', requestId: 'rq-duo-type', sessionId: agent.sessionId, payload: { text: 'hi' } }))
+      await done
+      expect(simctl.setPasteboard).toHaveBeenCalledWith('dev-1', 'hi')
+      expect(guest.lines()).toContain('key 7 25 100 7 227')
+      expect(MockTouchHelper).not.toHaveBeenCalled()
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('takes the guest-helper path on a session that was never booted by this agent (an agent restart)', async () => {
+      const { agent, browser, guest } = await bootedDuo({ boot: false })
+      browser.send(JSON.stringify({ type: 'input:touch:start', sessionId: agent.sessionId, payload: { x: 0.5, y: 0.5 } }))
+      await vi.waitFor(() => expect(guest.procs).toHaveLength(1))
+      expect(MockTouchHelper).not.toHaveBeenCalled()
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('stops the helper when the device is shut down, but not when the relay connection is rebuilt', async () => {
+      const { agent, browser, guest } = await bootedDuo()
+      await vi.waitFor(() => expect(guest.procs).toHaveLength(1))
+      const proc = guest.procs[0]
+      const internal = agent as unknown as { cleanupDeviceState(s: unknown): void; deviceStates: Map<string, unknown> }
+      internal.cleanupDeviceState(internal.deviceStates.get(agent.sessionId!))
+      expect(proc.stdin.end).not.toHaveBeenCalled()
+      browser.send(JSON.stringify({ type: 'device:shutdown', requestId: 'rq-off', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await vi.waitFor(() => expect(proc.stdin.end).toHaveBeenCalled())
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('points the capture at the lit panel once the helper has read the panels', async () => {
+      const MockCapture = vi.mocked(ScreenCaptureStreamer)
+      MockCapture.mockClear()
+      const { agent, browser, guest } = await bootedDuo({ captureHelper: true })
+      await guest.ready()
+      // Whichever came first — the stream or the panels — the capture must end up on the cover: built with it,
+      // or switched to it afterwards. Before this, the largest panel was captured, which is dark while folded.
+      await vi.waitFor(() => {
+        expect(MockCapture).toHaveBeenCalled()
+        const last = MockCapture.mock.results.length - 1
+        const switched = (MockCapture.mock.results[last].value as { selectPanel: ReturnType<typeof vi.fn> }).selectPanel.mock.calls
+        const panel = switched.length ? switched.at(-1)![0] : MockCapture.mock.calls[last][4]
+        expect(panel).toEqual({ width: 1398, height: 2034 })
+      })
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('sends the lit panel\'s own frame once the panels are known', async () => {
+      const chromeLoader = panelChromes()
+      const { agent, browser, guest, received } = await bootedDuo({ chromeLoader })
+      const chromes = () => received.filter((m) => m.type === 'session:chrome').map((m) => (m.payload as { framePng: string }).framePng)
+      await guest.ready()
+      await vi.waitFor(() => expect(chromes().at(-1)).toBe('phone15'))
+      // The folded Duo shows its cover upright, and says so; a single-panel device never carries the field.
+      const last = received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { streamRotation?: number }
+      expect(last.streamRotation).toBe(0)
+      expect(vi.mocked(chromeLoader.load)).toHaveBeenCalledWith('type-iphone-15', { chromeId: 'com.apple.dt.devicekit.chrome.phone15', width: 466, height: 678 })
+      agent.disconnect()
+      browser.close()
+    })
+
+    // An order the tests above leave to timing, forced. Mutation: drop the re-send at the end of the boot (a
+    // frame the helper settled first is overwritten by the model's). The capture switch has no such order to
+    // force any more: the boot waits for the helper, which reads the panels first, so a stream always starts
+    // knowing them — a fold is what switches it, and the unfold test below holds that.
+    it('ends on the lit panel\'s frame when the panels are known before the boot\'s frame has loaded', async () => {
+      let releaseModel: () => void = () => {}
+      const modelHeld = new Promise<void>((r) => { releaseModel = r })
+      const chromeLoader = { load: vi.fn(async (_t: string, panel?: { chromeId: string }) => {
+        if (!panel) await modelHeld
+        return chromeOf(panel?.chromeId.split('.').pop() ?? 'model')
+      }) } as unknown as DeviceChromeLoader
+      const guest = guestNative()
+      const simctl = duoSimctl()
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      const chromes: string[] = []
+      browser.on('message', (d, isBinary) => {
+        if (isBinary) return
+        try { const m = JSON.parse(String(d)); if (m.type === 'session:chrome') chromes.push(m.payload.framePng) } catch { /* not control */ }
+      })
+      await waitForOpen(browser)
+      const agent = new IOSAgent({ intervalMs: 50, guestHelperNative: guest.native, panelState: folded(), chromeLoader }, simctl)
+      await agent.connect(`ws://localhost:${port}`)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo-race', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await guest.ready()
+      await new Promise((r) => setTimeout(r, 50))
+      releaseModel()
+      await vi.waitFor(() => expect(chromes.at(-1)).toBe('phone15'))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // Mutation: drop the panel's native turn (the unfolded panel would be drawn a quarter off DeviceHub's).
+    it('turns the unfolded panel by the way the device is held plus its own native turn, and says nothing while that is unread', async () => {
+      for (const [held, expected] of [['portrait', 90], ['landscapeRight', 180], ['portraitUpsideDown', 270], ['landscapeLeft', 0], ['sideways', undefined]] as const) {
+        const { agent, browser, guest, received } = await bootedDuo({ chromeLoader: panelChromes(), panelState: unfolded('rot0'), physical: heldAs(() => held) })
+        await guest.ready()
+        await vi.waitFor(() => expect((received.filter((m) => m.type === 'session:chrome').at(-1)?.payload as { framePng?: string })?.framePng).toBe('phone14'))
+        const last = received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { streamRotation?: number }
+        expect(last.streamRotation, held).toBe(expected)
+        expect('streamRotation' in last, held).toBe(expected !== undefined)
+        agent.disconnect()
+        browser.close()
+      }
+    })
+
+    const postures = (received: Array<{ type: string; payload?: unknown }>) =>
+      received.filter((m) => m.type === 'device:postures').map((m) => m.payload as { postures: Array<{ id: string }>; currentId: string | null })
+
+    // A viewer draws a foldable's skeleton while it boots, and could only know from this. Mutation: report
+    // the product family alone (the Duo is an iPhone).
+    it('registers a multi-panel device as foldable', async () => {
+      const agent = new IOSAgent({ guestHelperNative: guestNative().native }, duoSimctl())
+      await agent.connect(`ws://localhost:${port}`)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForType(browser, 'agents:listed')
+      const sessions = listed.sessions as Array<{ devices: Array<{ formFactor?: string }> }>
+      expect(sessions[0]?.devices[0]?.formFactor).toBe('foldable')
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('offers Folded and Unfolded once the helper is ready, and says it is folded', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world })
+      await vi.waitFor(() => expect(postures(received).at(-1)).toEqual({ postures: [{ id: 'closed', label: 'Folded' }, { id: 'open', label: 'Unfolded' }], currentId: 'closed' }))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // DeviceHub draws the cover at half the unfolded device; sized by its own frame, each panel filled the
+    // viewer's height. And from the first frame: one that came without it was drawn large and then shrank.
+    // Mutations: leave it out; take the lit panel's own size; take the height alone (the unfolded frame is
+    // wide); send the first frame before the scale is known.
+    it('sizes every panel by the largest panel, on either, from the first frame', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes(), pollMs: 600_000 })
+      const sent = () => received.filter((m) => m.type === 'session:chrome').map((m) => m.payload as ChromeData)
+      const last = () => sent().at(-1)!
+      await vi.waitFor(() => expect(last()).toMatchObject({ framePng: 'phone15', scaleBasis: 2000 }))
+      expect(sent().map((c) => c.scaleBasis)).not.toContain(undefined)
+      browser.send(JSON.stringify({ type: 'input:posture', sessionId: agent.sessionId, payload: { postureId: 'open' } }))
+      await vi.waitFor(() => expect(last()).toMatchObject({ framePng: 'phone14', scaleBasis: 2000 }))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // On a loaded Mac the helper answered a fold after its panel had lit. Mutation: wait for the answer
+    // before watching the panel (the fold would be reported failed, the device having folded).
+    it('takes a lit panel as the fold done, whether or not the helper has answered', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes(), pollMs: 600_000, unanswered: ['hinge'] })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      browser.send(JSON.stringify({ type: 'input:posture', sessionId: agent.sessionId, payload: { postureId: 'open' } }))
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('open'))
+      await vi.waitFor(() => expect((received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { framePng: string }).framePng).toBe('phone14'))
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('unfolds: sweeps the hinge, waits for the panel, turns nothing, and follows it', async () => {
+      const world = duoWorld()
+      const MockCapture = vi.mocked(ScreenCaptureStreamer)
+      MockCapture.mockClear()
+      // The poll is effectively off: the fold must point the capture and the frame by itself, not leave it to
+      // the next read (2 s in production).
+      const { agent, browser, guest, received } = await bootedDuo({ world, captureHelper: true, chromeLoader: panelChromes(), pollMs: 600_000 })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      browser.send(JSON.stringify({ type: 'input:posture', sessionId: agent.sessionId, payload: { postureId: 'open' } }))
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('open'))
+      // Flat, DeviceHub's fully open pose — not its half-open 130°. Mutation: sweep to 130.
+      expect(guest.lines()).toContain('hinge 0 180 800')
+      expect(guest.lines().filter((l) => l.startsWith('orient'))).toEqual([])
+      // Held upright, the unfolded panel shows turned 90 — its native turn, which is how DeviceHub draws it.
+      await vi.waitFor(() => expect(received.filter((m) => m.type === 'session:chrome').at(-1)!.payload).toMatchObject({ framePng: 'phone14', streamRotation: 90 }))
+      const capture = MockCapture.mock.results.at(-1)!.value as { selectPanel: ReturnType<typeof vi.fn> }
+      expect(capture.selectPanel).toHaveBeenLastCalledWith({ width: 2007, height: 2853 })
+      // And back.
+      browser.send(JSON.stringify({ type: 'input:posture', sessionId: agent.sessionId, payload: { postureId: 'closed' } }))
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      expect(guest.lines()).toContain('hinge 180 0 800')
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('reports where the device really is when a fold does not land', async () => {
+      const world = duoWorld()
+      // A world whose hinge does nothing: the panel never changes, so the fold times out.
+      const stuck = { ...world, onCommand: () => {} }
+      const { agent, browser, received } = await bootedDuo({ world: stuck })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      const before = postures(received).length
+      browser.send(JSON.stringify({ type: 'input:posture', sessionId: agent.sessionId, payload: { postureId: 'open' } }))
+      await vi.waitFor(() => expect(postures(received).length).toBeGreaterThan(before), { timeout: 3000 })
+      expect(postures(received).at(-1)?.currentId).toBe('closed')
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('hides the fold control everywhere when the helper is gone for good', async () => {
+      const world = duoWorld()
+      const { agent, browser, guest, received } = await bootedDuo({ world })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.postures).toHaveLength(2))
+      // Three deaths in the window exhaust the respawn budget.
+      for (let n = 1; n <= 3; n++) {
+        await vi.waitFor(() => expect(guest.procs).toHaveLength(n))
+        await guest.ready()
+        const proc = guest.procs[n - 1]
+        proc.stdin.writable = false
+        proc.emit('exit', 1)
+      }
+      await vi.waitFor(() => expect(postures(received).at(-1)).toEqual({ postures: [], currentId: null }))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // The model's frame and a panel's are loaded separately, and a model frame that failed left the session with
+    // no frame for good: the lit panel's was never sent. Mutation: gate the re-send on a loaded frame again.
+    it('sends the lit panel\'s frame when the model\'s did not load', async () => {
+      const loader = { load: vi.fn(async (_type: string, panel?: { chromeId: string }) => (panel ? chromeOf(panel.chromeId.split('.').pop()!) : null)) } as unknown as DeviceChromeLoader
+      const { agent, browser, received } = await bootedDuo({ world: duoWorld(), chromeLoader: loader })
+      await vi.waitFor(() => expect(received.filter((m) => m.type === 'session:chrome').map((m) => (m.payload as { framePng: string }).framePng)).toContain('phone15'))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // A run replays from the same orientation; the single-panel stand-up skips a multi-panel device, so its own
+    // runs it through the helper. Mutation: drop it.
+    it('turns a Duo upright for a run, through its helper', async () => {
+      const world = duoWorld()
+      world.world.held = 'landscapeRight'
+      const { agent, browser, guest, received } = await bootedDuo({ world, chromeLoader: panelChromes(), boot: false })
+      const ok = vi.fn(async () => {})
+      const sim = (agent as unknown as { simctl: Record<string, unknown> }).simctl
+      Object.assign(sim, { uninstallAppForReset: ok, clearAppDataIfInstalled: ok, waitForBootStatus: ok, resetKeychain: ok, resetPrivacy: ok, clearLocation: ok })
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo-run', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', runReset: { uninstall: [], clear: [] } } }))
+      await waitForType(browser, 'device:ready')
+      await vi.waitFor(() => expect(world.world.held).toBe('portrait'))
+      expect(guest.lines()).toContain('orient portrait')
+      // And re-described as upright. The re-send after the turn makes it immediate; the panel poll `turnHeld` re-arms
+      // would get there within its interval too, so this holds the end state and not the re-send itself.
+      await vi.waitFor(() => expect((received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { streamRotation?: number }).streamRotation).toBe(0))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // A newer boot can land while a run's stand-up waits in the rotation queue. The superseded run neither turns nor
+    // goes on to open a stream over the newer boot's. Mutation: drop the bootSeq checks around the turn.
+    it('drops a run\'s stand-up when a newer boot supersedes it while the turn waits', async () => {
+      const world = duoWorld()
+      world.world.held = 'landscapeRight'
+      const { agent, browser, guest } = await bootedDuo({ world, chromeLoader: panelChromes(), boot: false })
+      const ok = vi.fn(async () => {})
+      const sim = (agent as unknown as { simctl: Record<string, unknown> }).simctl
+      Object.assign(sim, { uninstallAppForReset: ok, clearAppDataIfInstalled: ok, waitForBootStatus: ok, resetKeychain: ok, resetPrivacy: ok, clearLocation: ok })
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      void (agent as unknown as { enqueueRotation(id: string, step: () => Promise<void>): Promise<void> }).enqueueRotation('dev-1', () => gate)
+      const superseded = waitForType(browser, 'device:boot-error')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-run', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', runReset: { uninstall: [], clear: [] } } }))
+      await guest.ready()
+      await new Promise((r) => setTimeout(r, 50))
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-next', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      const live = [...(agent as unknown as { deviceStates: Map<string, { streamWs: unknown }> }).deviceStates.values()][0]!
+      const newer = live.streamWs
+      release()
+      const e = await superseded
+      expect(e['requestId']).toBe('rq-run')
+      await new Promise((r) => setTimeout(r, 50))
+      // `openStreamWs` assigns the state's socket before it awaits, so a superseded boot reaching it took the newer
+      // boot's stream reference — the later bootSeq check answers the request but cannot give the reference back.
+      expect(live.streamWs).toBe(newer)
+      expect(guest.lines()).not.toContain('orient portrait')
+      expect(world.world.held).toBe('landscapeRight')
+      agent.disconnect()
+      browser.close()
+    })
+
+    // The same, one step later: superseded while the turn reads where the device is held, which takes a moment.
+    // Mutation: do not ask again after the read.
+    it('drops a run\'s stand-up when a newer boot supersedes it during the orientation read', async () => {
+      const world = duoWorld()
+      world.world.held = 'landscapeRight'
+      let hold: Promise<void> | null = null
+      let reading = false
+      let releaseRead!: () => void
+      const physical = new PhysicalOrientation({ readOrientation: async () => {
+        if (hold) { const h = hold; hold = null; reading = true; await h }
+        return { result: { deviceOrientation: world.world.held } }
+      } })
+      const { agent, browser, guest } = await bootedDuo({ world, physical, chromeLoader: panelChromes(), boot: false })
+      const ok = vi.fn(async () => {})
+      const sim = (agent as unknown as { simctl: Record<string, unknown> }).simctl
+      Object.assign(sim, { uninstallAppForReset: ok, clearAppDataIfInstalled: ok, waitForBootStatus: ok, resetKeychain: ok, resetPrivacy: ok, clearLocation: ok })
+      let releaseQueue!: () => void
+      const queued = new Promise<void>((r) => { releaseQueue = r })
+      void (agent as unknown as { enqueueRotation(id: string, step: () => Promise<void>): Promise<void> }).enqueueRotation('dev-1', () => queued)
+      const superseded = waitForType(browser, 'device:boot-error')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-run', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', runReset: { uninstall: [], clear: [] } } }))
+      await guest.ready()
+      await new Promise((r) => setTimeout(r, 50))
+      hold = new Promise<void>((r) => { releaseRead = r })
+      releaseQueue()
+      await vi.waitFor(() => expect(reading).toBe(true))
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-next', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      releaseRead()
+      expect((await superseded)['requestId']).toBe('rq-run')
+      await new Promise((r) => setTimeout(r, 50))
+      expect(guest.lines()).not.toContain('orient portrait')
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('follows a fold made outside tapflow', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes() })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      world.world.open = true // DeviceHub's hinge
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('open'))
+      await vi.waitFor(() => expect((received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { framePng: string }).framePng).toBe('phone14'))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // devicectl costs ~0.2 s of CPU a read, so a device left alone is read slowly — and a fold made outside
+    // tapflow, seen at the next slow read, brings the fast poll back for the next one.
+    // Mutations: never slow down; never come back; not count a change seen by the poll as activity.
+    it('reads a device left alone slowly, and quickly again once it moves', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes(), pollMs: 50, idlePollMs: 1_000, quietMs: 300 })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      const readsIn = async (ms: number) => { const from = world.world.reads; await new Promise((r) => setTimeout(r, ms)); return world.world.reads - from }
+      await new Promise((r) => setTimeout(r, 500))
+      // Fast, that is ~16 reads.
+      expect(await readsIn(800)).toBeLessThanOrEqual(3)
+      world.world.open = true
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('open'), { timeout: 3_000 })
+      // Slow, at most one.
+      expect(await readsIn(250)).toBeGreaterThanOrEqual(3)
+      agent.disconnect()
+      browser.close()
+    })
+
+    // A fold or a turn sent from tapflow is someone at the device: the poll is fast again at once, not after
+    // the slow wait already scheduled. Mutations: drop either one's activity mark; keep the scheduled wait.
+    it.each([
+      ['fold', { type: 'input:posture', payload: { postureId: 'open' } }],
+      ['turn', { type: 'input:rotate', payload: { direction: 'clockwise' } }],
+    ] as const)('reads quickly again after a %s sent from tapflow', async (name, msg) => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes(), pollMs: 50, idlePollMs: 60_000, quietMs: 300 })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      await new Promise((r) => setTimeout(r, 500))
+      browser.send(JSON.stringify({ ...msg, sessionId: agent.sessionId }))
+      if (name === 'fold') await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('open'))
+      else await vi.waitFor(() => expect((received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { streamRotation?: number }).streamRotation).toBe(90))
+      const from = world.world.reads
+      await new Promise((r) => setTimeout(r, 400))
+      // Fast, that is ~8; on the slow wait, none.
+      expect(world.world.reads - from).toBeGreaterThanOrEqual(3)
+      agent.disconnect()
+      browser.close()
+    })
+
+    // A Duo coming up from an erase can light its unfolded panel for a few seconds and go back to its cover
+    // (measured, PANEL_HOLD_MS); followed, the viewer swapped to a dark panel and back. The test above is the
+    // other half: a fold that holds is still followed. Mutation: follow every reading.
+    it('does not follow a panel lit only for a moment', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes() })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      const chromes = () => received.filter((m) => m.type === 'session:chrome').map((m) => (m.payload as { framePng: string }).framePng)
+      const before = chromes().length
+      world.world.open = true
+      await new Promise((r) => setTimeout(r, 150))
+      world.world.open = false
+      await new Promise((r) => setTimeout(r, 600))
+      expect(chromes().slice(before)).not.toContain('phone14')
+      expect(postures(received).map((p) => p.currentId)).not.toContain('open')
+      agent.disconnect()
+      browser.close()
+    })
+
+    // DeviceHub's rotate-right: a quarter turn from the way the device is read to be held, on either panel.
+    // Mutations: turn from a remembered orientation; skip the cover; send the target's landscape when one is met.
+    it('turns the device a quarter clockwise from where it is held, on either panel, and waits for it to land', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes() })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      const lastRotation = () => (received.filter((m) => m.type === 'session:chrome').at(-1)!.payload as { streamRotation?: number }).streamRotation
+      const clockwise = () => browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { direction: 'clockwise' } }))
+      await vi.waitFor(() => expect(lastRotation()).toBe(0))
+      clockwise()
+      await vi.waitFor(() => expect(lastRotation()).toBe(90))
+      expect(world.world.held).toBe('landscapeRight')
+      // Turned outside tapflow (DeviceHub) — the next quarter starts from there, not from what was sent.
+      world.world.held = 'portraitUpsideDown'
+      await vi.waitFor(() => expect(lastRotation()).toBe(180))
+      clockwise()
+      await vi.waitFor(() => expect(world.world.held).toBe('landscapeLeft'))
+      await vi.waitFor(() => expect(lastRotation()).toBe(270))
+      // Unfolded, the same hold shows the panel's native turn on top.
+      browser.send(JSON.stringify({ type: 'input:posture', sessionId: agent.sessionId, payload: { postureId: 'open' } }))
+      await vi.waitFor(() => expect(lastRotation()).toBe(0))
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { direction: 'counterclockwise' } }))
+      await vi.waitFor(() => expect(world.world.held).toBe('portraitUpsideDown'))
+      await vi.waitFor(() => expect(lastRotation()).toBe(270))
+      agent.disconnect()
+      browser.close()
+    })
+
+    // Mutation: turn from the last reading instead of a fresh one. With the poll off, a turn made in DeviceHub
+    // is only learned by reading at the press.
+    it('reads the way the device is held at the press, not between polls', async () => {
+      const world = duoWorld()
+      const { agent, browser, received } = await bootedDuo({ world, chromeLoader: panelChromes(), pollMs: 600_000 })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      world.world.held = 'landscapeLeft'
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { direction: 'clockwise' } }))
+      // A quarter clockwise from landscapeLeft is portrait; from the stale portrait it would be landscapeRight.
+      await vi.waitFor(() => expect(world.world.held).toBe('portrait'))
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('takes an older viewer\'s target: either landscape meets landscape, portrait means upright', async () => {
+      const world = duoWorld()
+      world.world.held = 'landscapeLeft'
+      const { agent, browser, guest, received } = await bootedDuo({ world, chromeLoader: panelChromes() })
+      await vi.waitFor(() => expect(postures(received).at(-1)?.currentId).toBe('closed'))
+      const orients = () => guest.lines().filter((l) => l.startsWith('orient'))
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { orientation: 'landscape' } }))
+      await new Promise((r) => setTimeout(r, 150))
+      expect(orients()).toEqual([])
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { orientation: 'portrait' } }))
+      await vi.waitFor(() => expect(world.world.held).toBe('portrait'))
+      // Already upright: nothing is sent.
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { orientation: 'portrait' } }))
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { orientation: 'landscape' } }))
+      await vi.waitFor(() => expect(world.world.held).toBe('landscapeRight'))
+      expect(orients()).toEqual(['orient portrait', 'orient landscape-right'])
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('fails the boot with the reason when the runtime refuses the helper, and shuts down only a device it brought up', async () => {
+      for (const booted of [false, true]) {
+        const { agent, browser, simctl } = await bootedDuo({ fatal: 'HIDVirtualEventService missing', booted })
+        const err = waitForType(browser, 'device:boot-error')
+        browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo-fatal', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+        expect(String((await err).message)).toContain('HIDVirtualEventService missing')
+        if (booted) expect(simctl.shutdown).not.toHaveBeenCalled()
+        else expect(simctl.shutdown).toHaveBeenCalledWith('dev-1')
+        agent.disconnect()
+        browser.close()
+      }
+    })
+
+    // A helper that never says `fatal` is relaunched for ever, which a boot cannot wait out. Mutation: wait on
+    // `whenReady` alone — the boot never answers.
+    it('fails a boot whose helper is never ready, and shuts down only a device it brought up', async () => {
+      const { agent, browser, simctl } = await bootedDuo({ silent: true, booted: false, boot: false, helperBootReadyMs: 300 })
+      const err = waitForType(browser, 'device:boot-error')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo-silent', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      expect(String((await err).message)).toContain('not ready within 0.3s')
+      expect(simctl.shutdown).toHaveBeenCalledWith('dev-1')
+      agent.disconnect()
+      browser.close()
+    })
+
+    // Quitting DeviceHub shuts every simulator down under tapflow, and the helper serving the old boot stayed
+    // registered: the next boot found it, waited on it, and started from the panel lit before. Mutation: drop
+    // the stop for a cold boot — the second boot spawns nothing.
+    it('gives a device shut down outside tapflow a new helper when it boots again', async () => {
+      const { agent, browser, guest, simctl } = await bootedDuo()
+      await guest.ready()
+      ;(simctl.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'dev-1', name: 'iPhone 15', platform: 'ios', status: 'shutdown', osVersion: 'iOS 27.1', typeId: 'type-iphone-15' },
+      ])
+      const ready = waitForType(browser, 'device:ready')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo-again', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await ready
+      expect(guest.procs[0].stdin.end).toHaveBeenCalled()
+      expect(guest.native.spawn).toHaveBeenCalledTimes(2)
+      agent.disconnect()
+      browser.close()
+    })
+
+    // A socket closing under a boot builds no channel, so there is no helper to wait on; that is not the helper
+    // refusing, and a cold device it brought up is not shut down for it. Mutation: treat no helper as a refusal.
+    it('does not shut a device down when the relay socket closed before the helper started', async () => {
+      const { agent, browser, simctl } = await bootedDuo({ booted: false, boot: false })
+      const ws = (agent as unknown as { ws: WebSocket }).ws
+      // Closing once the boot is under way — past the entry guard, before the chrome is sent.
+      ;(simctl.boot as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        Object.defineProperty(ws, 'readyState', { get: () => WebSocket.CLOSING, configurable: true })
+      })
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-duo-closing', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await vi.waitFor(() => expect(simctl.boot).toHaveBeenCalled())
+      await new Promise((r) => setTimeout(r, 300))
+      expect(simctl.shutdown).not.toHaveBeenCalled()
+      delete (ws as unknown as Record<string, unknown>).readyState
+      agent.disconnect()
+      browser.close()
+    })
+
+    it('does not offer a multi-panel device this Mac cannot drive, and still offers the rest', async () => {
+      const guest = guestNative({ unavailable: 'devicectl was not found' })
+      const simctl = duoSimctl()
+      ;(simctl.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'dev-1', name: 'iPhone Duo', platform: 'ios', status: 'booted', osVersion: 'iOS 27.1', typeId: 'type-iphone-15' },
+        { id: 'dev-2', name: 'iPhone 17', platform: 'ios', status: 'booted', osVersion: 'iOS 27.0', typeId: 'type-single' },
+      ])
+      const sent: unknown[] = []
+      const agent = new IOSAgent({ intervalMs: 50, guestHelperNative: guest.native, panelState: folded() }, simctl)
+      const internal = agent as unknown as { sendOn(ws: unknown, m: unknown): void }
+      const orig = internal.sendOn.bind(agent)
+      internal.sendOn = (ws, m) => { sent.push(m); orig(ws, m) }
+      await agent.connect(`ws://localhost:${port}`)
+      const register = sent.find((m) => (m as { type: string }).type === 'agent:register') as { devices: Array<{ id: string }> }
+      expect(register.devices.map((d) => d.id)).toEqual(['dev-2'])
+      agent.disconnect()
+    })
+
+    it('leaves a single-panel device on the Indigo path and starts no helper', async () => {
+      const { agent, browser, guest, received } = await bootedDuo({ panels: 1, chromeLoader: panelChromes() })
+      await vi.waitFor(() => expect(MockTouchHelper).toHaveBeenCalled())
+      expect(guest.native.spawn).not.toHaveBeenCalled()
+      const chrome = received.find((m) => m.type === 'session:chrome')?.payload as { framePng: string }
+      expect(chrome.framePng).toBe('model')
+      // Its turn is the one it is held at — upright, stood up on this first boot (no devicectl under vitest).
+      expect((chrome as { streamRotation?: number }).streamRotation).toBe(0)
       agent.disconnect()
       browser.close()
     })
@@ -3459,10 +4173,12 @@ describe('IOSAgent', () => {
   describe('input:rotate handler (#910)', () => {
     beforeEach(() => { MockTouchHelper.mockClear() })
 
+    // A frame to re-send: under vitest the real loader finds no chrome, and a session with no frame gets no turn.
+    const frameLoader = () => ({ load: vi.fn(async () => ({ framePng: 'f', compositeWidth: 100, compositeHeight: 200, buttons: [] })) }) as unknown as DeviceChromeLoader
     async function setupSession(sim = mockSimctl(true)) {
       const browser = new WebSocket(`ws://localhost:${port}`)
       await waitForOpen(browser)
-      const agent = new IOSAgent({ intervalMs: 50 }, sim)
+      const agent = new IOSAgent({ intervalMs: 50, chromeLoader: frameLoader() }, sim)
       await agent.connect(`ws://localhost:${port}`)
       browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
       await waitForType(browser, 'session:joined')
@@ -3496,13 +4212,15 @@ describe('IOSAgent', () => {
       agent.disconnect(); browser.close()
     })
 
-    // Mutation: ignore the payload. The second `landscape` toggles back to portrait.
+    // An older dashboard draws landscape as 270, which is the helper's `landscapeRight` (UIInterface names). A
+    // second `landscape` is met already and sends nothing. Mutation: ignore the payload — the second toggles back.
     it('goes to the target it is given, however often', async () => {
       const { browser, agent, sim } = await setupSession()
       vi.mocked(sim.rotate).mockClear()
       rotate(browser, agent, 'landscape'); rotate(browser, agent, 'landscape'); rotate(browser, agent, 'portrait')
-      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledTimes(3), { timeout: 1000 })
-      expect(targets(sim)).toEqual(['landscapeRight', 'landscapeRight', 'portrait'])
+      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledTimes(2), { timeout: 1000 })
+      await new Promise((r) => setTimeout(r, 30))
+      expect(targets(sim)).toEqual(['landscapeRight', 'portrait'])
       agent.disconnect(); browser.close()
     })
 
@@ -3531,6 +4249,146 @@ describe('IOSAgent', () => {
       release()
       await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledTimes(2), { timeout: 1000 })
       expect(targets(sim)).toEqual(['landscapeRight', 'portrait'])
+      agent.disconnect(); browser.close()
+    })
+
+    // ── The physical model (four-way rotation) ──
+    const chromeTurns = (browser: WebSocket) => {
+      const turns: Array<number | undefined> = []
+      browser.on('message', (d, isBinary) => {
+        if (isBinary) return
+        try { const m = JSON.parse(String(d)); if (m.type === 'session:chrome') turns.push(m.payload.streamRotation) } catch { /* not ours */ }
+      })
+      return turns
+    }
+    const turn = (browser: WebSocket, agent: IOSAgent, direction: 'clockwise' | 'counterclockwise' = 'clockwise') =>
+      browser.send(JSON.stringify({ type: 'input:rotate', sessionId: agent.sessionId, payload: { direction } }))
+
+    // A quarter clockwise from where it is held, four times round; Purple takes UIInterface names, so the
+    // device's landscapeRight (90) is the helper's `landscapeLeft`. Mutation: send the device's own names.
+    it('turns a quarter clockwise each time, and reports the turn it is held at', async () => {
+      const { browser, agent, sim } = await setupSession()
+      const turns = chromeTurns(browser)
+      vi.mocked(sim.rotate).mockClear()
+      for (let i = 0; i < 4; i++) turn(browser, agent)
+      await vi.waitFor(() => expect(turns).toEqual([90, 180, 270, 0]), { timeout: 2000 })
+      expect(targets(sim)).toEqual(['landscapeLeft', 'portraitUpsideDown', 'landscapeRight', 'portrait'])
+      agent.disconnect(); browser.close()
+    })
+
+    // An older dashboard draws landscape as 270: from the other landscape it must turn, or it shows upside down.
+    // Mutation: meet `landscape` with either landscape.
+    it('takes an older viewer\'s landscape to the one it draws', async () => {
+      const { browser, agent, sim } = await setupSession()
+      turn(browser, agent) // held at 90
+      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledWith('dev-1', 'landscapeLeft'))
+      vi.mocked(sim.rotate).mockClear()
+      rotate(browser, agent, 'landscape')
+      await vi.waitFor(() => expect(targets(sim)).toEqual(['landscapeRight']))
+      agent.disconnect(); browser.close()
+    })
+
+    // The orientation is the device's: a reload or a second viewer joins it where it is rather than standing it
+    // up under the first. A relay re-register builds every session's state afresh (`initDeviceStates`), which is
+    // what a second session would have — this suite cannot hold two sessions on one device. Mutations: keep the
+    // memory per session (`DeviceState`); stand it up on every boot.
+    it('keeps a device where it is held when a session joins it afresh', async () => {
+      const { browser, agent, sim } = await setupSession()
+      turn(browser, agent)
+      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledWith('dev-1', 'landscapeLeft'))
+      vi.mocked(sim.rotate).mockClear()
+      // As a relay loss does: the old state is cleaned up first (its audio poll would otherwise outlive the test),
+      // then the re-register builds a fresh one.
+      const inner = agent as unknown as {
+        deviceStates: Map<string, unknown>
+        cleanupDeviceState(state: unknown): void
+        initDeviceStates(s: Array<{ deviceId: string; sessionId: string }>): void
+      }
+      for (const state of inner.deviceStates.values()) inner.cleanupDeviceState(state)
+      inner.initDeviceStates([{ deviceId: 'dev-1', sessionId: agent.sessionId! }])
+      const turns = chromeTurns(browser)
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-910-again', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      await vi.waitFor(() => expect(turns.at(-1)).toBe(90))
+      expect(sim.rotate).not.toHaveBeenCalled()
+      agent.disconnect(); browser.close()
+    })
+
+    // A device this boot brings up starts from nothing — what was remembered described the boot before.
+    // Mutation: keep the memory across a cold boot.
+    it('stands up a device it boots, whatever it remembered', async () => {
+      const sim = mockSimctl(true)
+      const { browser, agent } = await setupSession(sim)
+      turn(browser, agent)
+      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledWith('dev-1', 'landscapeLeft'))
+      vi.mocked(sim.rotate).mockClear()
+      vi.mocked(sim.listDevices).mockResolvedValue([{ id: 'dev-1', name: 'iPhone 15', platform: 'ios', status: 'shutdown', osVersion: 'iOS 18.3', typeId: 'type-iphone-15' }])
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-910-cold', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      expect(targets(sim)).toEqual(['portrait'])
+      agent.disconnect(); browser.close()
+    })
+
+    // A flow replays from the same orientation whatever a person left the device in. Mutation: drop `runReset`
+    // from the stand-up condition.
+    it('stands the device up for a run, wherever it was left', async () => {
+      const sim = mockSimctl(true)
+      // A run's reset steps; their outcome is not what this test is about.
+      const ok = vi.fn(async () => {})
+      Object.assign(sim, { uninstallAppForReset: ok, clearAppDataIfInstalled: ok, waitForBootStatus: ok, resetKeychain: ok, resetPrivacy: ok, clearLocation: ok })
+      const { browser, agent } = await setupSession(sim)
+      turn(browser, agent)
+      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledWith('dev-1', 'landscapeLeft'))
+      vi.mocked(sim.rotate).mockClear()
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-910-run', sessionId: agent.sessionId, payload: { deviceId: 'dev-1', runReset: { uninstall: [], clear: [] } } }))
+      await waitForType(browser, 'device:ready')
+      expect(targets(sim)).toEqual(['portrait'])
+      agent.disconnect(); browser.close()
+    })
+
+    // A session whose frame did not load is sent no turn, and its viewer draws the device upright — so the
+    // device is stood up for it. Mutation: drop the frameless stand-up.
+    it('stands the device up for a session that has no frame to carry the turn', async () => {
+      const sim = mockSimctl(true)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      // No chrome loader injected: under vitest the real one finds no frame.
+      const agent = new IOSAgent({ intervalMs: 50 }, sim)
+      await agent.connect(`ws://localhost:${port}`)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-910-nf1', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      turn(browser, agent)
+      await vi.waitFor(() => expect(sim.rotate).toHaveBeenCalledWith('dev-1', 'landscapeLeft'))
+      vi.mocked(sim.rotate).mockClear()
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-910-nf2', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      await vi.waitFor(() => expect(targets(sim)).toEqual(['portrait']))
+      agent.disconnect(); browser.close()
+    })
+
+    // On an Xcode 27 host the device says where it is held: it is reported as it is, never stood up, and a
+    // turn starts from a fresh reading. Mutation: stand it up anyway; turn from the memory.
+    it('reports and turns from what devicectl reads, where it can', async () => {
+      let held = 'landscapeRight'
+      const sim = mockSimctl(true)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      const turns = chromeTurns(browser)
+      const agent = new IOSAgent({ intervalMs: 50, chromeLoader: frameLoader(), physicalOrientation: new PhysicalOrientation({ readOrientation: async () => ({ result: { deviceOrientation: held } }) }) }, sim)
+      await agent.connect(`ws://localhost:${port}`)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      browser.send(JSON.stringify({ type: 'device:boot', requestId: 'rq-910-read', sessionId: agent.sessionId, payload: { deviceId: 'dev-1' } }))
+      await waitForType(browser, 'device:ready')
+      await vi.waitFor(() => expect(turns.at(-1)).toBe(90))
+      expect(sim.rotate).not.toHaveBeenCalled()
+      held = 'portraitUpsideDown' // turned in DeviceHub
+      vi.mocked(sim.rotate).mockImplementation(async (_u, arg) => { held = arg === 'landscapeRight' ? 'landscapeLeft' : arg })
+      turn(browser, agent)
+      await vi.waitFor(() => expect(turns.at(-1)).toBe(270))
+      expect(targets(sim)).toEqual(['landscapeRight'])
       agent.disconnect(); browser.close()
     })
 

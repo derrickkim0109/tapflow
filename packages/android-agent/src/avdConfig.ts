@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import type { FormFactor } from '@tapflowio/protocol'
@@ -85,4 +85,53 @@ export function formFactorOf(
     // Unreadable is the same as unknown.
   }
   return undefined
+}
+
+/** An AVD's own directory (`<name>.avd`), or nothing when it cannot be found. Same search as `formFactorOf`. */
+export function avdDirOf(avdName: string, env: NodeJS.ProcessEnv = process.env, home: string = homedir(), fs: Files = realFiles): string | undefined {
+  try {
+    for (const dir of avdHomes(env, home)) {
+      const ini = join(dir, `${avdName}.ini`)
+      if (!fs.existsSync(ini)) continue
+      const named = parseIni(fs.readFileSync(ini, 'utf8')).path
+      return [named, join(dir, `${avdName}.avd`)].filter((p): p is string => Boolean(p)).find((d) => fs.existsSync(d))
+    }
+  } catch {
+    // Unreadable is the same as not found.
+  }
+  return undefined
+}
+
+/**
+ * Whether tapflow has already freed this AVD's rotation lock once. **Once per AVD, kept beside it**: earlier
+ * tapflow versions locked the rotation (`wm user-rotation lock`) and a lock tapflow wrote cannot be told from one
+ * a person chose, so the body-turning model frees it the first time it sees the AVD and leaves any later lock
+ * alone. Beside the AVD rather than in a tapflow store, so a deleted or recreated AVD starts over.
+ *
+ * **A lock tapflow writes afterwards is tapflow's again**, so writing one forgets the AVD (`forget`): the toggle on
+ * an emulator streaming without gRPC still locks, and the next gRPC session must free that lock as it freed the
+ * old ones.
+ */
+export interface RotationLockMemory {
+  freed(avdName: string): boolean
+  markFreed(avdName: string): void
+  forget(avdName: string): void
+}
+
+const ROTATION_FREED_MARKER = 'tapflow-rotation-freed'
+
+export const avdRotationLockMemory: RotationLockMemory = {
+  freed(avdName) {
+    const dir = avdDirOf(avdName)
+    // An AVD whose directory cannot be found is not one tapflow can remember freeing — so it is never freed.
+    return dir === undefined || existsSync(join(dir, ROTATION_FREED_MARKER))
+  },
+  markFreed(avdName) {
+    const dir = avdDirOf(avdName)
+    if (dir) writeFileSync(join(dir, ROTATION_FREED_MARKER), `${new Date().toISOString()}\n`)
+  },
+  forget(avdName) {
+    const dir = avdDirOf(avdName)
+    if (dir) rmSync(join(dir, ROTATION_FREED_MARKER), { force: true })
+  },
 }

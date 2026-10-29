@@ -21,7 +21,13 @@ describe('skeletonSize', () => {
 
   // Mutations: draw a foldable as a phone; or turn it on its side with the Android tablets, which a
   // first version did and review measured as further from its real shape than the phone.
-  it('draws a foldable as an upright tablet', () => {
+  it('draws an Android foldable as an upright tablet', () => {
     expect(skeletonSize('foldable', 'android')).toEqual({ width: 540, height: 720 })
+  })
+
+  // The iPhone Duo boots folded, and is drawn small enough that its unfolded panel fits. Mutation: draw it
+  // as an Android foldable (unfolded and full height, then the cover appears at three quarters of it).
+  it('draws an iOS foldable as its folded cover', () => {
+    expect(skeletonSize('foldable', 'ios')).toEqual({ width: 376, height: 548 })
   })
 })

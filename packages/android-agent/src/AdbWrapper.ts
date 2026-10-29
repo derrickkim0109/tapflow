@@ -575,6 +575,33 @@ export class AdbWrapper {
     throw new PlatformError(`Cannot read the rotation lock from: ${out || '(empty)'}`)
   }
 
+  /** Let Android rotate with the device again (`wm user-rotation free`): what an AVD comes with. */
+  async freeRotation(serial: string): Promise<void> {
+    await this.runner.exec('-s', serial, 'shell', 'wm', 'user-rotation', 'free')
+  }
+
+  /**
+   * How far an emulator's body is turned clockwise, from the **console's** accelerometer — no gRPC, so it
+   * reads a device streaming over scrcpy too. Gravity is +9.81 on the axis pointing up (measured): upright
+   * reads y+, a quarter clockwise x−, upside down y−, a quarter anticlockwise x+. Null when the reading is
+   * not one of those — lying flat, or an answer this cannot parse.
+   */
+  async readBodyRotation(serial: string): Promise<0 | 90 | 180 | 270 | null> {
+    const out = await this.runner.exec('-s', serial, 'emu', 'sensor', 'get', 'acceleration')
+    const m = /acceleration\s*=\s*(-?[\d.e+-]+):(-?[\d.e+-]+):(-?[\d.e+-]+)/.exec(out)
+    if (!m) return null
+    const [x, y] = [Number(m[1]), Number(m[2])]
+    if (Math.max(Math.abs(x), Math.abs(y)) < 7) return null
+    if (Math.abs(y) >= Math.abs(x)) return y > 0 ? 0 : 180
+    return x < 0 ? 90 : 270
+  }
+
+  /** Turn an emulator's body a quarter clockwise (`emu rotate`) — relative, so the caller reads before and after. */
+  async rotateBodyClockwise(serial: string): Promise<void> {
+    const out = await this.runner.exec('-s', serial, 'emu', 'rotate')
+    if (/^KO\b/m.test(out)) throw new PlatformError(`emu rotate refused: ${out.trim()}`)
+  }
+
   async sendInput(serial: string, ...args: string[]): Promise<void> {
     await this.runner.exec('-s', serial, 'shell', 'input', ...args)
   }

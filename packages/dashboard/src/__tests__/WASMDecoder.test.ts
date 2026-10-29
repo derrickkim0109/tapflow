@@ -115,3 +115,18 @@ describe('WASMDecoder — surface / close', () => {
     expect(renderer.disposed).toBe(true)
   })
 })
+
+describe('WASMDecoder — onPresented', () => {
+  it('tells every listener once per drawn picture, and stops telling one that was removed', () => {
+    const { d, worker } = setup()
+    const a = vi.fn(), b = vi.fn()
+    d.onPresented(a)
+    const offB = d.onPresented(b)
+    worker.emit({ type: 'decoderReady' })
+    worker.emit(picture(4, 2)); worker.emit(picture(4, 2))
+    offB()
+    worker.emit(picture(4, 2))
+    expect(a).toHaveBeenCalledTimes(3)
+    expect(b).toHaveBeenCalledTimes(2)
+  })
+})

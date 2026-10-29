@@ -100,17 +100,26 @@ export function useIOSScreen({ chrome, binaryFrameHandlerRef, perfHookRef, fps, 
       surface.style.zIndex = '3'
       surface.style.pointerEvents = 'none'
       containerRef.current?.appendChild(surface)
+      // Mirrored once per new frame, on the next animation frame (so after `onResize` has sized the canvas). It used
+      // to be drawn on every animation frame whether or not the picture had changed — a full-resolution copy up to
+      // 120 times a second on a ProMotion display, for a 30 fps stream, into a canvas only recording and
+      // screenshots read. A decoder that cannot say when it presented keeps the old loop.
       let raf: number | null = null
       const blit = () => {
+        raf = null
         const canvas = canvasRef.current
         const ctx = canvas?.getContext('2d')
         if (canvas && ctx && d.size) {
           try { ctx.drawImage(d.surface, 0, 0, canvas.width, canvas.height) } catch { /* surface not paintable yet */ }
         }
-        raf = requestAnimationFrame(blit)
       }
-      raf = requestAnimationFrame(blit)
+      const off = d.onPresented?.(() => { if (raf === null) raf = requestAnimationFrame(blit) })
+      if (!off) {
+        const loop = () => { blit(); raf = requestAnimationFrame(loop) }
+        raf = requestAnimationFrame(loop)
+      }
       return () => {
+        off?.()
         if (raf !== null) cancelAnimationFrame(raf)
         if (decoderSurfaceRef.current === surface) decoderSurfaceRef.current = null
       }

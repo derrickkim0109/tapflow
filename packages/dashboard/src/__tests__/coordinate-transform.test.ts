@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { iosToNormScreen,
+import { iosToNormScreen, iosTurn, turnPoint,
   androidToNorm,
   toPinchFingers,
   iosDisplayScale, placeTurnedFrame, turnedSize, surfaceBox, composeTurn, overlaySpace, showsPicture, framesAgree, remaining } from '@/lib/coordinate-transform'
@@ -22,13 +22,13 @@ describe('iosToNormScreen — portrait', () => {
   const fullScreen = srect(0, 0, 200, 400)
 
   it('정중앙 → {0.5, 0.5}', () => {
-    expect(iosToNormScreen({ x: 100, y: 200 }, r, cw, ch, fullScreen, false))
+    expect(iosToNormScreen({ x: 100, y: 200 }, r, cw, ch, fullScreen, 0))
       .toEqual({ x: 0.5, y: 0.5 })
   })
 
   it('bezel 클릭(screenRect 바깥) → null', () => {
     const inner = srect(50, 50, 100, 300)
-    expect(iosToNormScreen({ x: 10, y: 10 }, r, cw, ch, inner, false)).toBeNull()
+    expect(iosToNormScreen({ x: 10, y: 10 }, r, cw, ch, inner, 0)).toBeNull()
   })
 
   it('screenRect 우하단 경계 정확히 → {1, 1}', () => {
@@ -36,7 +36,7 @@ describe('iosToNormScreen — portrait', () => {
     // click at (50+100, 50+300) = (150, 350)
     // cx = 150 * (200/200) = 150, cy = 350 * (400/400) = 350
     // (cx - sx)/sw = (150-50)/100 = 1, (cy-sy)/sh = (350-50)/300 = 1
-    expect(iosToNormScreen({ x: 150, y: 350 }, r, cw, ch, inner, false))
+    expect(iosToNormScreen({ x: 150, y: 350 }, r, cw, ch, inner, 0))
       .toEqual({ x: 1, y: 1 })
   })
 })
@@ -53,26 +53,61 @@ describe('iosToNormScreen — landscape rotation (off-by-one guard)', () => {
 
   it('시각 좌상단(u=0,v=0) → portrait {1, 0}', () => {
     // u=0,v=0 → cx=(1-0)*200=200, cy=0*400=0 → {(200-0)/200, (0-0)/400} = {1, 0}
-    expect(iosToNormScreen({ x: 0, y: 0 }, landscapeRect, cw, ch, fullScreen, true))
+    expect(iosToNormScreen({ x: 0, y: 0 }, landscapeRect, cw, ch, fullScreen, 270))
       .toEqual({ x: 1, y: 0 })
   })
 
   it('시각 정중앙(u=0.5,v=0.5) → portrait {0.5, 0.5}', () => {
     // u=0.5,v=0.5 → cx=0.5*200=100, cy=0.5*400=200 → {0.5, 0.5}
-    expect(iosToNormScreen({ x: ch * 0.5, y: cw * 0.5 }, landscapeRect, cw, ch, fullScreen, true))
+    expect(iosToNormScreen({ x: ch * 0.5, y: cw * 0.5 }, landscapeRect, cw, ch, fullScreen, 270))
       .toEqual({ x: 0.5, y: 0.5 })
   })
 
   it('시각 우하단(u=1,v=1) → portrait {0, 1}', () => {
     // u=1,v=1 → cx=(1-1)*200=0, cy=1*400=400 → {0, 1}
-    expect(iosToNormScreen({ x: ch, y: cw }, landscapeRect, cw, ch, fullScreen, true))
+    expect(iosToNormScreen({ x: ch, y: cw }, landscapeRect, cw, ch, fullScreen, 270))
       .toEqual({ x: 0, y: 1 })
   })
 
   it('시각 우상단(u=0,v=1) → portrait {0, 0}', () => {
     // u=0,v=1 → cx=0, cy=0 → {0, 0}
-    expect(iosToNormScreen({ x: 0, y: cw }, landscapeRect, cw, ch, fullScreen, true))
+    expect(iosToNormScreen({ x: 0, y: cw }, landscapeRect, cw, ch, fullScreen, 270))
       .toEqual({ x: 0, y: 0 })
+  })
+})
+
+// ── iosToNormScreen — the turns a multi-panel device adds ─────────────────────
+// The iPhone Duo's unfolded panel is shown turned 90 (SpringBoard's own landscape) or 180. Each case
+// asks where a visual corner lands in the frame, which is the whole question for a quarter turn.
+describe('iosToNormScreen — 90 and 180', () => {
+  const cw = 200, ch = 400
+  const fullScreen = srect(0, 0, 200, 400)
+
+  it('90: the visual top-left is the frame\'s bottom-left, and the visual top-right its top-left', () => {
+    const turned = rect(0, 0, ch, cw)
+    expect(iosToNormScreen({ x: 0, y: 0 }, turned, cw, ch, fullScreen, 90)).toEqual({ x: 0, y: 1 })
+    expect(iosToNormScreen({ x: ch, y: 0 }, turned, cw, ch, fullScreen, 90)).toEqual({ x: 0, y: 0 })
+    expect(iosToNormScreen({ x: ch, y: cw }, turned, cw, ch, fullScreen, 90)).toEqual({ x: 1, y: 0 })
+  })
+
+  it('180: every point is mirrored through the centre', () => {
+    const upright = rect(0, 0, cw, ch)
+    expect(iosToNormScreen({ x: 0, y: 0 }, upright, cw, ch, fullScreen, 180)).toEqual({ x: 1, y: 1 })
+    expect(iosToNormScreen({ x: 50, y: 300 }, upright, cw, ch, fullScreen, 180)).toEqual({ x: 0.75, y: 0.25 })
+  })
+})
+
+describe('iosTurn', () => {
+  it('takes the agent\'s turn whenever it gives one, whatever the viewer last asked for', () => {
+    for (const t of [0, 90, 180, 270] as const) {
+      expect(iosTurn(t, false)).toBe(t)
+      expect(iosTurn(t, true)).toBe(t)
+    }
+  })
+
+  it('falls back to the viewer\'s one landscape turn when the agent says nothing', () => {
+    expect(iosTurn(undefined, false)).toBe(0)
+    expect(iosTurn(undefined, true)).toBe(270)
   })
 })
 
@@ -331,5 +366,24 @@ describe('remaining — a stop the answer cannot move', () => {
     // in the past and then never resolve.
     expect(remaining(8_000, 9_000)).toBe(0)
     expect(remaining(8_000, 8_000)).toBe(0)
+  })
+})
+
+// Android body mode: the frame (as the body is held) turned by `streamRotation` is the screen Android draws.
+// Mutation: turn the other way.
+describe('turnPoint', () => {
+  it('carries a point a quarter clockwise at a time, and back', () => {
+    const p = { x: 0.2, y: 0.1 }
+    const near = (a: { x: number; y: number }, b: { x: number; y: number }) => { expect(a.x).toBeCloseTo(b.x); expect(a.y).toBeCloseTo(b.y) }
+    near(turnPoint(p, 0), p)
+    near(turnPoint(p, 90), { x: 0.9, y: 0.2 })
+    near(turnPoint(p, 180), { x: 0.8, y: 0.9 })
+    near(turnPoint(p, 270), { x: 0.1, y: 0.8 })
+    near(turnPoint(turnPoint(p, 90), 270), p)
+  })
+  // Measured on a Pixel 9, body a quarter clockwise over a portrait-locked screen (correction 270): the frame's
+  // top-left corner is the screen's bottom-left.
+  it('lands the measured corner', () => {
+    expect(turnPoint({ x: 0, y: 0 }, 270)).toEqual({ x: 0, y: 1 })
   })
 })

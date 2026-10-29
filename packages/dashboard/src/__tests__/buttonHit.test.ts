@@ -187,8 +187,8 @@ describe('buttonTitles', () => {
   ] }
 
   it('names the physical buttons in portrait, on both layouts', () => {
-    expect(buttonTitles(PRO.buttons, PRO.box, false, 'tablet')).toEqual(['Volume Up', 'Volume Down'])
-    expect(buttonTitles(MINI.buttons, MINI.box, false, 'tablet')).toEqual(['Volume Up', 'Volume Down'])
+    expect(buttonTitles(PRO.buttons, PRO.box, 0, 'tablet')).toEqual(['Volume Up', 'Volume Down'])
+    expect(buttonTitles(MINI.buttons, MINI.box, 0, 'tablet')).toEqual(['Volume Up', 'Volume Down'])
   })
 
   // The pair that pins the rotation's direction. Turned counter-clockwise, the Pro's right edge
@@ -198,25 +198,25 @@ describe('buttonTitles', () => {
   //
   // Mutations: rotate the other way (both cases flip); swap whenever landscape (the mini fails).
   it('follows the effect in landscape: the Pro swaps, the mini does not', () => {
-    expect(buttonTitles(PRO.buttons, PRO.box, true, 'tablet')).toEqual(['Volume Down', 'Volume Up'])
-    expect(buttonTitles(MINI.buttons, MINI.box, true, 'tablet')).toEqual(['Volume Up', 'Volume Down'])
+    expect(buttonTitles(PRO.buttons, PRO.box, 270, 'tablet')).toEqual(['Volume Down', 'Volume Up'])
+    expect(buttonTitles(MINI.buttons, MINI.box, 270, 'tablet')).toEqual(['Volume Up', 'Volume Down'])
   })
 
   // An iPhone's volume does not follow orientation. Mutation: drop the form-factor gate.
   it('leaves a phone, or a device that did not say, with its physical names', () => {
-    expect(buttonTitles(PRO.buttons, PRO.box, true, 'phone')).toEqual(['Volume Up', 'Volume Down'])
-    expect(buttonTitles(PRO.buttons, PRO.box, true, undefined)).toEqual(['Volume Up', 'Volume Down'])
+    expect(buttonTitles(PRO.buttons, PRO.box, 270, 'phone')).toEqual(['Volume Up', 'Volume Down'])
+    expect(buttonTitles(PRO.buttons, PRO.box, 270, undefined)).toEqual(['Volume Up', 'Volume Down'])
   })
 
   // The pair is found by HID usage — Consumer page 12, Volume Increment 233 / Decrement 234, which
   // Apple's chrome states for each input — not by the `name` string. Mutation: match on name.
   it('finds the volume pair by HID usage, not by name', () => {
     const renamed = PRO.buttons.map((b, i) => ({ ...b, name: `vol-${i}` }))
-    expect(buttonTitles(renamed, PRO.box, true, 'tablet')).toEqual(['Volume Down', 'Volume Up'])
+    expect(buttonTitles(renamed, PRO.box, 270, 'tablet')).toEqual(['Volume Down', 'Volume Up'])
   })
 
   it('leaves a tablet with no volume pair alone', () => {
     const power = { ...button('power', 0, 32, 'top'), accessibilityTitle: 'Sleep/Wake', usagePage: 12, usage: 48 }
-    expect(buttonTitles([power], PRO.box, true, 'tablet')).toEqual(['Sleep/Wake'])
+    expect(buttonTitles([power], PRO.box, 270, 'tablet')).toEqual(['Sleep/Wake'])
   })
 })

@@ -70,6 +70,7 @@ Committed *why* behind non-obvious decisions. Read the relevant one **before** c
 | [relay-agent-auth.md](./contributing/relay-agent-auth.md) | rationale | Why remote agents authenticate with an `agent`-scope PAT instead of an IP check |
 | [relay-secret-loading.md](./contributing/relay-secret-loading.md) | rationale | Why the relay loads `.env` before evaluating its module-singleton config |
 | [simkit-internals.md](./contributing/simkit-internals.md) | reference | SimulatorKit reverse-engineering notes — binary layout, symbols, touch/button injection |
+| [ios-orientation-sources.md](./contributing/ios-orientation-sources.md) | reference | Where an iOS simulator's physical orientation can be read and written, per host Xcode — and the sources that only give the interface orientation |
 | [measurement.md](./contributing/measurement.md) | reference | Every performance metric emitter — how to enable it, its output, what it means |
 | [downscale-tuning.md](./contributing/downscale-tuning.md) | reference | Encode-resolution downscale lever — QA fidelity vs decode/bandwidth, recommended default |
 | [frame-envelope.md](./contributing/frame-envelope.md) | reference | Frame envelope wire format (TFFE v1) — 22-byte per-frame timestamp header, magic-byte backward compat |

@@ -14,6 +14,10 @@ status: living
 
 `IOSAgent`: controls iOS simulators via `xcrun simctl`, streams frames using SimulatorKit IOSurface callbacks, and injects touch / keyboard / button events directly via SimDeviceLegacyHIDClient. No WebDriverAgent.
 
+A device with more than one panel — the iPhone Duo, Xcode 27.1 — takes a different input, capture and
+rotation path from every other iPhone, through an in-simulator helper. That is its own section below,
+"Multi-panel devices"; a single-panel device never touches it.
+
 It also takes **one** simulator off the network and puts it back (#607), which on a device with no radio takes three mechanisms rather than one — a host system extension, an injected library, and the status bar. That is its own section at the end of this file, and none of the three is safe to touch alone.
 
 ## HOW
@@ -254,7 +258,7 @@ cd packages/ios-agent && swiftc src/touch-helper.swift -o bin/touch-helper
 ### screencapture-helper interface
 
 ```bash
-screencapture-helper <fps> <udid|booted> [jpeg|h264]
+screencapture-helper <fps> <udid|booted> [jpeg|h264] [--panel <w>x<h>]
 ```
 
 Reads the `com.apple.framebuffer.display` port directly via SimulatorKit IOSurface callbacks. The 3rd arg picks the codec (default `jpeg`); `h264` uses VideoToolbox (`VTCompressionSession`, baseline, B-frames off, periodic IDR, BT.709).
@@ -263,7 +267,7 @@ Output framing (length-prefixed):
 - **jpeg**: `[4-byte BE len][JPEG bytes] ...`
 - **h264**: `[4-byte BE len][flags:u8][Annex B NAL] ...` — `len` counts the flags byte; flags bit0 = keyframe (IDR). Keyframes carry SPS+PPS prepended.
 
-**stdin commands** (h264 only): a single `0x01` byte forces an IDR on the next frame. The relay sends this (via `stream:request-idr` → `ScreenCaptureStreamer.requestKeyframe()`) for drop-to-keyframe recovery, so the stream resyncs fast instead of waiting for the periodic IDR. JPEG ignores stdin.
+**stdin commands**: a single `0x01` byte forces an IDR on the next H.264 frame. The relay sends this (via `stream:request-idr` → `ScreenCaptureStreamer.requestKeyframe()`) for drop-to-keyframe recovery, so the stream resyncs fast instead of waiting for the periodic IDR; JPEG ignores it. A line `panel <w>x<h>` switches a multi-panel device's capture, for both codecs.
 
 **Env**:
 - `TAPFLOW_JPEG_QUALITY` (0–1, default `0.8`) — JPEG quality; the LAN bandwidth ↔ design-QA fidelity trade-off. Lower = fewer relay→browser drops on LAN, but more artifacts.
@@ -279,8 +283,8 @@ When the Swift binary interface changes, **always update both locations simultan
 Requires a TypeScript dist rebuild after compilation:
 ```bash
 cd packages/ios-agent
-swiftc src/screencapture-helper.swift -o bin/screencapture-helper \
-  -framework CoreVideo -framework ImageIO -framework VideoToolbox -framework CoreMedia
+swiftc src/screencapture-helper.swift -O -o bin/screencapture-helper \
+  -framework CoreVideo -framework ImageIO -framework VideoToolbox -framework CoreMedia -framework Metal
 pnpm build
 ```
 
@@ -346,7 +350,11 @@ rotation-helper <portrait|landscapeLeft|landscapeRight|portraitUpsideDown> <udid
 Acquires the `PurpleWorkspacePort` mach port via `SimDevice.lookup:error:` and sends a `GSEventTypeDeviceOrientationChanged` event directly.
 **No Simulator.app required. No Accessibility permission required.**
 
-UIDeviceOrientation rawValues: `portrait=1`, `portraitUpsideDown=2`, `landscapeRight=3`, `landscapeLeft=4`
+Values sent: `portrait=1`, `portraitUpsideDown=2`, `landscapeRight=3`, `landscapeLeft=4`. **The landscape
+names are `UIInterfaceOrientation`'s, not the device's**: the record carries a `UIDeviceOrientation`, and
+`3` there is `landscapeLeft`. Measured on Xcode 27 with `devicectl device orientation get`: what this helper
+calls `landscapeRight` the device reports as `landscapeLeft`. `PURPLE_ARGS` in `IOSAgent.ts` swaps the two
+for the physical model; anything else that maps this helper onto a physical orientation must do the same.
 
 Unlike the legacy `osascript` approach (bringing Simulator.app to the foreground and pressing Cmd+Arrow), this sets the absolute orientation directly, so it works regardless of the current state.
 
@@ -361,23 +369,19 @@ swiftc packages/ios-agent/src/rotation-helper.swift \
 
 ### IOSurface capture — timer-driven strategy
 
-IOSurface callbacks alone do not deliver frames when the screen is static.
-Use `DispatchSourceTimer` alongside callbacks to maintain a consistent FPS regardless of callback activity.
+IOSurface callbacks alone do not deliver frames when the screen is static, so a `DispatchSourceTimer` on
+`captureQueue` emits at the stream's fps and reads `latestSurface` each tick (`screencapture-helper.swift`).
 
-```swift
-// callback: only updates latestSurface
-let onFrame: @convention(block) () -> Void = {
-    captureQueue.async { updateLatestSurface() }
-}
+**Do not look the surface up in the frame callback.** The frame callback fires for every frame the simulator draws
+(60 a second or more while anything moves), and walking the descriptors there cost ~3 points of a core while a video
+played (callbacks alone 4.0%, callbacks that return at once 0.7%, measured). The answer does not change: the simulator
+draws each panel into one surface in place, and four rotations and an appearance change left the same surface id and
+size, with one surfaces-changed callback at registration (iOS 26). So `updateLatestSurface` runs on the
+surfaces-changed callback, on a `panel` selection, and once a second from the timer as a fallback for a runtime that
+swaps a surface without saying so. The frame callback only feeds capture-wait, and only under
+`TAPFLOW_STREAM_METRICS=1`.
 
-// timer: encodes the latest surface every tick
-let timer = DispatchSource.makeTimerSource(queue: captureQueue)
-timer.schedule(deadline: .now(), repeating: 1.0 / fps)
-timer.setEventHandler {
-    guard let surf = latestSurface, let jpeg = encodeJPEG(surf) else { return }
-    writeFrame(jpeg)
-}
-```
+The helper is compiled with `-O` (`ScreenCaptureStreamer.ts`); unoptimised it cost ~2 points of a core more.
 
 ---
 
@@ -385,10 +389,13 @@ timer.setEventHandler {
 
 **When**: reading the framebuffer IOSurface to encode (both the H.264 and JPEG paths go through it).
 
-**How**: don't encode the live surface. `copySurfaceStable` memcpys it into a private, reused
+**How**: don't encode the live surface. `copySurfaceStable` copies it into a private, reused
 buffer and brackets the copy with `IOSurfaceGetSeed`; if the seed moved, the simulator drew
 during the copy (possibly sheared) → retry (budget 4). `encodeH264`/`encodeJPEG` then read that
-snapshot.
+snapshot. The copy is a Metal blit (`GPUSurfaceCopier`, ~4% of a core while a video plays against ~7% for the memcpy),
+**waited for before the seed is read again** — that wait is what keeps the bracket meaningful. A surface the blit
+cannot take (not 32-bit BGRA, a row stride Metal cannot wrap — Metal aborts the process on one rather than refusing —
+or no Metal) is memcpy'd, frame by frame; the helper logs each reason once.
 
 **Why** (not obvious from the code):
 - The simulator draws into a **single IOSurface in place** (the static-skip seed relies on that),
@@ -404,9 +411,9 @@ snapshot.
 - This is distinct from the relay/agent **keyframe-aware backpressure** fix (orphan P-frames under
   drop): that is a transport-drop artifact; this is a source-pixel tear. Both can look like scroll
   tearing; they need separate fixes.
-- Reuse safety: downscale reads the snapshot synchronously (vImage) before the next tick; native
-  hands it to VTEncode but full-res encode is far slower than the frame interval, so the in-flight
-  encode never overlaps the next copy. `TAPFLOW_STREAM_METRICS=1` logs the retry/exhausted counts
+- Reuse safety: downscale reads the snapshot synchronously (vImage) before the next tick; native hands it to VTEncode, and a hardware encode of one frame is expected to be far shorter than the 33 ms
+  frame interval, so the in-flight encode does not overlap the next copy (an expectation, not a measurement of the
+  encode on its own). `TAPFLOW_STREAM_METRICS=1` logs the retry/exhausted counts
   (and the per-frame `capture-wait` poll gap) — formats and the full instrumentation surface are in
   [`contributing/measurement.md`](../../contributing/measurement.md).
 
@@ -517,6 +524,110 @@ issued for a device the list called `booted` too. Nothing short-circuits on the 
 **`device:ready` is not a sync point.** It is sent as soon as the stream is handed off, before the helpers a test is usually about to read are observable — so `waitForType(browser, 'device:ready')` returning does not mean `MockCapture` or `MockTouchHelper` has been constructed. Always `vi.waitFor` on the mock you are about to read, never on the message alone.
 
 There used to be a second reason: the relay replayed `device:ready` on `session:start` for any session whose device was up at registration, so the wait could latch an ack that belonged to no boot at all — that is what made the codec-negotiation test flake at ~2/10 suite runs. The replay now keys off whether the session announced a stream (relay `Session.readySent`), so a freshly registered `mockSimctl(true)` session no longer produces one. The `vi.waitFor` rule stands on the first reason alone.
+
+---
+
+### Multi-panel devices (iPhone Duo)
+
+A device type whose `capabilities.plist` lists more than one integrated display is registered as
+`formFactor: 'foldable'` and runs on a path of its own. `TypePanels` holds what is known per device type
+before boot (each panel's frame, its native turn, `scaleBasis`); `panels.ts` reads the booted panels from
+`simctl io <udid> enumerate`. **Every other device skips all of it** — no helper, no devicectl polling — and
+an Xcode 26 host, which has no such device type, never reaches it.
+
+#### Input goes through `guest-helper`, inside the simulator
+
+On a multi-panel device the host's Indigo path has no live receiver for the cover's touches, and Indigo keys,
+buttons and the Purple rotation event are dropped. So touch, keys, buttons, the hinge and the orientation
+picker all go through `src/guest-helper.m`, an iOS-simulator executable started with `xcrun simctl spawn`
+that dispatches HID events on virtual services it registers. Its stdin protocol is in the file's header.
+
+- **Every private symbol for this device lives in that one file**, opened with `dlopen`. A runtime that
+  refuses one makes it print `fatal`, and the boot fails with that reason — the device is shut down only if
+  the boot brought it up. So does a helper that is not ready within `HELPER_BOOT_READY_MS` (60 s): one that
+  dies without `fatal` is relaunched for ever, which a session can wait out and a boot cannot. Nothing is
+  half-offered: no helper means no input, so the device is refused.
+- **Before connecting, only two things are checked**: that `bin/guest-helper` exists and that `devicectl` is
+  found. Either missing leaves every multi-panel device out of the list. Whether the runtime accepts the
+  helper is known only at boot.
+- **A boot that brings the device up stops the helper and forgets the readings of the boot before.** A
+  simulator shut down outside tapflow (quitting DeviceHub shuts every one) left them in place, and the next
+  boot waited out the old helper's respawn cooldown and started from the panel lit before the shutdown. A
+  devicectl read still in flight at that moment is dropped too (`forget` bumps a generation).
+- **It is a committed binary**, built by `build-guest-helper.sh` (any Xcode's iphonesimulator SDK, arm64,
+  ad-hoc signed) and recorded in `guest-helper-shipped.json`; `scripts/__tests__/guestHelperArtifactFresh.test.mjs`
+  fails when the source moved and the binary did not. Same pattern as the network hook's dylib.
+- **A service registered is not a service usable.** A tap within 50 ms of registration is dropped, one at
+  100 ms lands (measured, Xcode 27.1). Everything is registered at start and `ready` comes 300 ms after.
+- **`GuestHelper` is `TouchHelper`'s lifecycle with three differences**, listed in its header: the process
+  spawned is `simctl spawn`, not the helper, and the two do not die together, so the helper's own pid is
+  killed separately and stale helpers are found with `pgrep` before each spawn; `fatal` is final; running
+  out of the respawn budget is not.
+- **`hinge` gets a 30 s answer deadline, not 10.** On a loaded 8 GB Mac the answer came after 10.8 s, the
+  helper was replaced as wedged, and the next fold was dropped. A fold's success is the panel lighting,
+  watched at the same time, never the helper's answer.
+
+#### Which panel is lit is read, never inferred
+
+Both panels report powered on, and the host cannot tell from the angle it sent which one SpringBoard lit.
+`PanelState` reads `devicectl device info displays` (the `active` panel), and that reading decides where
+touches go, which panel is captured and which frame is drawn.
+
+- **A fold takes 4–6 s to light its panel**, so `setPosture` waits up to `FOLD_SETTLE_MS` (10 s). The
+  sweep ending is not the fold landing.
+- **A panel change nobody asked for is followed only after holding `PANEL_HOLD_MS` (4 s).** A Duo booted
+  after an erase lit its unfolded panel for up to 3.2 s and went back to the cover, once in two boots
+  (measured); followed, the viewer swapped to a dark panel and back. tapflow's own fold is confirmed at once.
+- **Two postures, `closed` 0° and `open` 180°.** DeviceHub's half-open 130° lights the same panel as flat,
+  so a third step would read as a press that did nothing; unfolding to 130 left DeviceHub drawing the device
+  half open. Same reasoning as Android leaving out HALF_OPENED's twin.
+- **Folds made outside tapflow are polled**, every 2 s while anything is moving and every 6 s once nothing
+  has for 30 s. Each devicectl read costs ~0.2 s of CPU; a flat 2 s poll held ~18% of a core for as long as
+  a session was open. A change the poll sees, or a fold or turn sent from tapflow, brings the 2 s poll back.
+
+#### Capture, frame and scale follow the lit panel
+
+The capture helper is pointed at the lit panel by size (`ScreenCaptureStreamer.selectPanel`); before that it
+took the largest surface, which is the unfolded panel, dark while folded. Each panel has its own frame — the
+chrome id `simctl io enumerate` gives it (cover `phone15`, unfolded `phone14`; Duo-only shapes, not iPhone
+14/15). `ChromeData.scaleBasis` sizes both by the largest frame, so the cover is drawn at half the unfolded
+device as DeviceHub draws it. Corner radii come from `capabilities.plist`'s per-corner values
+(`screenCornerRadii`), because the cover is rounded outside and nearly square at the hinge.
+
+#### Rotation is the physical orientation
+
+`ChromeData.streamRotation` is the way the device is **held** — `devicectl device orientation get`
+(`PhysicalOrientation`) — plus the lit panel's native turn (the unfolded panel is drawn turned 270, so
+upright shows it turned 90). The glass turns with the body, as in DeviceHub; whether the picture stands up
+is the app's business. Every read and write source measured, including the ones rejected:
+[`contributing/ios-orientation-sources.md`](../../contributing/ios-orientation-sources.md).
+
+- **devicectl's `currentOrientation` on a display is the UI's orientation, not the device's**, and does not
+  move on the home screen however the device is turned. Do not build rotation on it.
+- **Rotate is a quarter turn from a fresh reading** (`direction: 'clockwise'`), sent as the helper's
+  `orient` with DeviceHub's labels and confirmed by reading back. Purple and `devicectl … orientation set`
+  do nothing on the Duo (measured).
+- **Single-panel devices are on the same model, through Purple** (`rotation-helper`, see below for its
+  inverted names; `PURPLE_ARGS` maps them). The orientation is **read on every host**, at a session's boot
+  and before each turn, and reported as read — never reset, so a reload or a second viewer joins the device
+  where it is. **An Xcode 26 host's devicectl does not see simulators**, so there it is read inside the
+  simulator: `guest-helper --orientation`, one backboardd MIG call (`_BKSHIDGetNonFlatDeviceOrientation`),
+  0.33–0.42 s through `simctl spawn` (measured, iOS 26.5, all four Purple turns). The source is chosen by the
+  host's Xcode, not tried in turn: on iOS 27.1 backboardd's value did not follow a DeviceHub turn, so it would
+  answer portrait for a device that is not. **The helper is renamed for this** — it was `duo-helper` while
+  it did only the Duo's input.
+- **What it stands up, and why.** Only a device with nothing to report — no reading and nothing remembered
+  (`PhysicalOrientation.note`, for a host where neither source answers: the helper is arm64-only); **every
+  run's boot** (`runReset`), so a flow replays from the same orientation whatever a person left; and a
+  session with no frame, which cannot be told the turn and whose viewer draws the device upright. A
+  per-device memory, not a per-session one: per session is #910's shape, which the design review found. A
+  device is read every time rather than marked unreadable after a failure — one failure right after a boot
+  otherwise kept it on memory for the agent's life (review finding).
+- **An older viewer's `landscape` target means 270** (`landscapeLeft`) on a single-panel device, because
+  that viewer draws landscape as 270; met only there. Meeting it with either landscape — the Duo's rule —
+  would show the device upside down in that viewer.
+- Under vitest the default `PhysicalOrientation` rejects every read (no source answers), so a suite never
+  reaches the host's devicectl or spawns into a simulator.
 
 ---
 

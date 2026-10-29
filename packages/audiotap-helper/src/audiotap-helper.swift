@@ -148,31 +148,55 @@ var srcSR = 48000.0
 var srcCh = 2
 var connectedOK = (muteOnlyIdx == nil) // mute-only never streams → sendBuffer stays a no-op
 
+// BEGIN resampler — compiled on its own by src/__tests__/resampler.test.ts, so keep it self-contained.
+// Linear resampling that carries its phase and the previous callback's last frame from one callback to the
+// next. Starting each callback from zero, as this did, dropped the fractional output frame every callback
+// (512 in → 470.4 out, 470 sent) and never interpolated across the boundary: a step in the waveform ~94
+// times a second, heard as a ticking under every sound, and 44,062 frames a second against the 44,100 the
+// dashboard plays, so its buffer slowly ran dry.
+struct ResamplerState {
+  var pos = 0.0 // the next output frame's position, in source frames from this callback's first frame
+  var prevL: Float = 0, prevR: Float = 0 // the previous callback's last frame, at position -1
+}
+
+func resample(_ src: UnsafePointer<Float>, _ inFrames: Int, _ channels: Int, _ srcRate: Double, _ dstRate: Double,
+              _ st: inout ResamplerState) -> [Int16] {
+  let step = srcRate / dstRate
+  var out = [Int16]()
+  out.reserveCapacity((Int(Double(inFrames) / step) + 2) * 2)
+  @inline(__always) func frame(_ i: Int) -> (Float, Float) {
+    if i < 0 { return (st.prevL, st.prevR) }
+    let l = src[i * channels]
+    return (l, channels > 1 ? src[i * channels + 1] : l)
+  }
+  var p = st.pos
+  while p < Double(inFrames - 1) {
+    let i0 = Int(p.rounded(.down))
+    let frac = Float(p - Double(i0))
+    let (l0, r0) = frame(i0), (l1, r1) = frame(i0 + 1)
+    out.append(f2s16(l0 + (l1 - l0) * frac))
+    out.append(f2s16(r0 + (r1 - r0) * frac))
+    p += step
+  }
+  st.pos = p - Double(inFrames)
+  (st.prevL, st.prevR) = frame(inFrames - 1)
+  return out
+}
+
 @inline(__always) func f2s16(_ f: Float) -> Int16 {
   let c = f > 1 ? 1 : (f < -1 ? -1 : f)
   return Int16(c * 32767)
 }
+// END resampler
 
-// Reused scratch; the socket write is the only per-callback alloc-free hot path.
+var resampler = ResamplerState() // read by the IOProc, reset by rebuildTap after destroyTap() has drained it
+
 func sendBuffer(_ data: UnsafeMutableRawPointer, _ byteSize: UInt32) {
   guard connectedOK else { return }
   let inFrames = Int(byteSize) / 4 / srcCh
   if inFrames == 0 { return }
-  let src = data.assumingMemoryBound(to: Float.self)
-  let ratio = DST_SR / srcSR
-  let outFrames = max(1, Int(Double(inFrames) * ratio))
-  var out = [Int16](repeating: 0, count: outFrames * 2)
-  for j in 0..<outFrames {
-    let srcPos = Double(j) / ratio
-    let i0 = min(Int(srcPos), inFrames - 1)
-    let i1 = min(i0 + 1, inFrames - 1)
-    let frac = Float(srcPos - Double(i0))
-    let l0 = src[i0 * srcCh], l1 = src[i1 * srcCh]
-    let r0 = srcCh > 1 ? src[i0 * srcCh + 1] : l0
-    let r1 = srcCh > 1 ? src[i1 * srcCh + 1] : l1
-    out[j * 2]     = f2s16(l0 + (l1 - l0) * frac)
-    out[j * 2 + 1] = f2s16(r0 + (r1 - r0) * frac)
-  }
+  let out = resample(data.assumingMemoryBound(to: Float.self), inFrames, srcCh, srcSR, DST_SR, &resampler)
+  if out.isEmpty { return }
   out.withUnsafeBytes { raw in
     var len = UInt32(raw.count).bigEndian
     let hOK = withUnsafeBytes(of: &len) { write(sock, $0.baseAddress, 4) == 4 }
@@ -252,6 +276,7 @@ func rebuildTap(_ pids: [pid_t]) -> Bool {
   AudioObjectGetPropertyData(curAggID, &faddr, 0, nil, &fsz, &fmt)
   srcSR = fmt.mSampleRate > 0 ? fmt.mSampleRate : 48000.0
   srcCh = Int(fmt.mChannelsPerFrame > 0 ? fmt.mChannelsPerFrame : 2)
+  resampler = ResamplerState() // a new tap is a new stream, so it starts with no phase or previous frame
   err("audiotap: tapping \(procObjs.count)/\(pids.count) pids — src \(srcSR)Hz \(srcCh)ch → 44100/stereo/S16")
 
   let block: AudioDeviceIOBlock = { (_, inInputData, _, _, _) in

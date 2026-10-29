@@ -16,19 +16,44 @@ import ObjectiveC
 import VideoToolbox
 import CoreMedia
 import Accelerate
+import Metal
 
 // MARK: - Args
 
-let args = CommandLine.arguments
-guard args.count == 3 || args.count == 4,
-      let fps = Double(args[1]), fps > 0
+// `--panel <w>x<h>` picks a multi-panel device's panel by its framebuffer size (iPhone Duo: cover 1398x2034,
+// unfolded 2007x2853). Without it the largest surface is captured, which is every single-panel device's only
+// panel — and on the Duo the unfolded one, dark while folded, which is why the flag exists.
+func parsePanel(_ s: String) -> (Int, Int)? {
+    let parts = s.split(separator: "x").compactMap { Int($0) }
+    return parts.count == 2 && parts[0] > 0 && parts[1] > 0 ? (parts[0], parts[1]) : nil
+}
+var positional: [String] = []
+var initialPanel: (Int, Int)? = nil
+do {
+    var rest = Array(CommandLine.arguments.dropFirst())
+    while !rest.isEmpty {
+        let a = rest.removeFirst()
+        if a == "--panel" {
+            guard let v = rest.first, let panel = parsePanel(v) else {
+                fputs("error: --panel needs <width>x<height>\n", stderr)
+                exit(1)
+            }
+            rest.removeFirst()
+            initialPanel = panel
+        } else {
+            positional.append(a)
+        }
+    }
+}
+guard positional.count == 2 || positional.count == 3,
+      let fps = Double(positional[0]), fps > 0
 else {
-    fputs("usage: screencapture-helper <fps> <udid> [jpeg|h264]\n", stderr)
+    fputs("usage: screencapture-helper <fps> <udid> [jpeg|h264] [--panel <w>x<h>]\n", stderr)
     exit(1)
 }
-let targetUDID = args[2]
+let targetUDID = positional[1]
 // Fail closed on an unknown codec rather than silently emitting JPEG framing.
-let codec = args.count == 4 ? args[3] : "jpeg"
+let codec = positional.count == 3 ? positional[2] : "jpeg"
 guard codec == "jpeg" || codec == "h264" else {
     fputs("error: unknown codec '\(codec)' — expected jpeg or h264\n", stderr)
     exit(1)
@@ -257,7 +282,7 @@ var h264Height = 0
 var h264SrcWidth = 0        // source IOSurface dimensions — drives session recreation on rotation
 var h264SrcHeight = 0
 var scaledBuffer: CVPixelBuffer?  // reused downscale target; nil when encoding at native size
-var srcCopyBuffer: CVPixelBuffer? // reused tear-free CPU snapshot of the live framebuffer surface
+var srcCopyBuffer: CVPixelBuffer? // reused tear-free snapshot of the live framebuffer surface (GPU blit, or memcpy)
 var srcCopyW = 0, srcCopyH = 0
 var tearRetries = 0               // copies that raced a sim write (seed changed) and were retried
 var tearExhausted = 0             // copies still racing after the retry budget (best-effort frame)
@@ -393,16 +418,96 @@ func scaleToTarget(_ src: CVPixelBuffer) -> CVPixelBuffer? {
     return dst
 }
 
-// Tear-free CPU snapshot of the live framebuffer surface. The simulator draws into a single
+// Tear-free snapshot of the live framebuffer surface. The simulator draws into a single
 // IOSurface in place (the static-skip seed relies on that), asynchronously to our 30fps timer.
 // Reading the surface mid-draw (native: VTEncode reads it directly; downscale: vImage reads it)
 // bakes a horizontal tear (top = old frame, bottom = new) into the H.264 frame — visible on every
 // tier and decoder, recovering on the next frame. IOSurfaceLock(.readOnly) is cooperative and does
 // not block the sim's GPU writes, so it alone does not prevent the tear.
 //
-// Fix: memcpy the surface into a private buffer and bracket the copy with IOSurfaceGetSeed; if the
-// seed moved, the sim drew during the copy → it may be sheared → retry. memcpy ≈ 1ms vs ≈ 16ms write
-// interval, so 1–2 tries land a coherent snapshot even during continuous scroll.
+// Fix: copy the surface into a private buffer and bracket the copy with IOSurfaceGetSeed; if the
+// seed moved, the sim drew during the copy → it may be sheared → retry. A copy (memcpy ≈ 1ms, GPU blit
+// ≈ 0.3ms) against a ≈ 16ms write interval lands a coherent snapshot in 1–2 tries even during scroll.
+//
+// The copy runs on the GPU when it can (`GPUSurfaceCopier`): the same snapshot, the same seed bracket, without the CPU
+// reading 12–15 MB a frame. Measured while a video played: the helper at ~4% of a core against ~7% for the memcpy,
+// with the simulator's own processes and WindowServer unchanged and the same tear retries. Waiting for the blit before
+// reading the seed again is what keeps the bracket meaningful. A surface the GPU path refuses (not 32-bit BGRA, a row
+// stride Metal cannot wrap, or Metal unavailable or failing) takes the memcpy, frame by frame.
+
+// BEGIN gpu-copy — compiled on its own by src/__tests__/gpuCopy.test.ts, so keep it self-contained.
+final class GPUSurfaceCopier {
+    private let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private var source: (id: IOSurfaceID, width: Int, height: Int, texture: MTLTexture)?
+    private var target: (buffer: CVPixelBuffer, texture: MTLTexture)?
+    /// Why the last `copy` returned false, for the log.
+    private(set) var lastFailure = ""
+
+    init?() {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
+        self.device = device
+        self.queue = queue
+    }
+
+    /// Copies `surface` into `buffer` on the GPU and waits for it. False when either is not 32-bit BGRA of the same
+    /// size, a row stride is not what Metal can wrap, or Metal will not do it; the caller then copies on the CPU.
+    func copy(_ surface: IOSurface, into buffer: CVPixelBuffer) -> Bool {
+        let width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface)
+        // Metal does not refuse a misaligned stride, it aborts the process (measured: a 468-byte row). A 1398-pixel
+        // panel is 5592 bytes a row unpadded, so this is asked of every surface rather than assumed.
+        let align = device.minimumLinearTextureAlignment(for: .bgra8Unorm)
+        guard IOSurfaceGetPixelFormat(surface) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA
+        else { lastFailure = "pixel format \(IOSurfaceGetPixelFormat(surface))"; return false }
+        guard CVPixelBufferGetWidth(buffer) == width, CVPixelBufferGetHeight(buffer) == height
+        else { lastFailure = "size \(width)x\(height)"; return false }
+        guard IOSurfaceGetBytesPerRow(surface) % align == 0, CVPixelBufferGetBytesPerRow(buffer) % align == 0
+        else { lastFailure = "row stride \(IOSurfaceGetBytesPerRow(surface))/\(CVPixelBufferGetBytesPerRow(buffer)) bytes"; return false }
+        guard let src = sourceTexture(surface, width, height), let dst = targetTexture(buffer, width, height),
+              let commands = queue.makeCommandBuffer(), let blit = commands.makeBlitCommandEncoder()
+        else { lastFailure = "texture or command buffer not created"; return false }
+        blit.copy(from: src, to: dst)
+        blit.endEncoding()
+        commands.commit()
+        // No timeout of our own: Metal ends a hung command buffer itself with a GPU-timeout error, and a semaphore
+        // here could not unblock captureQueue anyway.
+        commands.waitUntilCompleted()
+        guard commands.status == .completed
+        else { lastFailure = "GPU error \(commands.error.map { String(describing: $0) } ?? "status \(commands.status.rawValue)")"; return false }
+        return true
+    }
+
+    // Keyed by the surface's id and size: the simulator keeps drawing into one surface, and a fold or a new runtime
+    // that hands over another one, even of the same size, must not be read through the old texture.
+    private func sourceTexture(_ surface: IOSurface, _ width: Int, _ height: Int) -> MTLTexture? {
+        let id = IOSurfaceGetID(surface)
+        if let s = source, s.id == id, s.width == width, s.height == height { return s.texture }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        d.usage = .shaderRead
+        d.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: d, iosurface: surface, plane: 0) else { return nil }
+        source = (id, width, height, texture)
+        return texture
+    }
+
+    private func targetTexture(_ buffer: CVPixelBuffer, _ width: Int, _ height: Int) -> MTLTexture? {
+        if let t = target, t.buffer === buffer { return t.texture }
+        guard let surface = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue() else { return nil }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        d.usage = .shaderWrite
+        d.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: d, iosurface: surface, plane: 0) else { return nil }
+        target = (buffer, texture)
+        return texture
+    }
+}
+// END gpu-copy
+
+let gpuCopier = GPUSurfaceCopier()
+var gpuFailuresLogged = Set<String>()  // each reason once, so a later, different one is still heard
+if gpuCopier == nil { fputs("info: no Metal device — copying frames on the CPU\n", stderr) }
+
 func copySurfaceStable(_ surface: IOSurface) -> CVPixelBuffer? {
     let w = IOSurfaceGetWidth(surface)
     let h = IOSurfaceGetHeight(surface)
@@ -413,6 +518,19 @@ func copySurfaceStable(_ surface: IOSurface) -> CVPixelBuffer? {
         srcCopyBuffer = pb; srcCopyW = w; srcCopyH = h
     }
     guard let dst = srcCopyBuffer else { return nil }
+    if let gpu = gpuCopier {
+        var copied = true
+        for attempt in 0...3 {
+            let seed0 = IOSurfaceGetSeed(surface)
+            guard gpu.copy(surface, into: dst) else { copied = false; break }
+            if IOSurfaceGetSeed(surface) == seed0 { return dst }  // no write during the copy → coherent
+            if attempt < 3 { tearRetries += 1 } else { tearExhausted += 1 }
+        }
+        if copied { return dst }  // best-effort, as below
+        if gpuFailuresLogged.insert(gpu.lastFailure).inserted {
+            fputs("info: GPU copy not used (\(gpu.lastFailure)) — copying on the CPU\n", stderr)
+        }
+    }
     CVPixelBufferLockBaseAddress(dst, [])
     defer { CVPixelBufferUnlockBaseAddress(dst, []) }
     guard let dstBase = CVPixelBufferGetBaseAddress(dst) else { return nil }
@@ -534,10 +652,9 @@ guard !descriptors.isEmpty else {
 
 // MARK: - Capture loop
 //
-// Strategy: IOSurface callbacks update `latestSurface` whenever the framebuffer
-// changes. A DispatchSourceTimer emits JPEG frames at the configured FPS,
-// reading `latestSurface` each tick. This guarantees smooth FPS even when
-// the simulator screen is static (no callbacks firing).
+// Strategy: `latestSurface` is the framebuffer surface, looked up when the simulator reports its surfaces changed (and
+// as a fallback once a second — see the registration below). A DispatchSourceTimer emits frames at the configured
+// FPS, reading `latestSurface` each tick. This guarantees smooth FPS even when the simulator screen is static.
 
 let captureQueue = DispatchQueue(label: "com.tapflow.capture", qos: .userInteractive)
 var latestSurface: IOSurface?
@@ -551,15 +668,26 @@ var captureWaitSumMs = 0.0
 var captureWaitMax = 0.0
 var captureWaitN = 0
 
+// Read and written on captureQueue only.
+var selectedPanel: (Int, Int)? = initialPanel
+var lastSurfaceWalkNs: UInt64 = 0
+
 func updateLatestSurface() {
+    lastSurfaceWalkNs = DispatchTime.now().uptimeNanoseconds
     var best: IOSurface?
     var bestArea = 0
+    var selected: IOSurface?
     for desc in descriptors {
         guard let obj = desc.perform(surfSel)?.takeUnretainedValue() else { continue }
         let surf = unsafeBitCast(obj, to: IOSurface.self)
-        let area = IOSurfaceGetWidth(surf) * IOSurfaceGetHeight(surf)
-        if area > bestArea { best = surf; bestArea = area }
+        let w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf)
+        if let p = selectedPanel, p.0 == w, p.1 == h { selected = surf }
+        if w * h > bestArea { best = surf; bestArea = w * h }
     }
+    // A selected panel that is not there (yet) falls back to the old rule rather than to nothing: a stream
+    // that shows the wrong panel recovers on the next walk (surfaces changed, or the timer's once a second),
+    // one that shows nothing trips the 8 s watchdog and restarts the helper.
+    if let selected { best = selected }
     if let best {
         latestSurface = best
         let s = IOSurfaceGetSeed(best)
@@ -570,7 +698,7 @@ func updateLatestSurface() {
 // Accumulate capture-wait for a freshly-changed frame; emit avg/max each 150-sample window.
 // Excludes keep-alive / forced-keyframe re-sends (changed == false) — those aren't new captures.
 func recordCaptureWait(_ changed: Bool, _ nowNs: UInt64) {
-    guard logTearStats, changed, latestSeedArrivalNs != 0 else { return }
+    guard logTearStats, changed, latestSeedArrivalNs != 0, nowNs >= latestSeedArrivalNs else { return }
     captureWaitSumMs += Double(nowNs - latestSeedArrivalNs) / 1_000_000
     captureWaitMax = max(captureWaitMax, Double(nowNs - latestSeedArrivalNs) / 1_000_000)
     captureWaitN += 1
@@ -586,10 +714,23 @@ let regSel = NSSelectorFromString(
     "surfacesChangedCallback:propertiesChangedCallback:"
 )
 
+// The frame callback fires for every frame the simulator draws (60 a second or more while anything moves), and it
+// used to walk every descriptor for its surface each time — ~3 points of a core while a video played, for an answer
+// that does not change: the simulator draws each panel into one surface in place, and four rotations and an appearance
+// change left the same surface (same id and size) with one surfaces-changed callback, at registration (measured,
+// iOS 26). So the surface is looked up when the simulator says the surfaces changed, when a panel is selected, and
+// once a second from the timer in case a runtime changes one without saying so. The frame callback only feeds
+// capture-wait, and only when that is being measured.
+func noteFrameArrival() {
+    guard logTearStats, let surf = latestSurface else { return }
+    let s = IOSurfaceGetSeed(surf)
+    if s != lastObservedSeed { lastObservedSeed = s; latestSeedArrivalNs = DispatchTime.now().uptimeNanoseconds }
+}
+
 for desc in descriptors where desc.responds(to: regSel) {
     guard let imp = class_getMethodImplementation(type(of: desc), regSel) else { continue }
     let uuid = NSUUID()
-    let onFrame:    @convention(block) () -> Void = { captureQueue.async { updateLatestSurface() } }
+    let onFrame:    @convention(block) () -> Void = { if logTearStats { captureQueue.async { noteFrameArrival() } } }
     let onSurfaces: @convention(block) () -> Void = { captureQueue.async { updateLatestSurface() } }
     let onProps:    @convention(block) () -> Void = {}
     callbackBlocks += [onFrame as AnyObject, onSurfaces as AnyObject, onProps as AnyObject]
@@ -636,8 +777,13 @@ var lastSentNs: UInt64 = 0
 let timer = DispatchSource.makeTimerSource(queue: captureQueue)
 timer.schedule(deadline: .now(), repeating: 1.0 / fps)
 timer.setEventHandler {
-    guard let surf = latestSurface else { return }
+    if latestSurface == nil || DispatchTime.now().uptimeNanoseconds - lastSurfaceWalkNs >= 1_000_000_000 {
+        updateLatestSurface()
+    }
+    // Taken after the walk: a walk that meets an unseen seed stamps its arrival now, and an earlier `nowNs` would make
+    // capture-wait's unsigned subtraction negative, which traps (review finding).
     let nowNs = DispatchTime.now().uptimeNanoseconds
+    guard let surf = latestSurface else { return }
     if useH264 {
         // Static-skip an unchanged screen so idle viewers stop decoding (the decoder holds the
         // last, identical frame). With no frames generated during the gap, the next P-frame
@@ -673,15 +819,38 @@ timer.setEventHandler {
 }
 timer.resume()
 
-// stdin command channel (H.264 only): a 0x01 byte forces an IDR on the next frame.
-// The relay sends this for drop-to-keyframe recovery so the stream resyncs fast
-// instead of waiting for the periodic IDR. Set the flag on captureQueue so it is
-// only ever touched there (same queue as encodeH264).
-if useH264 {
-    FileHandle.standardInput.readabilityHandler = { handle in
-        let data = handle.availableData
-        if data.isEmpty { handle.readabilityHandler = nil; return } // stdin closed
-        if data.contains(0x01) { captureQueue.async { pendingForceKeyFrame = true } }
+// stdin command channel, read for both codecs:
+//  - a 0x01 byte forces an IDR on the next H.264 frame. The relay sends this for drop-to-keyframe
+//    recovery so the stream resyncs fast instead of waiting for the periodic IDR. JPEG ignores it.
+//  - a text line `panel <w>x<h>\n` switches a multi-panel device's capture to that panel. It used to be
+//    H.264-only; a JPEG session (TAPFLOW_IOS_CODEC=jpeg, or a browser without H.264) then had no way to
+//    follow a fold. Text never contains 0x01, so the two cannot be confused; lines are buffered because
+//    `availableData` chunks are arbitrary.
+// Everything is applied on captureQueue, the only queue that touches the capture state.
+var stdinText = ""
+FileHandle.standardInput.readabilityHandler = { handle in
+    let data = handle.availableData
+    if data.isEmpty { handle.readabilityHandler = nil; return } // stdin closed
+    if data.contains(0x01) { captureQueue.async { pendingForceKeyFrame = true } }
+    stdinText += String(decoding: data.filter { $0 != 0x01 }, as: UTF8.self)
+    while let nl = stdinText.firstIndex(of: "\n") {
+        let line = String(stdinText[..<nl]).trimmingCharacters(in: .whitespaces)
+        stdinText = String(stdinText[stdinText.index(after: nl)...])
+        let parts = line.split(separator: " ")
+        guard parts.count == 2, parts[0] == "panel", let panel = parsePanel(String(parts[1])) else {
+            if !line.isEmpty { fputs("warning: unknown stdin command '\(line)'\n", stderr) }
+            continue
+        }
+        captureQueue.async {
+            selectedPanel = panel
+            updateLatestSurface()
+            // The new panel's seed is unrelated to the old one's, so a match must not read as "static", and
+            // the first frame of a new size has to be a keyframe (encodeH264 also forces one on a size change).
+            lastSeed = 0
+            lastSentNs = 0
+            pendingForceKeyFrame = true
+            fputs("info: capturing panel \(panel.0)x\(panel.1)\n", stderr)
+        }
     }
 }
 

@@ -461,7 +461,7 @@ export function SimulatorToolbar({
             right for two: opening a menu to pick the only other option is a click for nothing. The
             radio menu that used to stand behind this for three or more was unreachable —
             `android-agent`'s `KNOWN` table has two entries and `parsePostures` filters it, so the
-            wire carries 0, 1 or 2, and iOS sends none.
+            wire carries 0, 1 or 2; iOS sends two for an iPhone Duo and none for anything else.
 
             It is `=== 2` rather than `> 1` so that a third entry added to that table does not
             silently fall into `(at + 1) % length` and start *cycling*, which is the behaviour the

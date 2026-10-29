@@ -1,5 +1,26 @@
 # @tapflowio/relay
 
+## 0.31.0
+
+### Minor Changes
+
+- fc96414: The dashboard draws an Android emulator that reports `bodyRotation` by its body: the frame as it arrives, in a shell of its shape, so a portrait-locked app shows on its side. Rotate spins the device a quarter clockwise, as on iOS, sends the turn once the spin has finished, and the next frame ends the spin; a turn whose frame never comes is undone after 4 s. Touches go out in the frame's space (`space: 'frame'`), so one sent right after a turn lands where it is aimed; a touch is refused only while the device is drawn mid-spin. Leaving a session no longer turns the device back. Real devices and emulators without gRPC (scrcpy) still toggle portrait/landscape.
+- d02f08a: The dashboard shows and folds the iPhone Duo. The fold control Android foldables already have appears for it, and while it folds the screen says **Folding...** or **Unfolding...** and the new panel fades in. Both panels are drawn at one scale, so the cover shows at half the unfolded device, and a booting Duo is drawn as the folded cover. The device is turned the way it is held, frame and screen together, and **Rotate** turns it a quarter clockwise, the frame first and the screen after it.
+
+  Every iOS device now turns on screen in 0.3 s when rotated instead of jumping, and a tap or frame-button press made while it turns is not sent, so it cannot land somewhere other than where it was aimed.
+
+  A recording of an iOS device turned to landscape is no longer saved sideways: it is saved the way the device is shown, on every iOS device, and keeps the size it started with if the device turns or folds during it.
+
+### Patch Changes
+
+- 1e57d34: Device audio plays without ticking. The dashboard plays device audio at its own 44.1 kHz instead of the speakers' rate: each audio chunk is scheduled on its own, and at 48 kHz the chunk boundaries drifted off the sample grid and ticked several times a second. The audiotap helper's resampler carries its position and the previous frame from one Core Audio callback to the next; it used to start each callback afresh, dropping part of a frame and leaving each boundary uninterpolated, a tick every 10 ms and 44,062 frames a second instead of 44,100. The rebuilt helper asks once more for permission to record audio, which both iOS capture and the Android host-mute need.
+- c859f83: The dashboard copies an iOS device's picture into the canvas that recording and screenshots read only when a new frame arrives. It copied it at full resolution on every display refresh, up to 120 times a second on a ProMotion display for a 30 fps stream, which cost the browser GPU time while nothing was recorded.
+- 6cd0f97: The dashboard records an iOS device at up to the stream's resolution. The recording canvas was the size the device was laid out on the page, under a third of the stream on a native-tier iPhone; it is now the laid-out device scaled by the screen's stream pixels per page pixel, frame and cursor included, held to 1920 px on its longest side and to even dimensions. A native-tier phone with its frame meets that limit and is recorded at about 70% of the stream; the smaller stream tiers are recorded at their full size. Android recordings were already at the stream's size and are unchanged.
+- Updated dependencies [3f53fb4]
+- Updated dependencies [990b959]
+  - @tapflowio/protocol@0.31.0
+  - @tapflowio/agent-core@0.31.0
+
 ## 0.30.0
 
 ### Minor Changes

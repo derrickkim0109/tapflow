@@ -1,6 +1,6 @@
 {
   "name": "@tapflowio/ios-agent",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "iOS simulator agent for tapflow — xcrun simctl control and screen streaming",
   "keywords": [
     "tapflow",
@@ -61,6 +61,7 @@
     "test": "vitest run",
     "lint": "eslint src",
     "build:nethook": "./build-nethook.sh",
+    "build:guest-helper": "./build-guest-helper.sh",
     "test:netfilter": "./ios-netfilter/run-tests.sh"
   },
   "dependencies": {

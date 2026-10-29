@@ -58,10 +58,55 @@ the device looks goes in the screen component or its hook, never in a viewer**, 
 State that belongs to a control but changes the picture is an input, not something the screen owns:
 iOS `isLandscape`, Android `userWantsLandscape` and `rotatePending`. **That state is the controlling
 viewer's own and is not on the wire** — no message tells anyone else the device was turned. So a caller
-with no controls that passes the defaults shows the device upright after somebody else rotated it: on
-iOS and on Android's scrcpy backend the CSS turn is the only rotation, and on gRPC the turned frame is
-not held back while the rotation lands. Following another viewer's rotation needs orientation on the
-wire first. iOS press targets on the frame exist only when the caller passes `buttons`; without them the
+with no controls that passes the defaults shows the device upright after somebody else rotated it. That
+now holds only for a device that does not report its turn: an older agent, and Android's scrcpy backend,
+where the CSS turn is the only rotation. An Android emulator on gRPC reports `bodyRotation` (below).
+
+**iOS is the exception, and the wire already carries it** — the iPhone Duo first, and every iOS simulator
+from an agent that reports it. The agent reports how far to turn
+the whole device as `ChromeData.streamRotation`, and when that is present `iosTurn` uses it and ignores
+`isLandscape` — the tester's Rotate is carried out on the device and comes back as a new turn, so a
+watching page follows it too. The viewer then asks from the reported turn and does not turn the device
+back on unmount, because the orientation is the device's, shared with DeviceHub. `isLandscape` is left
+for an older iOS agent that sends no turn.
+
+**An Android emulator on gRPC is drawn the same way, by `AndroidChrome.bodyRotation`.** Its frames already
+arrive as the body is held, so body mode draws them unturned (`totalTurn` 0) in a shell of the frame's shape,
+and a portrait-locked app shows on its side. **Nothing is held back on a turn**: the next frame is the turned
+body (53 ms, measured) while the chrome follows 0.6–3.6 s later, so the shell takes the *frame's* shape and the
+picture never waits on the description. Holding it — the first version — put every turn behind "Changing
+posture…", and framing by a lagging description stretched a landscape frame into a portrait shell.
+
+**Input does not wait either: a pointer goes out as the frame's own point, marked `space: 'frame'`**, and the
+agent turns it by the frame it holds. The second version turned it here into the screen Android draws, by the
+description's correction, and so had to drop every touch until the description caught up — felt as input
+stalling after each turn. The cursor, the pinch hint and the recording's overlay are still drawn in the screen
+Android draws (`toShownNorm`, `turnPoint` by `streamRotation`); they move with the description, which is only
+a picture of where the pointer is. Every other sender of a touch — MCP's screenshot, the UI tree, older
+dashboards — sends no `space` and means that screen, and `bodyRotation` is the marker that the agent reads the
+field at all.
+
+**A press spins the device, as on iOS, and the frame ends the spin.** Each press owes a quarter, drawn as a CSS
+turn of the whole bezel inside an area that swaps its shape with it, and `input:rotate` is sent after `SPIN_MS`.
+The turned body's frame pays the quarter — recognised by its sides swapping, never by the description — and is the
+same picture the spin ended on, so the swap does not move. A frame that never comes is undone after
+`PENDING_TURN_MS`. Only this viewer's presses spin: a turn made elsewhere arrives as a frame with nothing owed and
+is drawn as it comes, because spinning it would turn a picture that has already turned. No touch is taken while
+the device is drawn mid-spin.
+
+Two orders are DeviceHub's and easy to lose. **The frame turns first and the turn is sent when it has
+finished** (`SPIN_MS`): sent at the press, a quick device turned its screen while the frame was still on
+its way. And **a turn that arrives with another frame is a fold, not a turn** — the unfolded panel is drawn
+a quarter round from the cover — so `IOSDeviceScreen` jumps to it rather than spinning a dark panel round.
+
+**A fold is not animated beyond a fade, by decision.** While one this viewer asked for is in flight
+(`usePostureControl().folding`, read from the posture list's order the way the toolbar reads it), the screen
+shows the waiting overlay with "Folding..." / "Unfolding..."; the new panel's frame fades in (`usePanelFade`).
+A 2D stand-in — a picture cut at the hinge and turned in 3D, and before it a squeeze — was built and dropped:
+no thickness, a box folding rather than the frame, an abrupt swap to the real frame, and it spilled over the
+UI around it. A convincing fold needs the device's 3D model.
+
+iOS press targets on the frame exist only when the caller passes `buttons`; without them the
 buttons are drawn at rest and nothing on the frame can be pressed.
 
 `src/__tests__/DeviceScreen.test.tsx` holds the seam directly. Before it, four ways of cutting it (an
@@ -429,9 +474,10 @@ Navigation that crossed it — not Environment, which is the group whose *future
 battery, appearance, locale, time zone, permissions) make it the one to watch next.
 
 **And Device followed it**: the restart (#628) took Android's Device group to four and iOS's to
-three, and the fold toggle (Android foldables only) takes Android's to five — over the threshold on
-that device. iOS's is still at three, so the threshold is a per-platform question, and Android's
-Device group is the one that should get a popover before anything else is added to it.
+three, and the fold toggle (foldables only: Android's, and the iPhone Duo) takes Android's to five —
+over the threshold on that device — and a Duo's to four. Other iPhones stay at three, so the threshold
+is a per-platform question, and Android's Device group is the one that should get a popover before
+anything else is added to it.
 
 ## HOW NOT
 

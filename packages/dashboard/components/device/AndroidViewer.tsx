@@ -5,9 +5,10 @@ import { newRequestId } from '@/lib/requestId';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useClientRecording } from '@/hooks/useClientRecording';
 import { ArrowLeft, Home, LayoutGrid, Loader2, Play, Power, Volume1, Volume2 } from 'lucide-react';
-import { MAX_ANDROID_LONG, useAndroidScreen } from '@/hooks/useAndroidScreen';
+import { MAX_ANDROID_LONG, SPIN_MS, useAndroidScreen } from '@/hooks/useAndroidScreen';
 import { AndroidDeviceScreen } from './AndroidDeviceScreen';
 import { useFps } from '@/hooks/useFps';
+import { usePostureControl } from '@/hooks/usePostureControl';
 import { SimulatorToolbar } from './shared/SimulatorToolbar';
 import { useNetworkControl } from '@/hooks/useNetworkControl';
 import type { NetworkMessageHandler } from '@/hooks/useNetworkControl';
@@ -17,7 +18,7 @@ import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { AndroidButton, PosturesPayload } from '@/lib/types'
 import type { BinaryFrameHandler } from '@/lib/envelope'
-import { androidToNorm as toNormPure, toPinchFingers as makePinchFingers, placeTurnedFrame, turnedSize, overlaySpace, remaining } from '@/lib/coordinate-transform';
+import { androidToNorm as toNormPure, toPinchFingers as makePinchFingers, placeTurnedFrame, turnedSize, overlaySpace, turnPoint, type Turn } from '@/lib/coordinate-transform';
 import type { MutableRefObject } from 'react';
 import type { PerfHook } from '@/components/perf/types';
 import { useClipboardBridge, isBridgedChord, type ClipboardMessageHandler } from '@/hooks/useClipboardBridge';
@@ -67,6 +68,9 @@ interface AndroidViewerProps {
   /** Quarter turns clockwise to apply to the video so it matches `screenWidth/Height`. The agent
    *  computes it; see `AndroidChrome.streamRotation`. */
   streamRotation?: 0 | 90 | 180 | 270;
+  /** How far the emulator's body is turned — `AndroidChrome.bodyRotation`. Present means body mode: the frame is
+   *  drawn as the body is held and Rotate turns the body; absent means the portrait/landscape toggle. */
+  bodyRotation?: 0 | 90 | 180 | 270;
   /** Rounded-corner radius as a fraction of width — the emulator bakes the device's corners into
    *  the framebuffer as black; we clip them so they don't show inside the screen bezel. 0 = square. */
   cornerRadius?: number;
@@ -79,7 +83,7 @@ export function AndroidViewer({
   launching, androidButtons,
   binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, onRecordingUploaded,
   rebootPending, onReboot, restartButtonRef,
-  screenWidth, screenHeight, cornerRadius, postures, streamRotation = 0,
+  screenWidth, screenHeight, cornerRadius, postures, streamRotation = 0, bodyRotation,
   perfHookRef,
 }: AndroidViewerProps) {
   const { fps, frameCount } = useFps();
@@ -111,13 +115,25 @@ export function AndroidViewer({
   // **Before the picture, because the picture is held back while one is in flight.** The effects that
   // release it stay with the rotate control below.
   const [rotatePending, setRotatePending] = useState(false)
+  // Body mode: each press spins the device and is sent once the spin has finished (see `handleRotate`).
+  const [turnsAsked, setTurnsAsked] = useState(0)
+  // Turns waiting for the spin to finish. A viewer that goes away first sends them as it goes, as iOS does: the
+  // tester pressed, and the device is shared.
+  const rotateTimers = useRef(new Map<ReturnType<typeof setTimeout>, () => void>())
+  useEffect(() => {
+    const timers = rotateTimers.current
+    return () => { for (const [t, sendNow] of timers) { clearTimeout(t); sendNow() } }
+  }, [])
 
   // ── The picture (decoding, geometry, visibility) — shared with the watch-only page ──
   const screen = useAndroidScreen({
     binaryFrameHandlerRef, perfHookRef, frameCount,
-    screenWidth, screenHeight, streamRotation, cornerRadius, userWantsLandscape, rotatePending,
+    screenWidth, screenHeight, streamRotation, cornerRadius, userWantsLandscape, rotatePending, bodyRotation, turnsAsked,
   })
-  const { surfaceHostRef, containerRef, decoderRef, videoSizeRef, needsCSSRotationRef, decoderUnsupported, totalTurn } = screen
+  const { surfaceHostRef, containerRef, decoderRef, videoSizeRef, needsCSSRotationRef, screenTurnRef, screenTurn, decoderUnsupported, totalTurn, spinning } = screen
+  // Read by the pointer handlers, which run between renders.
+  const spinningRef = useRef(false)
+  useLayoutEffect(() => { spinningRef.current = spinning }, [spinning])
 
   // ── Recording (composeFrame only — state/refs/lifecycle in useClientRecording) ──
   const composeFrame = useCallback(() => {
@@ -243,48 +259,13 @@ export function AndroidViewer({
     }
   }, [recordState, startClientRecording, stopClientRecording, totalTurn, recordCanvasRef, videoSizeRef])
 
-  // A fold takes a moment — the emulator changes panel and the stream renegotiates — and without a
-  // sign of it the button reads as not having registered the press.
-  // The posture we asked for, or null when nothing is in flight. Holding the *target* rather than
-  // a boolean is what lets the release wait for the device to actually arrive there — a plain flag
-  // could only be released on a timer, and a timer that starts at the request expires long before
-  // the fold finishes.
-  const [pendingPosture, setPendingPosture] = useState<string | null>(null)
-  const posturePending = pendingPosture !== null
-  // The stop's deadline, fixed when the press happens. **A report that does not match cannot be
-  // allowed to move it**: `postures` is a fresh object per message, so re-running this effect
-  // re-armed a whole new 8s from whenever the report arrived — and the agent sends one on the
-  // failure path precisely so a change that did not happen ends. That made it end later. Same
-  // shape as the rotate hold two blocks down, which had the same deps and the same comment.
-  const postureDeadline = useRef(0)
-  const handlePosture = useCallback((postureId: string) => {
-    postureDeadline.current = Date.now() + 8_000
-    setPendingPosture(postureId)
-    send({ type: 'input:posture', sessionId, payload: { postureId } })
-  }, [send, sessionId])
-  // **Released a beat after the device answers, not the instant it does.** `device:postures` and
-  // `session:chrome` are separate messages on separate paths, and the posture one usually wins —
-  // so releasing on it alone brings the picture back while the viewer still holds the previous
-  // screen's dimensions, which is the flash again. The beat lets the chrome land.
-  //
-  // The timer also runs when no answer arrives, so a posture change that fails silently ends with
-  // a visible screen rather than a permanent placeholder.
-  useEffect(() => {
-    if (pendingPosture === null) return
-    // Only the toolbar's spinner depends on this now — the picture is gated on the frame and the
-    // screen agreeing, which is a fact rather than a duration. Released as soon as the device
-    // reports the posture that was asked for, with a long stop for a change that never lands.
-    const arrived = postures?.currentId === pendingPosture
-    const t = setTimeout(
-      () => setPendingPosture(null),
-      arrived ? 0 : remaining(postureDeadline.current, Date.now()),
-    )
-    return () => clearTimeout(t)
-  }, [pendingPosture, postures])
+  // The fold control, shared with the iOS viewer. `posturePending` also holds the picture back.
+  const { pending: posturePending, select: handlePosture } = usePostureControl(send, sessionId, postures)
 
-  // **A rotation is held the same way a fold is, and for a reason the fold does not have.** Folding
+  // **The toggle's rotation — a real device, or an emulator streaming without gRPC — is held the same way a fold
+  // is**, and for a reason the fold does not have. Body mode holds nothing; its press spins instead (below). Folding
   // changes the frame's dimensions, so the frame/screen comparison in `useAndroidScreen` notices it on its own. A
-  // rotation does not — the capture follows the skin, which does not move — so the only thing that
+  // rotation there does not — the capture does not turn with it — so the only thing that
   // changes is the correction angle, and applying a new angle to the frame that was drawn under the
   // old one turns the picture. On an idle screen no further frame arrives to correct it, so it
   // stays turned.
@@ -312,12 +293,23 @@ export function AndroidViewer({
   // The orientation last sent, beside the state — see `IOSViewer` (#910).
   const landscapeRef = useRef(false)
   const handleRotate = useCallback(() => {
+    // **A device that reports its body turns it a quarter clockwise** — the iOS model. The device spins first and
+    // the turn is sent when the spin has finished, DeviceHub's order: sent at once, the turned frame (53 ms,
+    // measured) would land while the device was still spinning. That frame ends the spin; nothing waits on the
+    // description. Each press is a turn; the agent turns from a fresh reading, so two quick presses are half a turn.
+    if (bodyRotation !== undefined) {
+      setTurnsAsked((n) => n + 1)
+      const sendNow = () => send({ type: 'input:rotate', sessionId, payload: { direction: 'clockwise' } })
+      const t = setTimeout(() => { rotateTimers.current.delete(t); sendNow() }, SPIN_MS)
+      rotateTimers.current.set(t, sendNow)
+      return
+    }
     const next = !landscapeRef.current
     landscapeRef.current = next
     setRotatePending(true)
     send({ type: 'input:rotate', sessionId, payload: { orientation: next ? 'landscape' : 'portrait' } })
     setUserWantsLandscape(next)
-  }, [send, sessionId])
+  }, [send, sessionId, bodyRotation])
 
   // Reset device orientation to portrait on unmount if we left it in landscape (iOS pattern).
   //
@@ -331,6 +323,8 @@ export function AndroidViewer({
   const undoRotateRef = useRef<(() => void) | null>(null)
   useEffect(() => {
     undoRotateRef.current = () => {
+      // Not in body mode, where the toggle was never pressed: the body's turn is the device's, shared with
+      // every other viewer, and this one leaving is no reason to turn it under them.
       if (landscapeRef.current) send({ type: 'input:rotate', sessionId, payload: { orientation: 'portrait' } })
     }
   }, [send, sessionId])
@@ -403,18 +397,37 @@ export function AndroidViewer({
   }, [keyboardActive, containerRef, surfaceHostRef])
 
   // ── Pointer interaction ───────────────────────────────────────────────────
-  const toNorm = useCallback((e: { clientX: number; clientY: number }) => {
+  /** The pointer on the picture in the shell. Body mode's shell is the frame, so this is the frame's own point. */
+  const toPictureNorm = useCallback((e: { clientX: number; clientY: number }) => {
     const host = surfaceHostRef.current
     if (!host) return null
-    const rect = host.getBoundingClientRect()
-    return toNormPure({ x: e.clientX, y: e.clientY }, rect, needsCSSRotationRef.current)
+    return toNormPure({ x: e.clientX, y: e.clientY }, host.getBoundingClientRect(), needsCSSRotationRef.current)
   }, [surfaceHostRef, needsCSSRotationRef])
+  /** Where the pointer is in the screen Android draws — for the cursor, the pinch hint and the recording's overlay,
+   *  which are drawn in that screen. Body mode turns the frame there by the description's correction. */
+  const toShownNorm = useCallback((e: { clientX: number; clientY: number }) => {
+    const p = toPictureNorm(e)
+    return p && turnPoint(p, screenTurnRef.current)
+  }, [toPictureNorm, screenTurnRef])
+  const bodyMode = bodyRotation !== undefined
+  /** The point for the wire. **Body mode sends the frame's own point** (`space: 'frame'`) and the agent turns it by
+   *  the frame it holds: turned here by the description's correction, which lags a turn by 0.6–3.6 s, it landed a
+   *  quarter off until the description caught up, so every touch in that window had to be dropped. Everywhere
+   *  else the picture is the screen, the space every other sender uses. */
+  //  None is taken while the device spins for a press: the picture is caught mid-turn, so a point means nothing.
+  const toNorm = useCallback((e: { clientX: number; clientY: number }) => {
+    if (spinningRef.current) return null
+    return bodyMode ? toPictureNorm(e) : toShownNorm(e)
+  }, [bodyMode, toPictureNorm, toShownNorm])
 
+  /** Both fingers, for the wire and for the hint. The fingers are point-symmetric about the centre, which every
+   *  quarter turn keeps, so the hint's pair is the wire's pair turned. */
   const toPinchFingers = useCallback((e: { clientX: number; clientY: number }) => {
-    const f1 = toNorm(e)
-    if (!f1) return null
-    return makePinchFingers(f1)
-  }, [toNorm])
+    const sent = toNorm(e)
+    const shown = toShownNorm(e)
+    if (!sent || !shown) return null
+    return { sent: makePinchFingers(sent), shown: makePinchFingers(shown) }
+  }, [toNorm, toShownNorm])
 
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     if (isOptionHeld.current) {
@@ -423,8 +436,8 @@ export function AndroidViewer({
       isPinchMode.current = true; setPinchActive(true)
       ;(e.target as Element).setPointerCapture(e.pointerId)
       const _lc = liveCursorRef.current; if (_lc) _lc.style.display = 'none'
-      setPinchHint(fingers)
-      send({ type: 'input:pinch:start', sessionId, payload: fingers })
+      setPinchHint(fingers.shown)
+      send({ type: 'input:pinch:start', sessionId, payload: bodyMode ? { ...fingers.sent, space: 'frame' } : fingers.sent })
       return
     }
     const pos = toNorm(e)
@@ -433,7 +446,7 @@ export function AndroidViewer({
     touchStartPos.current = pos
     ;(e.target as Element).setPointerCapture(e.pointerId)
     const _rect = (e.currentTarget as Element).getBoundingClientRect()
-    cursorPosRef.current = pos // normalized — composeFrame maps to record-canvas (native) space
+    cursorPosRef.current = toShownNorm(e) // normalized — composeFrame maps to record-canvas (native) space
     cursorStateRef.current = 'down'; releaseAnimRef.current = null
     const _lc = liveCursorRef.current
     if (_lc) {
@@ -443,17 +456,17 @@ export function AndroidViewer({
       _lc.style.background = 'rgba(255,255,255,0.92)'; _lc.style.border = '1.5px solid rgba(0,0,0,0.2)'
       _lc.style.boxShadow = '0 0 0 1px rgba(0,0,0,0.15), 0 0 8px rgba(255,255,255,0.25)'
     }
-    send({ type: 'input:touch:start', sessionId, payload: pos })
-  }, [toNorm, toPinchFingers, send, sessionId])
+    send({ type: 'input:touch:start', sessionId, payload: bodyMode ? { ...pos, space: 'frame' } : pos })
+  }, [toNorm, toShownNorm, toPinchFingers, send, sessionId, bodyMode])
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (e.buttons === 0) {
       if (isOptionHeld.current) {
-        setPinchHint(toPinchFingers(e)); cursorPosRef.current = null
+        setPinchHint(toPinchFingers(e)?.shown ?? null); cursorPosRef.current = null
         const _lc = liveCursorRef.current; if (_lc) _lc.style.display = 'none'
         return
       }
-      const norm = toNorm(e)
+      const norm = toShownNorm(e)
       const _r = (e.currentTarget as Element).getBoundingClientRect()
       const _lc = liveCursorRef.current
       if (norm) {
@@ -478,7 +491,7 @@ export function AndroidViewer({
       const now = performance.now()
       if (now - lastMoveSentAt.current < MOVE_THROTTLE_MS) return
       lastMoveSentAt.current = now
-      setPinchHint(fingers); send({ type: 'input:pinch:move', sessionId, payload: fingers })
+      setPinchHint(fingers.shown); send({ type: 'input:pinch:move', sessionId, payload: bodyMode ? { ...fingers.sent, space: 'frame' } : fingers.sent })
       return
     }
     if (!touchStartPos.current) return
@@ -490,13 +503,13 @@ export function AndroidViewer({
     if (now - lastMoveSentAt.current < MOVE_THROTTLE_MS) return
     lastMoveSentAt.current = now
     const _r = (e.currentTarget as Element).getBoundingClientRect()
-    cursorPosRef.current = pos // normalized — see composeFrame
+    cursorPosRef.current = toShownNorm(e) // normalized — see composeFrame
     const _lc = liveCursorRef.current
     if (_lc && _lc.style.display !== 'none') {
       _lc.style.left = `${e.clientX - _r.left}px`; _lc.style.top = `${e.clientY - _r.top}px`
     }
-    send({ type: 'input:touch:move', sessionId, payload: pos })
-  }, [toNorm, toPinchFingers, send, sessionId])
+    send({ type: 'input:touch:move', sessionId, payload: bodyMode ? { ...pos, space: 'frame' } : pos })
+  }, [toNorm, toShownNorm, toPinchFingers, send, sessionId, bodyMode])
 
   const handlePointerUp = useCallback(() => {
     if (isPinchMode.current) {
@@ -653,7 +666,7 @@ export function AndroidViewer({
               />
               {pinchHint && (
                 <>
-                  {([pinchHint.f0, pinchHint.f1] as const).map((f, i) => (
+                  {([pinchHint.f0, pinchHint.f1] as const).map((sent) => turnPoint(sent, ((360 - screenTurn) % 360) as Turn)).map((f, i) => (
                     <div key={i} style={{
                       position: 'absolute', zIndex: 10, borderRadius: '50%',
                       transform: 'translate(-50%, -50%)', pointerEvents: 'none',

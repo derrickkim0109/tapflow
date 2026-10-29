@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { pcmS16ToFloat32Planar } from '@/lib/audio/pcm'
 
-// MVP fixed format: the Android emulator's gRPC audio is S16LE / 44100 / Stereo. iOS will
-// negotiate its format later. The AudioContext resamples 44100 buffers to its own rate.
+// Fixed format: both agents send S16LE / 44100 / Stereo (the Android emulator's gRPC audio is natively
+// that; the iOS helper resamples to it).
 const SAMPLE_RATE = 44100
 const CHANNELS = 2
 // Small jitter buffer: schedule each chunk this far ahead so network jitter doesn't underrun.
@@ -29,7 +29,11 @@ export function useAudioPlayback(): AudioPlayback {
     const Ctor: AnyAudioContext | undefined =
       window.AudioContext ?? (window as unknown as { webkitAudioContext?: AnyAudioContext }).webkitAudioContext
     if (!Ctor) return null
-    ctxRef.current = new Ctor()
+    // At the PCM's own rate, not the device's. Each chunk is its own buffer source, and at 48 kHz a 470-frame
+    // chunk lasts 511.6 output frames: the starts drift off the sample grid and every few chunks a boundary
+    // overlaps or gaps by a frame. Recorded from the output on a 1 kHz tone: 7.3 ticks a second at the
+    // device's 48 kHz, none at 44.1 kHz. The browser then resamples the whole mix once, continuously.
+    ctxRef.current = new Ctor({ sampleRate: SAMPLE_RATE })
     return ctxRef.current
   }, [])
 
