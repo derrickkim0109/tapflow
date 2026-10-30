@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **A USB-connected iPhone works like a simulator.** Plug in an iPhone or iPad that trusts the Mac and has Developer Mode on, and it is listed next to the simulators with a USB badge. Opening it mirrors its screen live in the browser and taps reach the phone. The agent Mac needs the Camera permission for `device-capture-helper` once, and `TAPFLOW_IOS_TEAM_ID` set to an Apple development team that can sign the XCUITest runner for the device. Installing a build, the clipboard, network control, rotation and screenshots are not available on a phone yet, and say so when asked.
+- **The App Center takes iOS device builds.** Upload an `.ipa` (or a `.app.zip`/`.tar.gz` built only for devices) and it is listed as a **Device build**; QA Session offers it only on a USB-connected iPhone, while a simulator build can still be opened on a phone. An `.ipa` without an `iphoneos` slice is refused. Upgrade the relay: an older one refuses every `.ipa`.
 
 ### Fixed
 

@@ -25,7 +25,7 @@ To have CI replay flows, or to let an LLM agent drive the device, see [MCP in CI
 
 ## Any build tool
 
-tapflow works on the built artifact, not the build tool. A native Xcode or Gradle build, React Native, Flutter, or a cloud build service all produce a build you upload the same way. Once you have an artifact (`.app.zip`, `.tar.gz`/`.tgz`, or `.apk`), the rest of this page is the same.
+tapflow works on the built artifact, not the build tool. A native Xcode or Gradle build, React Native, Flutter, or a cloud build service all produce a build you upload the same way. Once you have an artifact (`.app.zip`, `.tar.gz`/`.tgz`, `.ipa`, or `.apk`), the rest of this page is the same.
 
 ## Prerequisites
 
@@ -82,7 +82,7 @@ curl -X POST https://your-relay/api/v1/builds \
 Use `label` to attach context — branch name, ticket number, or a short description.
 
 ::: warning iOS builds
-`.ipa` files are not supported. For a simulator build, upload `.app.zip` or `.tar.gz`/`.tgz`. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder; a `.tar.gz`/`.tgz` is what a cloud simulator build produces.
+For a simulator build, upload `.app.zip` or `.tar.gz`/`.tgz`. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder; a `.tar.gz`/`.tgz` is what a cloud simulator build produces. A device build is accepted as `.ipa` (it must contain an `iphoneos` arm64 slice) and installs only on an iPhone connected to an agent's Mac over USB; the App Center marks it "Device build".
 :::
 
 ## 3. Post build metadata (optional)

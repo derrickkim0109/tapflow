@@ -25,7 +25,7 @@ CI에서 플로우를 재생하거나 LLM 에이전트가 기기를 조작하게
 
 ## 어떤 빌드 도구든
 
-tapflow는 빌드 도구가 아니라 완성된 아티팩트를 다룹니다. 네이티브 Xcode·Gradle 빌드, React Native, Flutter, 클라우드 빌드 서비스가 만드는 빌드를 모두 같은 방식으로 업로드합니다. 아티팩트(`.app.zip`·`.tar.gz`/`.tgz`·`.apk`)만 나오면 이후 과정은 이 페이지 그대로입니다.
+tapflow는 빌드 도구가 아니라 완성된 아티팩트를 다룹니다. 네이티브 Xcode·Gradle 빌드, React Native, Flutter, 클라우드 빌드 서비스가 만드는 빌드를 모두 같은 방식으로 업로드합니다. 아티팩트(`.app.zip`·`.tar.gz`/`.tgz`·`.ipa`·`.apk`)만 나오면 이후 과정은 이 페이지 그대로입니다.
 
 ## 사전 조건
 
@@ -82,7 +82,7 @@ curl -X POST https://your-relay/api/v1/builds \
 `label`에는 브랜치명, 티켓 번호 등 맥락을 담을 수 있습니다.
 
 ::: warning iOS 빌드
-`.ipa` 파일은 지원하지 않습니다. 시뮬레이터 빌드는 `.app.zip` 또는 `.tar.gz`/`.tgz`를 올립니다. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드해 `.app` 폴더를 zip으로 압축하고, `.tar.gz`/`.tgz`는 클라우드 시뮬레이터 빌드가 만드는 아카이브입니다.
+시뮬레이터 빌드는 `.app.zip` 또는 `.tar.gz`/`.tgz`를 올립니다. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드해 `.app` 폴더를 zip으로 압축하고, `.tar.gz`/`.tgz`는 클라우드 시뮬레이터 빌드가 만드는 아카이브입니다. 디바이스 빌드는 `.ipa`로 올리며(`iphoneos` arm64 슬라이스 필요), 에이전트 Mac에 USB로 연결된 iPhone에만 설치됩니다. App Center에는 "Device build"로 표시됩니다.
 :::
 
 ## 3. 빌드 메타데이터 첨부 (선택)

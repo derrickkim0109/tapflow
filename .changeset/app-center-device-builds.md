@@ -1,0 +1,5 @@
+---
+"@tapflowio/relay": minor
+---
+
+The App Center accepts iOS device builds (#152). `POST /api/v1/builds` takes an `.ipa`, reads its metadata from `Payload/*.app/Info.plist`, and requires an `iphoneos` slice in the main executable; a `.app.zip` or `.tar.gz` with only a device slice is accepted as a device build instead of refused. Slices are read from the Mach-O load commands (`LC_BUILD_VERSION` platform), in pure JS, because `lipo -info` cannot tell an arm64 simulator slice from a device one; an executable that cannot be classified still falls back to `lipo` and counts as a simulator build. Build JSON from the list, get and upload routes gains `target: 'simulator' | 'device' | null` (null for Android), derived from the stored file, so there is no migration. The dashboard labels each build's target, accepts `.ipa` in the upload dialog, and in QA Session lets a device build start only on a USB-connected iPhone; a simulator build stays selectable on a phone. The upload error for an unsupported file now lists `.ipa`.
