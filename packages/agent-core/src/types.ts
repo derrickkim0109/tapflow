@@ -1,5 +1,5 @@
 import type {
-  AndroidButton, AgentResources, ClipboardErrorPayload, FormFactor, Point, UIElement, UIElementFrame, UIElementRole,
+  AndroidButton, AgentResources, ClipboardErrorPayload, DeviceKind, FormFactor, Point, UIElement, UIElementFrame, UIElementRole,
 } from '@tapflowio/protocol'
 
 // These three are **wire** payload types, so `@tapflowio/protocol` owns them — it is the leaf both
@@ -9,7 +9,7 @@ import type {
 //
 // `export type`, not a bare `export { … } from`: the latter is a real runtime import of protocol's
 // `dist`, which would drag this package into the source-resolution rule in the root AGENTS.md.
-export type { AndroidButton, AgentResources, ClipboardErrorPayload, Point, UIElement, UIElementFrame, UIElementRole }
+export type { AndroidButton, AgentResources, ClipboardErrorPayload, DeviceKind, Point, UIElement, UIElementFrame, UIElementRole }
 
 export type Platform = string
 
@@ -24,6 +24,8 @@ export interface Device {
   osVersion?: string  // e.g. "iOS 18.3"
   /** Phone, tablet or foldable, when the platform can say; reported in `agent:register`. */
   formFactor?: FormFactor
+  /** Simulator, emulator or USB-connected hardware (#152); reported in `agent:register`. */
+  kind?: DeviceKind
 }
 
 

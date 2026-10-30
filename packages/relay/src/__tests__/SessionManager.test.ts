@@ -507,6 +507,18 @@ describe('SessionManager', () => {
       expect(sm.list('asker', () => true, IDLE_MAC).flatMap((g) => g.devices)[0].formFactor).toBe('phone')
     })
 
+    // `kind` takes the same road as `formFactor`. Mutations: leave it out of `agentFields` (both
+    // assertions fail), or out of `list()` (the list assertions fail).
+    it('carries a device\'s kind to the list, and takes the new one on rebind', () => {
+      const sm = new SessionManager()
+      const [id] = sm.create(mockSocket(), [{ ...DEV, kind: 'physical' }])
+      expect(sm.list('asker', () => true, IDLE_MAC)[0].devices[0].kind).toBe('physical')
+
+      sm.rebind(id!, mockSocket(), { ...DEV, kind: 'simulator' }, AGENT)
+      expect(sm.get(id!)?.deviceKind).toBe('simulator')
+      expect(sm.list('asker', () => true, IDLE_MAC).flatMap((g) => g.devices)[0].kind).toBe('simulator')
+    })
+
     // An agent that cannot tell, or predates the field, rebinding over one that could: absent wins,
     // because the new register is the truth about the device now.
     it('clears the form factor when a rebind reports none', () => {

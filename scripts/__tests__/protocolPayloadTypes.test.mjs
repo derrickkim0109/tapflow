@@ -175,8 +175,9 @@ describe('wire payload types are declared once, in @tapflowio/protocol', () => {
     expect(count('ChromeData')).toBe(14) // 14 with `streamRotation`, `screenCornerRadii` and `scaleBasis` (iPhone Duo)
     expect(count('ChromeButton')).toBe(13)
     // 9 with `holder`, the AI client driving a device; 10 with `serviceTier` (L2); 15 with the five that say whose
-    // dropped session the device is waiting for (#1087); 18 with `displayName`, `hidden` and `favourite` (#1085)
-    expect(count('DeviceSummary')).toBe(18)
+    // dropped session the device is waiting for (#1087); 18 with `displayName`, `hidden` and `favourite` (#1085);
+    // 19 with `kind`, a simulator, an emulator or a physical device (#152)
+    expect(count('DeviceSummary')).toBe(19)
     // 6 with `admission`, the relay's reading of the Mac (L2); 7 with `agentKey`, the key for its devices' settings (#1085)
     expect(count('SessionInfo')).toBe(7)
   })

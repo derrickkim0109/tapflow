@@ -3,7 +3,7 @@ import { WebSocket } from 'ws'
 import type { DeviceStatus } from '@tapflowio/agent-core'
 import type { AgentResources, SessionInfo } from './types.js'
 import type { BooterClass } from './admission/HostBootGate.js'
-import type { AiClientKind, ChromePayload, DeviceSummary, MacAdmission, ServiceTier, ClientKind, DeviceDetails, DeviceReport, FormFactor, Point, PosturesPayload, WatchEndReason } from '@tapflowio/protocol'
+import type { AiClientKind, ChromePayload, DeviceSummary, MacAdmission, ServiceTier, ClientKind, DeviceDetails, DeviceKind, DeviceReport, FormFactor, Point, PosturesPayload, WatchEndReason } from '@tapflowio/protocol'
 
 export interface Session {
   id: string
@@ -63,6 +63,8 @@ export interface Session {
   deviceOsVersion?: string
   /** From the agent's register, like `deviceOsVersion`; the viewer reads it off `agents:listed`. */
   deviceFormFactor?: FormFactor
+  /** From the agent's register, like `deviceFormFactor`. */
+  deviceKind?: DeviceKind
   chromeData?: ChromePayload
   /** Cached like `chromeData`, and replayed to a re-joining viewer for the same reason. */
   postures?: PosturesPayload
@@ -137,7 +139,7 @@ export type InstalledBuild = { buildId: number; filePath: string }
 export type JoinResult = { ok: true } | { ok: false; failure: 'not-found' | 'held-by-another' }
 
 type AgentField = 'agentId' | 'agentName' | 'agentPlatform' | 'agentCapabilities'
-type DeviceField = 'deviceName' | 'devicePlatform' | 'deviceStatus' | 'deviceOsVersion' | 'deviceFormFactor' | 'deviceServiceTier'
+type DeviceField = 'deviceName' | 'devicePlatform' | 'deviceStatus' | 'deviceOsVersion' | 'deviceFormFactor' | 'deviceKind' | 'deviceServiceTier'
 
 /** The device fields `refreshDevice` writes. A test holds it against `deviceFields`, so a field added there is a
  *  decision for this path too rather than one it misses in silence. */
@@ -234,6 +236,7 @@ export class SessionManager {
       deviceStatus: device.status as DeviceStatus,
       deviceOsVersion: device.osVersion,
       deviceFormFactor: device.formFactor,
+      deviceKind: device.kind,
       deviceServiceTier: device.serviceTier,
     }
   }
@@ -826,6 +829,7 @@ export class SessionManager {
         status: s.deviceStatus,
         osVersion: s.deviceOsVersion,
         formFactor: s.deviceFormFactor,
+        ...(s.deviceKind !== undefined ? { kind: s.deviceKind } : {}),
         ...(s.deviceServiceTier !== undefined ? { serviceTier: s.deviceServiceTier } : {}),
         sessionId: s.id,
         ...(this.liveAiHolder(s, isAlive) ? { holder: { kind: s.holderKind as AiClientKind, user: s.holderLabel ?? 'unknown' } } : {}),

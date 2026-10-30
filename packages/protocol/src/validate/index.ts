@@ -272,6 +272,8 @@ const deviceReports = z.array(z.object({
   // the register stands. Anything that is not a string is still refused, the line `capabilities`
   // draws — `.catch` over the whole field would swallow that too.
   formFactor: z.union([z.enum(['phone', 'tablet', 'foldable']), z.string().transform(() => undefined)]).optional(),
+  // Same rule as `formFactor`: an unknown kind is a newer agent, so the field goes and the register stands.
+  kind: z.union([z.enum(['simulator', 'emulator', 'physical']), z.string().transform(() => undefined)]).optional(),
   serviceTier: reportedTier,
 }))
 
