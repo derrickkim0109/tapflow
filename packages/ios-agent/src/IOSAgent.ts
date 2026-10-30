@@ -56,8 +56,6 @@ const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
 const PHYSICAL_REFUSALS = {
   'full-erase': 'Full reset is not available on a USB-connected device',
   'run-reset': 'A run reset is not available on a USB-connected device yet',
-  'app:install': 'Installing a build on a USB-connected device is not supported yet',
-  'app:launch': 'Launching an app on a USB-connected device is not supported yet',
   'app:clear-state': 'Clearing app data on a USB-connected device is not supported yet',
   clipboard: 'The clipboard is not available on a USB-connected device yet',
   network: 'Network control is not available on a USB-connected device',
@@ -2073,11 +2071,6 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           respond({ type: 'app:install-error', message: 'No booted device' })
           break
         }
-        const installRefusal = this.physicalRefusal(installState.deviceId, 'app:install')
-        if (installRefusal) {
-          respond({ type: 'app:install-error', message: installRefusal })
-          break
-        }
         this.installBuild(installState.deviceId, filePath, bundleId, { buildTicket, buildName, buildBytes })
           .then(() => respond({ type: 'app:install-done' }))
           .catch((e: unknown) => {
@@ -2102,11 +2095,6 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           respond({ type: 'app:launch-error', message: 'No booted device' })
           break
         }
-        const launchRefusal = this.physicalRefusal(launchState.deviceId, 'app:launch')
-        if (launchRefusal) {
-          respond({ type: 'app:launch-error', message: launchRefusal })
-          break
-        }
         // Checked again here rather than trusted: the relay checks with the same function, but an agent is the last
         // door before a command line, and a relay of another version may check less.
         const problem = launchOptionsProblem({ arguments: args, env })
@@ -2115,6 +2103,19 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           break
         }
         const options = compactLaunchOptions({ arguments: args, env })
+        if (this.isPhysical(launchState.deviceId)) {
+          // No network control on a phone, so nothing to name before the launch.
+          this.devicectl.launchApp(launchState.deviceId, bundleId, options)
+            .then(() => {
+              this.lastBundleIds.set(launchState.deviceId, bundleId)
+              respond(options ? { type: 'app:launch-done', applied: appliedKeys(options) } : { type: 'app:launch-done' })
+            })
+            .catch((e: unknown) => {
+              console.warn('[tapflow] app:launch failed:', e)
+              respond({ type: 'app:launch-error', message: e instanceof Error ? e.message : String(e) })
+            })
+          break
+        }
         // The target is named BEFORE the launch, and the order is the whole point: dyld reads the
         // environment when the process starts, so naming it afterwards arms the next launch and leaves
         // this one unhooked while `available` would still say true.
@@ -2805,6 +2806,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       // put a *network transfer* in that gap. An expired ticket, a dropped link, a timeout or a
       // short transfer would then leave the simulator with the old app gone and no new one: a tester
       // loses the build they were using, to an install that never had a chance of finishing.
+      if (this.isPhysical(udid)) return await this.installOnPhone(udid, source, tmpDir, bundleId)
       if (bundleId) {
         await this.simctl.uninstallApp(udid, bundleId).catch(() => { /* 미설치 상태면 무시 */ })
       }
@@ -2818,11 +2820,44 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   /** Extraction + `simctl install`, given a file this machine can actually open. */
   private async installFrom(udid: string, filePath: string, tmpDir: string): Promise<void> {
     const lower = filePath.toLowerCase()
-    const isTar = lower.endsWith('.tar.gz') || lower.endsWith('.tgz')
-    const isZip = lower.endsWith('.zip')
-    if (!isTar && !isZip) {
+    if (!lower.endsWith('.tar.gz') && !lower.endsWith('.tgz') && !lower.endsWith('.zip')) {
       return this.simctl.installApp(udid, filePath)
     }
+    await this.simctl.installApp(udid, await this.extractApp(filePath, tmpDir))
+  }
+
+  /**
+   * A USB-connected device takes only a device-signed build: an `.ipa` (what Firebase App Distribution and an
+   * ad-hoc or development export produce), or an archived `.app` built for iphoneos. Installed clean, as on a
+   * simulator. A simulator build cannot run there, but the same app is often already on the phone from TestFlight
+   * or Firebase, so that copy is used when it is.
+   */
+  private async installOnPhone(udid: string, source: string, tmpDir: string, bundleId?: string): Promise<void> {
+    const lower = source.toLowerCase()
+    const archived = ['.ipa', '.zip', '.tar.gz', '.tgz'].some((ext) => lower.endsWith(ext))
+    const appPath = archived ? await this.extractApp(source, tmpDir) : source
+    const info = await this.devicectl.appBundleInfo(appPath)
+    const id = bundleId ?? info.bundleId
+    if (info.platform !== 'simulator') {
+      // Only a build known to be for a device is worth removing the installed copy for: one whose Info.plist could
+      // not be read may still be refused, and the tester would be left with neither.
+      if (id && info.platform === 'device') await this.devicectl.uninstallApp(udid, id).catch(() => { /* not installed */ })
+      await this.devicectl.installApp(udid, appPath)
+      return
+    }
+    if (id && await this.devicectl.isAppInstalled(udid, id)) {
+      logger.info(`${id}: a simulator build cannot be installed on ${udid}; using the copy already installed there`)
+      return
+    }
+    throw new ValidationError(
+      `Install ${id ?? 'the app'} on the phone first (TestFlight or Firebase App Distribution), or upload its device build (.ipa); tapflow cannot install a simulator build on a device`,
+    )
+  }
+
+  /** Extracts a .zip / .ipa / .tar.gz(.tgz) into `tmpDir` and returns the `.app` inside it. */
+  private async extractApp(filePath: string, tmpDir: string): Promise<string> {
+    const lower = filePath.toLowerCase()
+    const isTar = lower.endsWith('.tar.gz') || lower.endsWith('.tgz')
 
     // A subdirectory of the caller's, which owns the cleanup: a downloaded archive already sits in
     // `tmpDir`, and extracting beside it would put the two in one listing.
@@ -2853,13 +2888,13 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       )
     }
 
-    const entries = fs.readdirSync(outDir)
-    const appDir = entries.find(e => e.endsWith('.app') && fs.statSync(path.join(outDir, e)).isDirectory())
-    if (!appDir) {
-      throw new ValidationError('.app 디렉토리를 찾을 수 없습니다. iphonesimulator 로 빌드한 .app 을 .app.zip 또는 .tar.gz 로 업로드하세요.')
+    // An .ipa keeps its app under Payload/.
+    for (const dir of [outDir, path.join(outDir, 'Payload')]) {
+      if (!fs.existsSync(dir)) continue
+      const appDir = fs.readdirSync(dir).find(e => e.endsWith('.app') && fs.statSync(path.join(dir, e)).isDirectory())
+      if (appDir) return path.join(dir, appDir)
     }
-
-    await this.simctl.installApp(udid, path.join(outDir, appDir))
+    throw new ValidationError('.app 디렉토리를 찾을 수 없습니다. iphonesimulator 로 빌드한 .app 을 .app.zip 또는 .tar.gz 로 업로드하세요.')
   }
 
   // DeviceAgent interface — delegate to SimctlWrapper
@@ -2874,7 +2909,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    *  alias, which would quietly act on whichever simulator happened to be up. */
   async installApp(appPath: string): Promise<void> {
     const deviceId = await this.soleLiveDeviceId()
-    this.refusePhysical(deviceId, 'app:install')
+    if (this.isPhysical(deviceId)) return this.installBuild(deviceId, appPath)
     await this.simctl.installApp(deviceId, appPath)
   }
   // ── network control (#607) ─────────────────────────────────────────────────
@@ -3003,7 +3038,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const problem = launchOptionsProblem(options ?? {})
     if (problem) throw new ValidationError(problem)
     const deviceId = await this.soleLiveDeviceId()
-    this.refusePhysical(deviceId, 'app:launch')
+    if (this.isPhysical(deviceId)) {
+      await this.devicectl.launchApp(deviceId, bundleId, compactLaunchOptions(options))
+      this.lastBundleIds.set(deviceId, bundleId)
+      return
+    }
     await this.simctl.launchApp(deviceId, bundleId, compactLaunchOptions(options))
   }
 

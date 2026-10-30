@@ -1,6 +1,10 @@
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { createLogger, type Device } from '@tapflowio/agent-core'
+import { join } from 'path'
+import { createLogger, PlatformError, type Device } from '@tapflowio/agent-core'
+import type { LaunchOptions } from '@tapflowio/protocol'
+import { hasLaunchOptions } from '@tapflowio/protocol/launch'
+import { iosLaunchArgv } from './launchArgs.js'
 
 const logger = createLogger('ios-agent:devicectl')
 const execFileAsync = promisify(execFile)
@@ -15,6 +19,21 @@ export type XcrunExec = (args: string[], timeoutMs?: number) => Promise<string>
 
 const defaultExec: XcrunExec = async (args, timeoutMs) =>
   (await execFileAsync('xcrun', args, { timeout: timeoutMs ?? DEFAULT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 })).stdout
+
+// Copying a build onto a phone over USB takes as long as its size needs; a hung transfer still has to end.
+const INSTALL_TIMEOUT_MS = 600_000
+
+/** A plist as JSON, the way `plutil` converts it. */
+export type PlistReader = (path: string) => Promise<unknown>
+
+const defaultPlistReader: PlistReader = async (path) =>
+  JSON.parse((await execFileAsync('plutil', ['-convert', 'json', '-o', '-', path], { timeout: 5_000 })).stdout)
+
+/** What a built `.app` says about itself. `platform` is `unknown` when its Info.plist names neither. */
+export interface AppBundleInfo {
+  bundleId?: string
+  platform: 'device' | 'simulator' | 'unknown'
+}
 
 type Obj = Record<string, unknown>
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -56,8 +75,95 @@ export function parsePhysicalDevices(doc: unknown): Device[] {
   return devices
 }
 
+/** Whether an app with `bundleId` is in a `devicectl device info apps -j` document. */
+export function parseAppInstalled(doc: unknown, bundleId: string): boolean {
+  const result = isObj(doc) ? doc.result : undefined
+  const apps = isObj(result) && Array.isArray(result.apps) ? result.apps : []
+  return apps.some((a) => isObj(a) && a.bundleIdentifier === bundleId)
+}
+
+/** An Info.plist (as JSON) read as `AppBundleInfo`: `iPhoneOS` in `CFBundleSupportedPlatforms` is a device build. */
+export function parseAppBundleInfo(plist: unknown): AppBundleInfo {
+  const p = isObj(plist) ? plist : {}
+  const platforms = Array.isArray(p.CFBundleSupportedPlatforms) ? p.CFBundleSupportedPlatforms : []
+  const sdk = str(p.DTPlatformName)
+  const platform = platforms.includes('iPhoneOS') || sdk === 'iphoneos'
+    ? 'device'
+    : platforms.includes('iPhoneSimulator') || sdk === 'iphonesimulator' ? 'simulator' : 'unknown'
+  const bundleId = str(p.CFBundleIdentifier)
+  return bundleId ? { bundleId, platform } : { platform }
+}
+
+/** devicectl's own reason from a failed call: with `-q`, its stderr is an `ERROR:` line and indented detail. */
+function devicectlFailure(what: string, e: unknown): PlatformError {
+  const stderr = isObj(e) && typeof e.stderr === 'string' ? e.stderr : ''
+  const line = stderr.split('\n').map((l) => l.trim()).find((l) => l.startsWith('ERROR:'))
+  const reason = line ? line.slice('ERROR:'.length).trim() : (e instanceof Error ? e.message.split('\n')[0] : String(e))
+  return new PlatformError(`${what}: ${reason}`)
+}
+
 export class DevicectlWrapper {
-  constructor(private readonly exec: XcrunExec = defaultExec) {}
+  constructor(
+    private readonly exec: XcrunExec = defaultExec,
+    private readonly readPlist: PlistReader = defaultPlistReader,
+  ) {}
+
+  /** The bundle id and platform of a built `.app` on this Mac. A bundle whose Info.plist cannot be read is `unknown`. */
+  async appBundleInfo(appPath: string): Promise<AppBundleInfo> {
+    try {
+      return parseAppBundleInfo(await this.readPlist(join(appPath, 'Info.plist')))
+    } catch (e) {
+      logger.warn(`could not read ${appPath}/Info.plist: ${e instanceof Error ? e.message : String(e)}`)
+      return { platform: 'unknown' }
+    }
+  }
+
+  /** Whether `bundleId` is installed on the device. `--include-all-apps`: by default devicectl lists only apps a
+   *  developer built, and one from TestFlight or the App Store would read as missing. */
+  async isAppInstalled(udid: string, bundleId: string): Promise<boolean> {
+    try {
+      const out = await this.exec(['devicectl', 'device', 'info', 'apps', '--device', udid, '--bundle-id', bundleId, '--include-all-apps', '-j', '-', '-q'])
+      return parseAppInstalled(JSON.parse(out), bundleId)
+    } catch (e) {
+      throw devicectlFailure(`could not list the apps on ${udid}`, e)
+    }
+  }
+
+  /** Installs a device-signed `.app` on the device. */
+  async installApp(udid: string, appPath: string): Promise<void> {
+    try {
+      await this.exec(['devicectl', 'device', 'install', 'app', '--device', udid, appPath, '-q'], INSTALL_TIMEOUT_MS)
+    } catch (e) {
+      throw devicectlFailure('install failed', e)
+    }
+  }
+
+  async uninstallApp(udid: string, bundleId: string): Promise<void> {
+    try {
+      await this.exec(['devicectl', 'device', 'uninstall', 'app', '--device', udid, bundleId, '-q'])
+    } catch (e) {
+      throw devicectlFailure(`uninstall of ${bundleId} failed`, e)
+    }
+  }
+
+  /**
+   * Launches an installed app in the foreground. As `simctl launch` does, a launch that carries options ends a
+   * running instance first, since arguments and environment are read only when the process starts. `--` ends
+   * devicectl's own options: the app's arguments start with `-`, which it would otherwise take for its own.
+   */
+  async launchApp(udid: string, bundleId: string, options?: LaunchOptions): Promise<void> {
+    const withOptions = hasLaunchOptions(options)
+    const env = options?.env && Object.keys(options.env).length > 0 ? ['--environment-variables', JSON.stringify(options.env)] : []
+    try {
+      await this.exec([
+        'devicectl', 'device', 'process', 'launch', '--device', udid, '-q',
+        ...(withOptions ? ['--terminate-existing'] : []), ...env,
+        '--', bundleId, ...iosLaunchArgv(options?.arguments),
+      ])
+    } catch (e) {
+      throw devicectlFailure(`could not launch ${bundleId}`, e)
+    }
+  }
 
   /** USB-connected iPhones and iPads (see `parsePhysicalDevices`). **Never rejects**: a Mac whose devicectl is
    *  missing, failing or slower than `timeoutMs` still has its simulators to offer, and this list is merged into
