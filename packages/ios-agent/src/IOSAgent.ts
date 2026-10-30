@@ -126,7 +126,7 @@ import {
 import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer.js'
 import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
 import { DevicectlWrapper, AppIdentityMismatchError } from './DevicectlWrapper.js'
-import { DeviceCaptureStreamer } from './DeviceCaptureStreamer.js'
+import { DeviceCaptureStreamer, CameraAccessDeniedError } from './DeviceCaptureStreamer.js'
 import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
 import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio/audiotap-helper'
@@ -1067,6 +1067,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
 
     const pump = async () => {
       let delivered = false
+      let permanent = false
       try {
         while (true) {
           const { value, done } = await reader.read()
@@ -1082,11 +1083,14 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           const sent = dropper.send(streamWs, frame, threshold, codec === CODEC_JPEG || value.keyframe, onDrop, onWantKeyframe)
           if (sent) metrics?.recordSent(value.payload.length)
         }
-      } catch {
-        // stream cancelled or ws closed — expected on disconnect
+      } catch (e) {
+        // A cancelled reader ends with `done`, so what lands here is the capture failing: camera denied, no device,
+        // a helper that never reported its status.
+        logger.warn(`screen stream for ${state.deviceId} failed: ${e instanceof Error ? e.message : String(e)}`)
+        permanent = e instanceof CameraAccessDeniedError
       }
       if (metricsTimer) clearInterval(metricsTimer)
-      if (state.streamReader === reader && streamWs.readyState === WebSocket.OPEN) {
+      if (!permanent && state.streamReader === reader && streamWs.readyState === WebSocket.OPEN) {
         const next = streamRestartPlan(failures, delivered)
         if (next.failures === 2) {
           logger.warn(`screen stream for ${state.deviceId} keeps ending before its first frame — backing off restarts`)

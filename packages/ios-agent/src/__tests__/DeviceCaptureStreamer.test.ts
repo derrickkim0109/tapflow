@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
-import { DeviceCaptureStreamer, DEVICE_CAPTURE_EXIT } from '../DeviceCaptureStreamer'
+import { DeviceCaptureStreamer, DEVICE_CAPTURE_EXIT, CameraAccessDeniedError } from '../DeviceCaptureStreamer'
 import type { DeviceCaptureDeps, HelperSocket } from '../DeviceCaptureStreamer'
 
 // The system boundaries are the LaunchServices launch and the loopback socket; both are doubled here.
@@ -102,14 +102,17 @@ describe('DeviceCaptureStreamer', () => {
   })
 
   // Mutations: ignore the status byte (the denial would surface as a silent empty stream); map it to a
-  // message that does not say where to grant Camera access.
+  // message that does not say where to grant Camera access; or to a plain PlatformError, which IOSAgent then
+  // restarts forever.
   it('reports a Camera denial with where to grant it', async () => {
     const { deps, connect } = harness()
     const reader = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, deps).start().getReader()
     await vi.advanceTimersByTimeAsync(0)
     const sock = connect()
     sock.emit('data', Buffer.from([DEVICE_CAPTURE_EXIT.permission]))
-    await expect(reader.read()).rejects.toThrow(/Privacy & Security › Camera/)
+    const denied = reader.read().catch((e: unknown) => e)
+    await expect(denied).resolves.toBeInstanceOf(CameraAccessDeniedError)
+    await expect(Promise.reject(await denied)).rejects.toThrow(/Privacy & Security › Camera/)
     expect(sock.destroy).toHaveBeenCalled()
   })
 
