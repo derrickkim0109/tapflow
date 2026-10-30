@@ -198,9 +198,6 @@ async function answers(host: string, port: number, token: string): Promise<boole
   }
 }
 
-// Drives the resident XCUITest tree runners, one per simulator: builds the runner once, launches it per device
-// (staying resident), and queries GET /tree over the simulator-shared loopback. Replaces the AXUIElement path
-// (UITreeReader), which required a Simulator.app window.
 export interface XCUITreeReaderOptions {
   /** Which devices are physical. Default: none — every device is a simulator. */
   platformOf?: (udid: string) => RunnerPlatform
@@ -221,6 +218,11 @@ export interface RunnerInputClient {
   request(path: string, body?: string): Promise<void>
 }
 
+// Drives the resident XCUITest runners, one per device: builds the runner once per platform (simulator, or iphoneos
+// signed by a team), launches it per device (staying resident), and talks to it over HTTP — GET /tree for the UI
+// tree, and on a USB-connected device /tap /drag /type /key for input too. A simulator's runner is on the loopback it
+// shares with the Mac; a device's binds `::` and is reached over its CoreDevice tunnel, every route behind a
+// per-launch token. Replaces the AXUIElement path (UITreeReader), which required a Simulator.app window.
 export class XCUITreeReader {
   private readonly runners = new Map<string, RunnerHandle>()
   private readonly starting = new Map<string, Promise<ReadyRunner>>()
