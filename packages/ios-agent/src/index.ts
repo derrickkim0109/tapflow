@@ -11,6 +11,8 @@ export { KEY_CODE_MAP, MODIFIER_BITS } from './KeyCodeMap.js'
 // Audio-capture TCC priming for `tapflow setup ios` (grant up front, not at first boot).
 // Re-exported from the shared helper package so existing importers (cli) keep working.
 export { requestAudioPermission, isAudioSupported } from '@tapflowio/audiotap-helper'
+// Camera TCC priming for USB iPhone screen capture, the same idea as the audio grant above.
+export { requestDeviceCapturePermission } from './DeviceCaptureStreamer.js'
 
 AgentRegistry.register('ios', IOSAgent, {
   canRun: () => process.platform === 'darwin',
