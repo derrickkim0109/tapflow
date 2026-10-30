@@ -36,6 +36,10 @@ export type MemoryPressure = 'normal' | 'warn' | 'critical'
  *  `./validate`, held to this by its tier assertion. */
 export type FormFactor = 'phone' | 'tablet' | 'foldable'
 
+/** Whether a device is a simulator, an emulator or real hardware connected to the agent's Mac (#152). A string
+ *  literal union for the same reason as `FormFactor`; the register schema in `./validate` is its runtime copy. */
+export type DeviceKind = 'simulator' | 'emulator' | 'physical'
+
 /** What an agent reports about a device in `agent:register`. No `sessionId`/`busy` — the relay
  *  owns those. */
 export interface DeviceReport {
@@ -48,6 +52,9 @@ export interface DeviceReport {
    *  does not know rather than refusing the register, so a newer agent's new form factor reaches an
    *  older viewer as absent — which every consumer reads as "draw it as a phone". */
   formFactor?: FormFactor
+  /** Absent from an agent that predates it, which only ever offered simulators and emulators — so a viewer reads
+   *  absent as "not physical". A relay drops a kind it does not know, as it does a form factor. */
+  kind?: DeviceKind
   /** The service tier the device boots with now — what its agent last wrote for it. `'unsupported'` for a
    *  device whose runtime cannot take one (iOS before 18.5, every Android device). Absent from an agent that
    *  predates tiers. See `ServiceTier`. */

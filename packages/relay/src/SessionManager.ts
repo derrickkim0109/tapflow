@@ -3,7 +3,7 @@ import { WebSocket } from 'ws'
 import type { DeviceStatus } from '@tapflowio/agent-core'
 import type { AgentResources, SessionInfo } from './types.js'
 import type { BooterClass } from './admission/HostBootGate.js'
-import type { AiClientKind, ChromePayload, MacAdmission, ServiceTier, ClientKind, DeviceDetails, DeviceReport, FormFactor, Point, PosturesPayload, WatchEndReason } from '@tapflowio/protocol'
+import type { AiClientKind, ChromePayload, MacAdmission, ServiceTier, ClientKind, DeviceDetails, DeviceKind, DeviceReport, FormFactor, Point, PosturesPayload, WatchEndReason } from '@tapflowio/protocol'
 
 export interface Session {
   id: string
@@ -61,6 +61,8 @@ export interface Session {
   deviceOsVersion?: string
   /** From the agent's register, like `deviceOsVersion`; the viewer reads it off `agents:listed`. */
   deviceFormFactor?: FormFactor
+  /** From the agent's register, like `deviceFormFactor`. */
+  deviceKind?: DeviceKind
   chromeData?: ChromePayload
   /** Cached like `chromeData`, and replayed to a re-joining viewer for the same reason. */
   postures?: PosturesPayload
@@ -188,7 +190,7 @@ export class SessionManager {
   private static agentFields(
     agent: AgentIdentity,
     device: DeviceReport,
-  ): Pick<Session, 'agentId' | 'agentName' | 'agentPlatform' | 'agentCapabilities' | 'deviceName' | 'devicePlatform' | 'deviceStatus' | 'deviceOsVersion' | 'deviceFormFactor' | 'deviceServiceTier'> {
+  ): Pick<Session, 'agentId' | 'agentName' | 'agentPlatform' | 'agentCapabilities' | 'deviceName' | 'devicePlatform' | 'deviceStatus' | 'deviceOsVersion' | 'deviceFormFactor' | 'deviceKind' | 'deviceServiceTier'> {
     return {
       agentId: agent.agentId,
       agentName: agent.agentName,
@@ -199,6 +201,7 @@ export class SessionManager {
       deviceStatus: device.status as DeviceStatus,
       deviceOsVersion: device.osVersion,
       deviceFormFactor: device.formFactor,
+      deviceKind: device.kind,
       deviceServiceTier: device.serviceTier,
     }
   }
@@ -646,6 +649,7 @@ export class SessionManager {
         status: s.deviceStatus,
         osVersion: s.deviceOsVersion,
         formFactor: s.deviceFormFactor,
+        ...(s.deviceKind !== undefined ? { kind: s.deviceKind } : {}),
         ...(s.deviceServiceTier !== undefined ? { serviceTier: s.deviceServiceTier } : {}),
         sessionId: s.id,
         ...(this.liveAiHolder(s, isAlive) ? { holder: { kind: s.holderKind as AiClientKind, user: s.holderLabel ?? 'unknown' } } : {}),

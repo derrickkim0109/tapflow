@@ -137,6 +137,34 @@ describe('an agent older than a field still registers', () => {
     expect(fail(raw).reason).toBe('bad-shape')
   })
 
+  // `kind` tells a simulator or emulator from a USB-connected device (#152): the viewer offers different
+  // controls for each. Same rule as `formFactor` below — a kind this relay does not know costs the field,
+  // not the registration.
+  describe('a device kind', () => {
+    const register = (kind: unknown) =>
+      ({ type: 'agent:register', devices: [{ id: 'd', name: 'iPhone', platform: 'ios', status: 'booted', kind }] })
+    const device = (r: ReturnType<typeof ok>) => (r.msg as { devices: Array<{ kind?: string }> }).devices[0]
+
+    it.each(['simulator', 'emulator', 'physical'])('keeps %s', (v) => {
+      expect(device(ok(register(v))).kind).toBe(v)
+    })
+
+    // Mutation: a plain `z.enum`. The whole register is refused and the Mac drops out of the list.
+    it('drops a kind it does not know, and still registers', () => {
+      expect(device(ok(register('cloud'))).kind).toBeUndefined()
+    })
+
+    it('registers a device that reports none', () => {
+      const r = ok({ type: 'agent:register', devices: [{ id: 'd', name: 'iPhone', platform: 'ios', status: 'booted' }] })
+      expect(device(r).kind).toBeUndefined()
+    })
+
+    // Mutation: `.catch(undefined)` over the whole field, which would swallow a broken agent's value too.
+    it('still refuses a kind that is not a string', () => {
+      expect(fail(register(1)).reason).toBe('bad-shape')
+    })
+  })
+
   // `formFactor` (PR B of #785's follow-up) is how a viewer tells an iPad from an iPhone. A value this
   // relay does not know yet — an agent newer than it, reporting a form factor added later — must cost
   // that one field, not the registration: the rejection here is the most expensive one in the
