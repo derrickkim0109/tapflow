@@ -14,8 +14,9 @@ import XCTest
 //   GET  /drag?x1=&y1=&x2=&y2=&ms=        → press at (x1,y1) and drag to (x2,y2) over ms; equal points = long press
 //   POST /type[?bundleId=]                → type the UTF-8 body into the element with keyboard focus
 //   GET  /key?name=<name>[&bundleId=]     → return | delete | tab | home | volumeUp | volumeDown (device only)
-// Input routes answer JSON — {"ok":true} or {"ok":false,"error":"…"} — and always need the
-// `X-Tapflow-Token` header. Bound beyond loopback (TAPFLOW_TREE_BIND_ANY), /health and /tree need it too.
+// Input routes answer JSON — {"ok":true} or {"ok":false,"error":"…"} — and need the `X-Tapflow-Token`
+// header whenever the host passed a token (it always does). Bound beyond loopback (TAPFLOW_TREE_BIND_ANY),
+// /health and /tree need it too, and with no token there every route is refused.
 final class TreeServer {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "dev.tapflow.treeserver")
@@ -86,18 +87,30 @@ final class TreeServer {
             guard let self else { return }
             var buf = buffer
             if let data { buf.append(data) }
-            if let request = Self.parse(buf) {
+            switch Self.parse(buf) {
+            case .request(let request):
                 self.handleRequest(conn, request)
                 return
+            case .invalid:
+                conn.cancel()
+                return
+            case .incomplete:
+                break
             }
             if isComplete || error != nil || buf.count > 1 << 20 { conn.cancel(); return }
             self.receive(conn, buffer: buf)
         }
     }
 
-    private static func parse(_ buf: Data) -> Request? {
+    private enum Parsed {
+        case incomplete
+        case invalid
+        case request(Request)
+    }
+
+    private static func parse(_ buf: Data) -> Parsed {
         guard let sep = buf.range(of: Data("\r\n\r\n".utf8)),
-              let head = String(data: buf[..<sep.lowerBound], encoding: .utf8) else { return nil }
+              let head = String(data: buf[..<sep.lowerBound], encoding: .utf8) else { return .incomplete }
         let lines = head.components(separatedBy: "\r\n")
         let parts = (lines.first ?? "").split(separator: " ")
         var headers: [String: String] = [:]
@@ -107,14 +120,16 @@ final class TreeServer {
             headers[name] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         }
         let length = Int(headers["content-length"] ?? "0") ?? 0
+        // A negative length would pass the check below and trap in `prefix`, killing the runner for any caller.
+        guard length >= 0 && length <= 1 << 20 else { return .invalid }
         let body = buf[sep.upperBound...]
-        if body.count < length { return nil }
-        return Request(
+        if body.count < length { return .incomplete }
+        return .request(Request(
             method: parts.first.map(String.init) ?? "GET",
             path: parts.count >= 2 ? String(parts[1]) : "/",
             headers: headers,
             body: Data(body.prefix(length))
-        )
+        ))
     }
 
     private func handleRequest(_ conn: NWConnection, _ request: Request) {
@@ -126,7 +141,9 @@ final class TreeServer {
     }
 
     private func authorized(_ request: Request) -> Bool {
-        token.isEmpty || request.headers["x-tapflow-token"] == token
+        // Without a token there is nothing to check a caller against; beyond loopback that refuses everyone.
+        if token.isEmpty { return !bindAny }
+        return request.headers["x-tapflow-token"] == token
     }
 
     private func route(_ request: Request) -> (String, String, String) {
