@@ -13,7 +13,10 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: true
-        PRODUCT_BUNDLE_IDENTIFIER: dev.tapflow.treerunner.host
+        # A command-line override (TAPFLOW_RUNNER_BUNDLE_PREFIX=…) renames both targets for a team that cannot
+        # register dev.tapflow.*; the device build passes it from TAPFLOW_IOS_BUNDLE_PREFIX.
+        TAPFLOW_RUNNER_BUNDLE_PREFIX: dev.tapflow.treerunner
+        PRODUCT_BUNDLE_IDENTIFIER: $(TAPFLOW_RUNNER_BUNDLE_PREFIX).host
   # Resident UI-test target: launches, opens an HTTP server, and serves the
   # accessibility tree of any bundleId on demand. Window-agnostic (runs inside
   # the simulator) so it works with no Simulator.app window (tapflow headless path).
@@ -26,7 +29,8 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: true
-        PRODUCT_BUNDLE_IDENTIFIER: dev.tapflow.treerunner.uitests
+        TAPFLOW_RUNNER_BUNDLE_PREFIX: dev.tapflow.treerunner
+        PRODUCT_BUNDLE_IDENTIFIER: $(TAPFLOW_RUNNER_BUNDLE_PREFIX).uitests
 schemes:
   TreeRunner:
     build:

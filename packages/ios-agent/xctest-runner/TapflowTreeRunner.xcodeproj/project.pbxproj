@@ -177,7 +177,8 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.tapflow.treerunner.host;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(TAPFLOW_RUNNER_BUNDLE_PREFIX).host";
+				TAPFLOW_RUNNER_BUNDLE_PREFIX = dev.tapflow.treerunner;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -193,7 +194,8 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.tapflow.treerunner.uitests;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(TAPFLOW_RUNNER_BUNDLE_PREFIX).uitests";
+				TAPFLOW_RUNNER_BUNDLE_PREFIX = dev.tapflow.treerunner;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = TreeHost;
@@ -266,7 +268,8 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.tapflow.treerunner.uitests;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(TAPFLOW_RUNNER_BUNDLE_PREFIX).uitests";
+				TAPFLOW_RUNNER_BUNDLE_PREFIX = dev.tapflow.treerunner;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = TreeHost;
@@ -283,7 +286,8 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.tapflow.treerunner.host;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(TAPFLOW_RUNNER_BUNDLE_PREFIX).host";
+				TAPFLOW_RUNNER_BUNDLE_PREFIX = dev.tapflow.treerunner;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

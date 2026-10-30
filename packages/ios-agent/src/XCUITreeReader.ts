@@ -26,6 +26,7 @@ const RUNNER_BUNDLE = 'dev.tapflow.treerunner.uitests.xctrunner'
 const READY_DEADLINE_MS = 90_000
 const READY_LINE = /TAPFLOW_TREE_READY port=(\d+)/
 const TEAM_ENV = 'TAPFLOW_IOS_TEAM_ID'
+const BUNDLE_PREFIX_ENV = 'TAPFLOW_IOS_BUNDLE_PREFIX'
 
 /** Where a runner runs. A simulator shares the Mac's loopback; a physical device is reached over its CoreDevice tunnel. */
 export type RunnerPlatform = 'simulator' | 'physical'
@@ -56,7 +57,7 @@ export interface RunnerNative {
   // only for a physical device, so the simulator calls stay what they always were.
   builtStamp(platform?: 'physical'): string | undefined
   // Builds, then records `stamp` — only on success, so a half build is never trusted. A device build signs with `team`.
-  build(destination: string, stamp: string, device?: { team: string }): Promise<void>
+  build(destination: string, stamp: string, device?: { team: string; bundlePrefix?: string }): Promise<void>
   // Starts the runner on a port of the kernel's choosing. Its stdout must stay readable: the port arrives there.
   spawn(destination: string, token: string, platform?: 'physical'): ChildProcess
   terminateRunner(udid: string): void
@@ -88,11 +89,16 @@ export function urlHost(address: string): string {
 export function xcodebuildArgs(
   action: 'build-for-testing' | 'test-without-building',
   destination: string,
-  device?: { team?: string },
+  device?: { team?: string; bundlePrefix?: string },
 ): string[] {
   const base = ['-project', PROJECT, '-scheme', SCHEME, '-destination', destination, '-derivedDataPath', device ? DEVICE_BUILD_DIR : BUILD_DIR]
   if (!device) return action === 'build-for-testing' ? ['build-for-testing', ...base, '-quiet'] : ['test-without-building', ...base]
-  const signing = ['-allowProvisioningUpdates', ...(device.team ? [`DEVELOPMENT_TEAM=${device.team}`, 'CODE_SIGN_STYLE=Automatic'] : [])]
+  const signing = [
+    '-allowProvisioningUpdates',
+    ...(device.team ? [`DEVELOPMENT_TEAM=${device.team}`, 'CODE_SIGN_STYLE=Automatic'] : []),
+    // App IDs are unique across every Apple team: one that cannot register `dev.tapflow.treerunner.*` signs under its own.
+    ...(device.bundlePrefix ? [`TAPFLOW_RUNNER_BUNDLE_PREFIX=${device.bundlePrefix}.treerunner`] : []),
+  ]
   return action === 'build-for-testing' ? ['build-for-testing', ...base, ...signing, '-quiet'] : ['test-without-building', ...base, ...signing]
 }
 
@@ -200,6 +206,9 @@ export interface XCUITreeReaderOptions {
   platformOf?: (udid: string) => RunnerPlatform
   /** The Apple development team a device build signs with. Default: `TAPFLOW_IOS_TEAM_ID`. */
   team?: () => string | undefined
+  /** A reverse-DNS prefix for the device runner's bundle IDs, for a team that cannot register `dev.tapflow.*`.
+   *  Default: `TAPFLOW_IOS_BUNDLE_PREFIX`; unset keeps `dev.tapflow`. */
+  bundlePrefix?: () => string | undefined
 }
 
 /** What an input path needs from the runner of one device (see `XCUITestInput`). */
@@ -227,10 +236,12 @@ export class XCUITreeReader {
 
   private readonly platformOf: (udid: string) => RunnerPlatform
   private readonly team: () => string | undefined
+  private readonly bundlePrefix: () => string | undefined
 
   constructor(private readonly native: RunnerNative = defaultNative, options: XCUITreeReaderOptions = {}) {
     this.platformOf = options.platformOf ?? (() => 'simulator')
     this.team = options.team ?? (() => process.env[TEAM_ENV]?.trim() || undefined)
+    this.bundlePrefix = options.bundlePrefix ?? (() => process.env[BUNDLE_PREFIX_ENV]?.trim() || undefined)
   }
 
   private destination(udid: string): string {
@@ -267,11 +278,12 @@ export class XCUITreeReader {
       building = (async () => {
         const sources = await stamping
         if (platform === 'physical') {
-          // The team signs the products, so a different team is a different build.
-          const stamp = `${sources}:${team}`
+          // The team signs the products and the prefix names them, so a change to either is a different build.
+          const bundlePrefix = this.bundlePrefix()
+          const stamp = bundlePrefix ? `${sources}:${team}:${bundlePrefix}` : `${sources}:${team}`
           if (this.native.builtStamp('physical') === stamp) return
-          logger.info('building tree runner for a physical device (first run, or its sources, Xcode or team changed)...')
-          await this.native.build(this.destination(udid), stamp, { team: team! })
+          logger.info('building tree runner for a physical device (first run, or its sources, Xcode, team or bundle prefix changed)...')
+          await this.native.build(this.destination(udid), stamp, bundlePrefix ? { team: team!, bundlePrefix } : { team: team! })
         } else {
           if (this.native.builtStamp() === sources) return
           logger.info('building tree runner (first run, or its sources or Xcode changed — cached afterwards)...')
