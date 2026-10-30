@@ -41,7 +41,7 @@ const PORT = 24000
 
 interface Call { url: string; init: RequestInit | undefined }
 
-function setup(opts: { team?: string; built?: string; tunnel?: () => Promise<string>; physical?: string[] } = {}) {
+function setup(opts: { team?: string; bundlePrefix?: string; built?: string; tunnel?: () => Promise<string>; physical?: string[] } = {}) {
   const tokens: string[] = []
   const physical = new Set(opts.physical ?? ['udid-P'])
   const native = {
@@ -60,6 +60,7 @@ function setup(opts: { team?: string; built?: string; tunnel?: () => Promise<str
   const reader = new XCUITreeReader(native, {
     platformOf: (udid): RunnerPlatform => (physical.has(udid) ? 'physical' : 'simulator'),
     team: () => opts.team,
+    bundlePrefix: () => opts.bundlePrefix,
   })
   return { native, reader, tokens }
 }
@@ -136,6 +137,17 @@ describe('XCUITreeReader on a physical device', () => {
     await other.reader.read('udid-P', 'com.app')
     expect(other.native.build).toHaveBeenCalledTimes(1)
     other.reader.stop()
+  })
+
+  // App IDs are unique across every Apple team, so a team that cannot register `dev.tapflow.treerunner.*` signs under
+  // its own prefix. Mutation: leave the prefix out of the stamp — a prefix change reuses products signed under the old
+  // IDs — or out of `build` — the device build ignores it.
+  it('builds under a bundle prefix when one is set, and rebuilds when it changes', async () => {
+    const s = setup({ team: 'TEAM123', bundlePrefix: 'com.example.tapflow', built: 'stamp-1:TEAM123' })
+    tokens = s.tokens
+    await s.reader.read('udid-P', 'com.app')
+    expect(s.native.build).toHaveBeenCalledWith('platform=iOS,id=udid-P', 'stamp-1:TEAM123:com.example.tapflow', { team: 'TEAM123', bundlePrefix: 'com.example.tapflow' })
+    s.reader.stop()
   })
 
   // Mutation: keep `localhost` for a device. Its runner listens on the device, so /health is refused until the
@@ -229,6 +241,14 @@ describe('xcodebuildArgs', () => {
   })
 
   // Mutation: share `build/` across platforms. The device build would then overwrite the simulator's .xctestrun.
+  // Mutation: drop the setting from the args — the project keeps `dev.tapflow.treerunner` and signing fails for a
+  // team that cannot register it.
+  it('passes a bundle prefix to the project only when one is set', () => {
+    expect(xcodebuildArgs('build-for-testing', 'platform=iOS,id=P', { team: 'T', bundlePrefix: 'com.example.tapflow' }))
+      .toContain('TAPFLOW_RUNNER_BUNDLE_PREFIX=com.example.tapflow.treerunner')
+    expect(xcodebuildArgs('build-for-testing', 'platform=iOS,id=P', { team: 'T' }).some((a) => a.startsWith('TAPFLOW_RUNNER_BUNDLE_PREFIX'))).toBe(false)
+  })
+
   it('gives a device its own products dir, provisioning updates and the team', () => {
     const args = xcodebuildArgs('build-for-testing', 'platform=iOS,id=P', { team: 'TEAM123' })
     expect(args).toContain('-allowProvisioningUpdates')
