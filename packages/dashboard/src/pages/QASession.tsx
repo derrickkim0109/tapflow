@@ -471,11 +471,13 @@ function QASessionPage() {
                     // A dropped session waiting for its owner (#1087). The tester's own resumes it; someone else's asks first.
                     const yours = d.waiting?.yours === true
                     const othersWait = d.waiting && !yours ? d.waiting : null
+                    const isPhysical = d.kind === 'physical'
+                    // A phone on the desk is connected rather than booted: nothing starts it, and it stays on when the session ends.
                     const statusLabel = isBusy
                       ? (d.holder ? `${holderKindLabel(d.holder.kind)} is driving it` : 'In use')
                       : yours ? 'Your session is waiting for you'
                       : othersWait ? `Waiting for ${othersWait.name} to return${othersWait.remainingMs !== undefined ? ` · about ${minutesLeft(othersWait.remainingMs)} min` : ''}`
-                      : needsMemory ? 'Not enough memory to start' : isBooted ? 'Booted' : 'Available'
+                      : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
                     const statusDot = isBusy || d.waiting
                       ? 'bg-amber-400'
                       : isBooted
@@ -503,7 +505,10 @@ function QASessionPage() {
                         )}
                       >
                         <span className="flex flex-col gap-0.5">
-                          <span className="text-sm font-medium leading-tight">{shownName(d)}</span>
+                          <span className="flex items-center gap-2">
+                            <span className="text-sm font-medium leading-tight">{shownName(d)}</span>
+                            {isPhysical && <Badge variant="outline" className="text-[10px] leading-[15px]">USB</Badge>}
+                          </span>
                           {/* The device's own name, which is what automation and the logs call it. */}
                           {d.displayName && <span className="text-xs text-muted-foreground">{d.name}</span>}
                         </span>
@@ -563,6 +568,7 @@ function QASessionPage() {
                     const res = s.resources
                     const isStale = res ? Date.now() - res.reportedAt > RESOURCE_STALE_MS : false // eslint-disable-line react-hooks/purity
                     const deviceCount = s.devices.filter((d) => d.platform === os).length
+                    const usbCount = s.devices.filter((d) => d.platform === os && d.kind === 'physical').length
                     const cpuPercent = res?.cpuPercent ?? 0
                     const memPercent = res ? (res.memUsedMB / res.memTotalMB) * 100 : 0
                     // The dot and bars show the readings; whether the Mac takes a new session is the relay's call, which
@@ -602,6 +608,12 @@ function QASessionPage() {
                                 </div>
                                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                   <span>{deviceCount} device{deviceCount !== 1 ? 's' : ''}</span>
+                                  {usbCount > 0 && (
+                                    <>
+                                      <span>·</span>
+                                      <span>{usbCount} USB</span>
+                                    </>
+                                  )}
                                   {res && (
                                     <>
                                       <span>·</span>
