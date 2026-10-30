@@ -123,6 +123,8 @@ import type { ServiceTier } from '@tapflowio/protocol'
 import { LEAN_LABELS } from '../leanLabels'
 import { TouchHelper } from '../TouchHelper'
 import { XCUITreeReader } from '../XCUITreeReader'
+import { XCUITestInput } from '../XCUITestInput'
+import type { InputChannel } from '../InputChannel'
 import { PanelState } from '../PanelState'
 import { PhysicalOrientation, type DeviceOrientation } from '../PhysicalOrientation'
 import type { GuestHelperNative } from '../GuestHelper'
@@ -3998,10 +4000,10 @@ describe('IOSAgent', () => {
     }
 
     /** An agent with one simulator and `PHONE`, connected, recording everything it sends. */
-    async function connected(options: { capture?: PhysicalCaptureFactory | null } = {}) {
+    async function connected(options: { capture?: PhysicalCaptureFactory | null; input?: (deviceId: string) => InputChannel } = {}) {
       const simctl = mockSimctl(false)
       const capture = options.capture === null ? undefined : (options.capture ?? vi.fn(fakeCapture))
-      const agent = new IOSAgent({ intervalMs: 50, devicectl: devicectlWith([PHONE]), physicalCaptureFactory: capture }, simctl)
+      const agent = new IOSAgent({ intervalMs: 50, devicectl: devicectlWith([PHONE]), physicalCaptureFactory: capture, physicalInputFactory: options.input }, simctl)
       const internal = agent as unknown as Internals
       const sent: Sent[] = []
       const origOn = internal.sendOn.bind(agent)
@@ -4014,8 +4016,8 @@ describe('IOSAgent', () => {
       return { agent, simctl, capture, sent, phoneSession, deliver }
     }
 
-    async function bootPhone(payload: Record<string, unknown> = {}) {
-      const ctx = await connected()
+    async function bootPhone(payload: Record<string, unknown> = {}, input?: (deviceId: string) => InputChannel) {
+      const ctx = await connected({ input })
       ctx.deliver({ type: 'device:boot', requestId: 'rq-phone', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id, ...payload } })
       await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:ready' || m.type === 'device:boot-error')).toBe(true))
       return ctx
@@ -4120,7 +4122,8 @@ describe('IOSAgent', () => {
       { type: 'app:clear-state', payload: { bundleId: 'com.example.app' }, reply: 'app:clear-state-error', message: /Clearing app data/, call: 'clearAppData' },
       { type: 'clipboard:read', payload: {}, reply: 'clipboard:error', message: /clipboard is not available/, call: 'getPasteboard' },
       { type: 'clipboard:write', payload: { text: 'x' }, reply: 'clipboard:error', message: /clipboard is not available/, call: 'setPasteboard' },
-      { type: 'input:type', payload: { text: 'x' }, reply: 'input:type-error', message: /clipboard is not available/, call: 'setPasteboard' },
+      // No pasteboard on a phone: `input:type` goes to its runner, and with no runner channel it is refused as input.
+      { type: 'input:type', payload: { text: 'x' }, reply: 'input:type-error', message: /Input on a USB-connected device/, call: 'setPasteboard' },
       { type: 'network:set', payload: { offline: true }, reply: 'network:error', message: /Network control is not available/, call: 'setSimulatorEnv' },
       { type: 'open-url', payload: { url: 'https://example.com' }, reply: 'open-url:error', message: /Opening a URL/, call: 'openUrl' },
       { type: 'screenshot:request', payload: {}, reply: 'screenshot:error', message: /Screenshots of a USB-connected device/, call: 'screenshot' },
@@ -4130,6 +4133,18 @@ describe('IOSAgent', () => {
       await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === reply)).toBe(true))
       expect(ctx.sent.find((m) => m.type === reply)?.message).toMatch(message)
       expect(ctx.simctl[call]).not.toHaveBeenCalled()
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: send a physical device's `input:type` down the simctl pasteboard path, or drop the `typeText` call —
+    // the text never reaches the runner and the phone's field stays empty.
+    it('types into a USB-connected device through its XCUITest runner', async () => {
+      const runner = { warm: vi.fn(), state: () => 'ready' as const, request: vi.fn().mockResolvedValue(undefined) }
+      const ctx = await bootPhone({}, () => new XCUITestInput({ runner }))
+      ctx.deliver({ type: 'input:type', requestId: 'rq-type', sessionId: ctx.phoneSession, payload: { text: 'héllo 한글' } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'input:type-done')).toBe(true))
+      await vi.waitFor(() => expect(runner.request).toHaveBeenCalledWith('/type', 'héllo 한글'))
+      expect(ctx.simctl.setPasteboard).not.toHaveBeenCalled()
       ctx.agent.disconnect()
     })
 
