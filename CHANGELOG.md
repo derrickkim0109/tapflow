@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A USB-connected iPhone works like a simulator.** Plug in an iPhone or iPad that trusts the Mac and has Developer Mode on, and it is listed next to the simulators with a USB badge. Opening it mirrors its screen live in the browser and taps reach the phone. The agent Mac needs the Camera permission for `device-capture-helper` once, and `TAPFLOW_IOS_TEAM_ID` set to an Apple development team that can sign the XCUITest runner for the device. Installing a build, the clipboard, network control, rotation and screenshots are not available on a phone yet, and say so when asked.
+
 ### Fixed
 
 - **Reconnecting to a device no longer wipes the app under test.** When the dashboard lost its connection to the relay, even for a second, it reinstalled the build on reconnect, and an install clears the app's data first, so the tester came back to a logged-out, reset app. The relay now remembers the build it installed on each device, and the dashboard asks it to keep that build when it reconnects. Picking a device from the list still installs the build cleanly, and a restart still reinstalls it. A device that was shut down outside tapflow, for example by quitting Simulator.app, is reinstalled when the session comes back. Upgrade the relay: an older relay ignores the request and reinstalls as before.
