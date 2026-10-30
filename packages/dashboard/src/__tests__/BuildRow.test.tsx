@@ -144,3 +144,20 @@ describe('BuildRow — platform badge', () => {
     cleanup()
   })
 })
+
+// A device build installs only on a USB-connected iPhone, so the row says which kind it is before QA starts.
+describe('BuildRow — target label', () => {
+  // Mutation: swap the two labels, or render the label off anything but `target`.
+  it.each([['device', 'Device build'], ['simulator', 'Simulator build']] as const)('%s reads %s', (target, label) => {
+    renderRow(makeBuild({ target }))
+    expect(screen.getByText(label, { exact: true })).toBeTruthy()
+    cleanup()
+  })
+
+  // Mutation: default a missing target to one of the labels, and every Android build claims to be a simulator build.
+  it('draws no target label for an Android build', () => {
+    renderRow(makeBuild({ platform: 'android', target: null }))
+    expect(screen.queryByText(/Device build|Simulator build/)).toBeNull()
+    cleanup()
+  })
+})

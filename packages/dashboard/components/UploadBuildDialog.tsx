@@ -96,12 +96,12 @@ export function UploadBuildDialog({ onSuccess, appId, canWrite }: Props) {
             <input
               ref={inputRef}
               type="file"
-              accept=".zip,.apk,.tgz,.tar.gz,application/gzip,application/x-gzip"
+              accept=".zip,.ipa,.apk,.tgz,.tar.gz,application/gzip,application/x-gzip"
               className="hidden"
               onChange={(e) => setFile(e.target.files?.[0] ?? null)}
             />
             <p className="text-xs text-muted-foreground">
-              iOS: <code>.app.zip</code> or <code>.tar.gz</code> / <code>.tgz</code> (e.g. an EAS simulator build)
+              iOS: <code>.app.zip</code> or <code>.tar.gz</code> / <code>.tgz</code> (e.g. an EAS simulator build), or <code>.ipa</code> for a USB-connected iPhone
               &nbsp;·&nbsp;Android: <code>.apk</code>
             </p>
           </div>

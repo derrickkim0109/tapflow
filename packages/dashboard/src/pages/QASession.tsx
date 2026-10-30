@@ -284,9 +284,13 @@ export function QASession() {
                     // is for the person who started it, through the link their coding agent hands them; the
                     // device list only explains why the device is taken.
                     const isPhysical = d.kind === 'physical'
+                    // A device build cannot install on a simulator. The reverse stays open: a phone may already
+                    // hold a copy of a simulator build's app for the agent to launch.
+                    const needsPhone = build?.target === 'device' && !isPhysical
                     // A phone on the desk is connected rather than booted: nothing starts it, and it stays on when the session ends.
                     const statusLabel = isBusy
                       ? (d.holder ? `${holderKindLabel(d.holder.kind)} is driving it` : 'In use')
+                      : needsPhone ? 'Device build needs a USB iPhone'
                       : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
                     const statusDot = isBusy
                       ? 'bg-amber-400'
@@ -296,7 +300,7 @@ export function QASession() {
                     return (
                       <button
                         key={d.id}
-                        disabled={isBusy || needsMemory || booting || !connected}
+                        disabled={isBusy || needsMemory || needsPhone || booting || !connected}
                         onClick={() => handleStartDevice(d)}
                         className={cn(
                           'flex flex-col gap-3 rounded-lg border p-3 text-left transition-colors min-h-[100px]',

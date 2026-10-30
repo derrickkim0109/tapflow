@@ -23,7 +23,7 @@ import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Play, Trash2, TimerOff } from 'lucide-react';
 import type { Build } from '@/lib/types';
-import { PLATFORM_LABEL, STATUS_TONE, buildRowName, formatDeletionCountdown } from '@/lib/build-format';
+import { PLATFORM_LABEL, STATUS_TONE, TARGET_LABEL, buildRowName, formatDeletionCountdown } from '@/lib/build-format';
 
 interface Props {
   build: Build;
@@ -108,6 +108,11 @@ export function BuildRow({
             >
               {PLATFORM_LABEL[build.platform]}
             </Badge>
+            {build.target && (
+              <span className="rounded border px-1 text-[10px] font-medium text-muted-foreground">
+                {TARGET_LABEL[build.target]}
+              </span>
+            )}
             {build.status_label && (
               <Badge tone={STATUS_TONE[build.status_label]} className="text-xs">
                 {build.status_label}

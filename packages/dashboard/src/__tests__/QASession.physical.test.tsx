@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
@@ -16,7 +16,10 @@ vi.mock('@/hooks/useRelay', () => ({
   },
 }))
 const { BUILD } = vi.hoisted(() => ({
-  BUILD: { id: 7, app_id: 3, name: 'Demo', platform: 'ios', status_label: null, version_name: '1.0', build_number: '1' },
+  BUILD: {
+    id: 7, app_id: 3, name: 'Demo', platform: 'ios', status_label: null, version_name: '1.0', build_number: '1',
+    target: 'simulator' as 'simulator' | 'device',
+  },
 }))
 vi.mock('@/hooks/useBuildLoader', () => ({ useBuildLoader: () => ({ build: BUILD }) }))
 vi.mock('@/components/SessionPanel', () => ({ SessionPanel: () => <div /> }))
@@ -74,5 +77,32 @@ describe('QASession — a USB-connected device (#152)', () => {
     expect(phone.textContent).toContain('Connected')
     expect(phone.textContent).not.toContain('Booted')
     expect(screen.getByRole('button', { name: /iPhone 17/ }).textContent).toContain('Booted')
+  })
+})
+
+describe('QASession — a build for one target (#152)', () => {
+  afterEach(() => { BUILD.target = 'simulator' })
+
+  // Mutation: drop `needsPhone` from `disabled`, and a device build can be sent to a simulator that cannot install it.
+  it('offers a device build only on the plugged-in phone', async () => {
+    BUILD.target = 'device'
+    const user = await openDeviceList()
+    await user.click(await screen.findByText('studio-mac'))
+    const phone = await screen.findByRole('button', { name: /Test iPhone/ })
+    expect(phone).toBeEnabled()
+    for (const name of [/iPhone 17/, /iPhone SE/]) {
+      const sim = screen.getByRole('button', { name })
+      expect(sim).toBeDisabled()
+      expect(sim.textContent).toContain('needs a USB iPhone')
+    }
+  })
+
+  // Mutation: gate on the target in both directions, and a phone that already holds the app can no longer launch it.
+  it('leaves every device open to a simulator build, the phone included', async () => {
+    const user = await openDeviceList()
+    await user.click(await screen.findByText('studio-mac'))
+    expect(await screen.findByRole('button', { name: /Test iPhone/ })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /iPhone 17/ })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /iPhone SE/ })).toBeEnabled()
   })
 })

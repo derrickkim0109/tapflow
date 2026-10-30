@@ -14,6 +14,11 @@ export const PLATFORM_LABEL = {
   both: 'Both',
 } as const satisfies Record<App['platform'], string>
 
+export const TARGET_LABEL = {
+  simulator: 'Simulator build',
+  device: 'Device build',
+} as const satisfies Record<NonNullable<Build['target']>, string>
+
 export function buildLabel(build: Build): string {
   if (build.version_name && build.build_number) return `${build.version_name} · build ${build.build_number}`
   return build.version_name ?? build.version_label ?? (build.build_number ? `build ${build.build_number}` : 'Build')

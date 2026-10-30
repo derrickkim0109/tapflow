@@ -67,6 +67,9 @@ export interface Build {
   completed_at: string | null
   delete_after: string | null
   uploader: string | null
+  /** What an iOS build runs on: `device` builds (.ipa, or an iphoneos-only .app) install only on a USB-connected
+   *  iPhone. Null for Android. */
+  target?: 'simulator' | 'device' | null
 }
 
 export interface ReleaseGroup {
