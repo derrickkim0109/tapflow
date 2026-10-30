@@ -113,11 +113,11 @@ describe('POST /api/v1/builds — .tar.gz (EAS simulator) ingest', () => {
     expect(r.body.bundle_id).toBe('com.example.eas')
   })
 
-  // #4 — .ipa 거절, 안내에 .tar.gz 포함
-  it('rejects .ipa with guidance mentioning .tar.gz', async () => {
+  // #4 — an .ipa is a device build now (builds-device-upload.test.ts); one that is not a zip is still refused.
+  it('rejects an .ipa that is not a zip', async () => {
     const r = await postTar(port, 'T4', 'app.ipa', Buffer.alloc(50, 0x41), cookie)
     expect(r.status).toBe(400)
-    expect(r.body.error).toContain('.tar.gz')
+    expect(r.body.error).toContain('Payload')
   })
 
   // #5 — .aab 거절

@@ -68,7 +68,7 @@ describe('POST /api/v1/builds — a file part with no filename', () => {
   it('is refused as an unsupported file, and nothing is saved', async () => {
     const r = await postPart(port, cookie)
     expect(r.status).toBe(400)
-    expect(r.body.error).toBe('Only .app.zip / .tar.gz (iOS) or .apk (Android) files allowed')
+    expect(r.body.error).toBe('Only .app.zip / .tar.gz / .ipa (iOS) or .apk (Android) files allowed')
     expect(fs.readdirSync(uploadsDir)).toEqual([])
   })
 })

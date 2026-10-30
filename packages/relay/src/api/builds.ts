@@ -54,6 +54,8 @@ type AppInfo = {
   versionName: string | null
   buildNumber: string | null
   appName: string | null
+  /** CFBundleExecutable — the main binary's file name inside the .app. */
+  executable: string | null
 }
 
 /** Info.plist Buffer(xml 또는 bplist)에서 CFBundle* 를 파싱한다. 아카이브 종류와 무관. */
@@ -66,7 +68,7 @@ function parseInfoPlist(plistBuf: Buffer): AppInfo {
       input: plistBuf,
       encoding: 'utf8',
     })
-    if (plutil.status !== 0) return { bundleId: null, versionName: null, buildNumber: null, appName: null }
+    if (plutil.status !== 0) return { bundleId: null, versionName: null, buildNumber: null, appName: null, executable: null }
     parsed = parseXmlPlist(plutil.stdout as string)
   } else {
     parsed = parseXmlPlist(plistBuf.toString('utf8'))
@@ -77,6 +79,7 @@ function parseInfoPlist(plistBuf: Buffer): AppInfo {
     versionName: parsed['CFBundleShortVersionString'] ?? null,
     buildNumber: parsed['CFBundleVersion'] ?? null,
     appName: parsed['CFBundleDisplayName'] ?? parsed['CFBundleName'] ?? null,
+    executable: parsed['CFBundleExecutable'] ?? null,
   }
 }
 
@@ -107,6 +110,26 @@ export function extractAppZipInfo(zipPath: string): AppInfo | null {
   const extract = spawnSync('unzip', ['-p', zipPath, `${appDir}/Info.plist`], { maxBuffer: ARCHIVE_READ_MAXBUFFER })
   if (extract.status !== 0 || !extract.stdout) return null
 
+  return parseInfoPlist(extract.stdout as Buffer)
+}
+
+// ── .ipa helpers (device builds) ────────────────────────────────────────────
+
+/** The `Payload/<Name>.app` directory of an .ipa, or null when there is none. */
+function findAppDirInIpa(ipaPath: string): string | null {
+  const list = spawnSync('unzip', ['-l', ipaPath], { encoding: 'utf8', maxBuffer: ARCHIVE_READ_MAXBUFFER })
+  if (list.status !== 0) return null
+  // Matches any entry under the bundle, so an .ipa zipped without explicit directory entries still resolves.
+  const m = /\d{2}:\d{2}\s+Payload\/([^/\n]+\.app)\//m.exec(list.stdout as string)
+  return m ? `Payload/${m[1]}` : null
+}
+
+/** App metadata from an .ipa's `Payload/*.app/Info.plist`. Null on a structural error. */
+export function extractIpaInfo(ipaPath: string): AppInfo | null {
+  const appDir = findAppDirInIpa(ipaPath)
+  if (!appDir) return null
+  const extract = spawnSync('unzip', ['-p', ipaPath, `${appDir}/Info.plist`], { maxBuffer: ARCHIVE_READ_MAXBUFFER })
+  if (extract.status !== 0 || !extract.stdout?.length) return null
   return parseInfoPlist(extract.stdout as Buffer)
 }
 
@@ -148,11 +171,17 @@ export function extractAppTarInfo(tarPath: string): AppInfo | null {
 // ── archive-agnostic dispatch ───────────────────────────────────────────────
 
 function findAppDir(filePath: string): string | null {
-  return buildFileKind(filePath) === 'ios-tar' ? findAppDirInTar(filePath) : findAppDirInZip(filePath)
+  const kind = buildFileKind(filePath)
+  if (kind === 'ios-tar') return findAppDirInTar(filePath)
+  if (kind === 'ipa') return findAppDirInIpa(filePath)
+  return findAppDirInZip(filePath)
 }
 
 export function extractAppInfo(filePath: string): AppInfo | null {
-  return buildFileKind(filePath) === 'ios-tar' ? extractAppTarInfo(filePath) : extractAppZipInfo(filePath)
+  const kind = buildFileKind(filePath)
+  if (kind === 'ios-tar') return extractAppTarInfo(filePath)
+  if (kind === 'ipa') return extractIpaInfo(filePath)
+  return extractAppZipInfo(filePath)
 }
 
 /** Resolve aapt from the SDK build-tools (any version). Candidate list mirrors `tapflow doctor` so the two agree; falls back to PATH. */
@@ -279,20 +308,127 @@ function lipoHasSimSlice(binaryBuf: Buffer): boolean | null {
   }
 }
 
-/** .app.zip / .tar.gz 의 .app 실행 바이너리에 시뮬레이터 슬라이스가 있는지 확인. */
-function hasSimulatorSlice(filePath: string, appDir: string): boolean | null {
-  const binaryName = path.basename(appDir, '.app')
-  let binaryBuf: Buffer | null = null
+// ── Mach-O slice targets ───────────────────────────────────────────────────
+// `lipo -info` names architectures only, and arm64 is both an Apple Silicon simulator slice and a device slice.
+// The platform a slice was linked for is in its load commands, so read those directly. Pure JS, so it also runs
+// on a Linux relay where lipo does not exist.
 
-  if (buildFileKind(filePath) === 'ios-tar') {
-    binaryBuf = readTarEntry(filePath, `${appDir}/${binaryName}`)
-  } else {
-    const extract = spawnSync('unzip', ['-p', filePath, `${appDir}/${binaryName}`], { maxBuffer: ARCHIVE_READ_MAXBUFFER })
-    if (extract.status === 0 && extract.stdout?.length) binaryBuf = extract.stdout as Buffer
+export type BuildTarget = 'simulator' | 'device'
+export type SliceTargets = { simulator: boolean; device: boolean }
+
+const MH_MAGIC = 0xfeedface
+const MH_MAGIC_64 = 0xfeedfacf
+const FAT_MAGIC = 0xcafebabe
+const FAT_MAGIC_64 = 0xcafebabf
+const CPU_TYPE_X86 = 7
+const CPU_TYPE_X86_64 = 0x01000007
+const LC_VERSION_MIN_IPHONEOS = 0x25
+const LC_BUILD_VERSION = 0x32
+const PLATFORM_IOS = 2
+const PLATFORM_IOSSIMULATOR = 7
+// Java class files share FAT_MAGIC; a real universal binary carries a handful of slices.
+const MAX_FAT_ARCHS = 32
+
+function thinSliceTarget(buf: Buffer, offset: number): BuildTarget | null {
+  if (offset < 0 || offset + 28 > buf.length) return null
+  const magic = buf.readUInt32LE(offset)
+  if (magic !== MH_MAGIC && magic !== MH_MAGIC_64) return null
+  const cputype = buf.readUInt32LE(offset + 4)
+  const ncmds = buf.readUInt32LE(offset + 16)
+  let p = offset + (magic === MH_MAGIC_64 ? 32 : 28)
+  let versionMinIos = false
+  for (let i = 0; i < ncmds && p + 8 <= buf.length; i++) {
+    const cmd = buf.readUInt32LE(p)
+    const size = buf.readUInt32LE(p + 4)
+    if (cmd === LC_BUILD_VERSION && p + 12 <= buf.length) {
+      const platform = buf.readUInt32LE(p + 8)
+      if (platform === PLATFORM_IOS) return 'device'
+      if (platform === PLATFORM_IOSSIMULATOR) return 'simulator'
+      return null
+    }
+    if (cmd === LC_VERSION_MIN_IPHONEOS) versionMinIos = true
+    if (size < 8) break
+    p += size
   }
+  // Binaries linked before LC_BUILD_VERSION say only "iOS"; an Intel slice of one can only be a simulator's.
+  if (cputype === CPU_TYPE_X86 || cputype === CPU_TYPE_X86_64) return 'simulator'
+  return versionMinIos ? 'device' : null
+}
 
-  if (!binaryBuf?.length) return null
-  return lipoHasSimSlice(binaryBuf)
+/** Which targets a Mach-O (thin or universal) has slices for. Null when no slice could be classified. */
+export function machOSliceTargets(buf: Buffer): SliceTargets | null {
+  if (buf.length < 8) return null
+  const fatMagic = buf.readUInt32BE(0)
+  const targets: (BuildTarget | null)[] = []
+  if (fatMagic === FAT_MAGIC || fatMagic === FAT_MAGIC_64) {
+    const nfat = buf.readUInt32BE(4)
+    if (nfat === 0 || nfat > MAX_FAT_ARCHS) return null
+    const archSize = fatMagic === FAT_MAGIC_64 ? 32 : 20
+    for (let i = 0; i < nfat; i++) {
+      const a = 8 + i * archSize
+      if (a + archSize > buf.length) break
+      const off = fatMagic === FAT_MAGIC_64 ? Number(buf.readBigUInt64BE(a + 8)) : buf.readUInt32BE(a + 8)
+      targets.push(thinSliceTarget(buf, off))
+    }
+  } else {
+    targets.push(thinSliceTarget(buf, 0))
+  }
+  const simulator = targets.includes('simulator')
+  const device = targets.includes('device')
+  return simulator || device ? { simulator, device } : null
+}
+
+/** The .app's main executable, named by CFBundleExecutable and else by the bundle's own name. */
+function readAppExecutable(filePath: string, appDir: string, executable: string | null): Buffer | null {
+  const entry = `${appDir}/${executable ?? path.basename(appDir, '.app')}`
+  if (buildFileKind(filePath) === 'ios-tar') return readTarEntry(filePath, entry)
+  const extract = spawnSync('unzip', ['-p', filePath, entry], { maxBuffer: ARCHIVE_READ_MAXBUFFER })
+  return extract.status === 0 && extract.stdout?.length ? (extract.stdout as Buffer) : null
+}
+
+/**
+ * Decide whether an iOS archive is a simulator or a device build. `reject` carries the 400 message.
+ * An .ipa must carry a device slice. A .app.zip / .tar.gz is a simulator build when it has a simulator slice and a
+ * device build when it has only a device slice; when its slices cannot be classified it falls back to the lipo
+ * check, which accepts it as a simulator build as before.
+ */
+function classifyIosBuild(
+  filePath: string,
+  appDir: string,
+  executable: string | null,
+): { target: BuildTarget } | { reject: string } {
+  const binary = readAppExecutable(filePath, appDir, executable)
+  const slices = binary?.length ? machOSliceTargets(binary) : null
+  if (buildFileKind(filePath) === 'ipa') {
+    return slices?.device
+      ? { target: 'device' }
+      : { reject: 'This .ipa has no iOS device (iphoneos, arm64) slice in its main executable. Build it for a generic iOS device, or upload a simulator build as .app.zip / .tar.gz.' }
+  }
+  if (slices) return { target: slices.simulator ? 'simulator' : 'device' }
+  // lipo 슬라이스 검증 (macOS only; Linux에서는 null → skip)
+  if (binary?.length && lipoHasSimSlice(binary) === false) {
+    return { reject: 'This build has no arm64 or x86_64 slice. Build it for iphonesimulator or for a generic iOS device.' }
+  }
+  return { target: 'simulator' }
+}
+
+// The target is read back from the stored file rather than a column: an .ipa is always a device build, and a
+// device-only .app.zip / .tar.gz is stored under this marker. Older rows predate device builds and are simulator.
+const DEVICE_FILE_MARKER = '.device_'
+
+/** `simulator` / `device` for an iOS build's stored file, null for Android. */
+export function buildTargetOf(filePath: string): BuildTarget | null {
+  const kind = buildFileKind(filePath)
+  if (kind === 'ipa') return 'device'
+  if (kind !== 'ios-zip' && kind !== 'ios-tar') return null
+  const name = path.basename(filePath).replace(/^\d+-[0-9a-f]{8}/, '')
+  return name.startsWith(DEVICE_FILE_MARKER) ? 'device' : 'simulator'
+}
+
+/** Replaces a build row's `file_path` with the `target` derived from it, so the path never reaches a client. */
+function withTarget<T extends { file_path: string }>(row: T): Omit<T, 'file_path'> & { target: BuildTarget | null } {
+  const { file_path: filePath, ...rest } = row
+  return { ...rest, target: buildTargetOf(filePath) }
 }
 
 // ── app 자동 생성 / 조회 ──────────────────────────────────────────────────
@@ -358,15 +494,15 @@ export function handleListBuilds(req: http.IncomingMessage, res: http.ServerResp
   const items = db.prepare(`
     SELECT b.id, b.app_id, ap.name, b.version_name, b.build_number,
            b.version_label, b.status_label, b.platform,
-           b.bundle_id, b.uploaded_at, b.completed_at, b.delete_after,
+           b.bundle_id, b.uploaded_at, b.completed_at, b.delete_after, b.file_path,
            COALESCE(u.display_name, substr(u.email, 1, instr(u.email, '@') - 1)) as uploader
     ${baseFrom}
     ${where}
     ORDER BY b.${sortKey} ${sortDir}
     LIMIT ? OFFSET ?
-  `).all(...params, limit, page * limit)
+  `).all(...params, limit, page * limit) as { file_path: string }[]
 
-  json(res, 200, { items, total })
+  json(res, 200, { items: items.map(withTarget), total })
 }
 
 export function handleGetBuild(
@@ -378,14 +514,15 @@ export function handleGetBuild(
 
   const build = getDb().prepare(`
     SELECT b.id, b.app_id, ap.name, b.version_name, b.build_number,
-           b.version_label, b.status_label, b.platform, b.bundle_id, b.uploaded_at, b.completed_at, b.delete_after
+           b.version_label, b.status_label, b.platform, b.bundle_id, b.uploaded_at, b.completed_at, b.delete_after,
+           b.file_path
     FROM builds b
     LEFT JOIN apps ap ON ap.id = b.app_id
     WHERE b.id = ?
-  `).get(params.id)
+  `).get(params.id) as { file_path: string } | undefined
 
   if (!build) return json(res, 404, { error: 'Build not found' })
-  json(res, 200, build)
+  json(res, 200, withTarget(build))
 }
 
 export async function handleUpdateBuild(
@@ -587,18 +724,13 @@ export function handleUploadBuild(
     originalName = info.filename ?? ''
     const kind = buildFileKind(originalName)
 
-    if (kind === 'ipa') {
-      fileError = 'iOS simulator builds must be in .app.zip or .tar.gz format. Zip (or tar.gz, e.g. an EAS simulator build) the .app directory built for iphonesimulator and upload it.'
-      stream.resume()
-      return
-    }
     if (kind === 'aab') {
       fileError = 'Android emulator installs require an .apk. Build an .apk (not .aab) and upload it.'
       stream.resume()
       return
     }
     if (kind === 'unknown') {
-      fileError = 'Only .app.zip / .tar.gz (iOS) or .apk (Android) files allowed'
+      fileError = 'Only .app.zip / .tar.gz / .ipa (iOS) or .apk (Android) files allowed'
       stream.resume()
       return
     }
@@ -627,7 +759,7 @@ export function handleUploadBuild(
     if (!savedPath) return json(res, 400, { error: 'File required' })
 
     const kind = buildFileKind(originalName)
-    const isIos = kind === 'ios-zip' || kind === 'ios-tar'
+    const isIos = kind === 'ios-zip' || kind === 'ios-tar' || kind === 'ipa'
     const platform = fields.platform ?? (isIos ? 'ios' : 'android')
     const status = ['Backlog', 'In Progress', 'Done', 'Rejected'].includes(fields.status)
       ? fields.status : null
@@ -651,16 +783,25 @@ export function handleUploadBuild(
       const info = extractAppInfo(savedPath)
       if (info === null) {
         fs.unlinkSync(savedPath)
-        return json(res, 400, { error: 'No .app directory found in the archive. Upload a .app.zip or .tar.gz that contains a .app directory.' })
+        return json(res, 400, {
+          error: kind === 'ipa'
+            ? 'No Payload/*.app directory found in the .ipa.'
+            : 'No .app directory found in the archive. Upload a .app.zip or .tar.gz that contains a .app directory.',
+        })
       }
 
-      // lipo 슬라이스 검증 (macOS only; Linux에서는 null → skip)
       const appDir = findAppDir(savedPath)
       if (appDir) {
-        const sliceOk = hasSimulatorSlice(savedPath, appDir)
-        if (sliceOk === false) {
+        const verdict = classifyIosBuild(savedPath, appDir, info.executable)
+        if ('reject' in verdict) {
           fs.unlinkSync(savedPath)
-          return json(res, 400, { error: 'This build contains device-only slices. Build for iphonesimulator to include a simulator slice.' })
+          return json(res, 400, { error: verdict.reject })
+        }
+        if (verdict.target === 'device' && kind !== 'ipa') {
+          // The first `_` is the separator after `<ms>-<uuid8>`, which holds none.
+          const marked = path.join(path.dirname(savedPath), path.basename(savedPath).replace('_', DEVICE_FILE_MARKER))
+          fs.renameSync(savedPath, marked)
+          savedPath = marked
         }
       }
 
@@ -702,12 +843,12 @@ export function handleUploadBuild(
 
     const build = db.prepare(`
       SELECT b.id, b.app_id, ap.name, b.version_name, b.build_number,
-             b.bundle_id, b.status_label, b.platform, b.uploaded_at
+             b.bundle_id, b.status_label, b.platform, b.uploaded_at, b.file_path
       FROM builds b LEFT JOIN apps ap ON ap.id = b.app_id
       WHERE b.id = ?
-    `).get(result.lastInsertRowid)
+    `).get(result.lastInsertRowid) as { file_path: string }
 
-    json(res, 201, build)
+    json(res, 201, withTarget(build))
   })
 
   bb.on('error', () => json(res, 500, { error: 'Upload failed' }))

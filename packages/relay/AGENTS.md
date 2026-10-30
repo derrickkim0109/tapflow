@@ -25,9 +25,10 @@ A single process on a single configurable port (default: 4000) handles both WebS
 
 Build file storage path: `uploads/builds/`.
 
-iOS build format: `.app.zip` **or** `.tar.gz`/`.tgz` (EAS `eas build` simulator artifacts). `.ipa` uploads return 400. `.tar.gz` is stored natively (no re-zip) so the `.app`'s exec bits / symlinks survive to install time; `tar` extraction happens on the macOS agent.
-- Auto-extracts `CFBundleIdentifier`, `CFBundleShortVersionString`, `CFBundleVersion`, `CFBundleDisplayName`/`CFBundleName` from the top-level `*.app/Info.plist` (zip: `unzip -p`; tar: `tar -xzOf`).
-- Validates simulator slices via `lipo -info`. **Skipped in Linux environments (lipo not available) — errors surface at install time instead**.
+iOS build format: `.app.zip` **or** `.tar.gz`/`.tgz` (EAS `eas build` simulator artifacts) **or** `.ipa` (device build, for a USB-connected iPhone). `.tar.gz` is stored natively (no re-zip) so the `.app`'s exec bits / symlinks survive to install time; `tar` extraction happens on the macOS agent.
+- Auto-extracts `CFBundleIdentifier`, `CFBundleShortVersionString`, `CFBundleVersion`, `CFBundleDisplayName`/`CFBundleName` from the top-level `*.app/Info.plist` (zip: `unzip -p`; tar: `tar -xzOf`; ipa: `Payload/*.app/Info.plist`).
+- Classifies the main executable's slices from its Mach-O load commands (`machOSliceTargets`: `LC_BUILD_VERSION` platform 2 = device, 7 = simulator), in pure JS so it runs on Linux too. An `.ipa` needs a device slice; a `.app.zip`/`.tar.gz` is a simulator build if it has a simulator slice and a device build if it has only a device slice. An executable it cannot classify falls back to `lipo -info` (skipped on Linux) and counts as a simulator build.
+- Builds JSON carries `target: 'simulator' | 'device' | null` (null = Android). There is no column: `buildTargetOf` derives it from the stored file — `.ipa` is device, and a device-only `.app.zip`/`.tar.gz` is stored as `<ms>-<uuid8>.device_<name>`.
 - `.tar.gz` uploads are validated before storage (`validateTarGz`): rejects path traversal (`..`/absolute), symlink/hardlink entries, corrupt gzip, and gzip bombs (`TAPFLOW_MAX_UNPACKED_BYTES`, default upload cap ×4). `tar` resolves PAX/GNU long names so header parsing can't be bypassed.
 
 ## HOW

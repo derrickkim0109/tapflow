@@ -100,12 +100,12 @@ describe('upload size-limit handling', () => {
   })
 
   // #263 — build-validation errors are returned in English, not Korean
-  it('빌드: .ipa 업로드는 400 + 영어 안내', async () => {
+  it('build: an .ipa that is not a zip gets a 400 with English guidance', async () => {
     const boundary = 'X3'
     const body = multipartBody(boundary, [{ name: 'file', filename: 'app.ipa', contentType: 'application/octet-stream', data: Buffer.alloc(50, 0x41) }])
     const r = await httpPostMultipart(port, '/api/v1/builds', body, boundary, cookie)
     expect(r.status).toBe(400)
-    expect(r.body.error).toBe('iOS simulator builds must be in .app.zip or .tar.gz format. Zip (or tar.gz, e.g. an EAS simulator build) the .app directory built for iphonesimulator and upload it.')
+    expect(r.body.error).toBe('No Payload/*.app directory found in the .ipa.')
   })
 
   it('빌드: .app 디렉토리 없는 zip은 400 + 영어 안내', async () => {
