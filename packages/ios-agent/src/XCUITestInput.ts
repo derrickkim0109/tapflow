@@ -89,7 +89,7 @@ export class XCUITestInput implements InputChannel {
 
   touchStart(x: number, y: number): boolean {
     this.touch = null
-    if (this.inputState() !== 'ready') return false
+    if (!this.ready()) return false
     this.touch = { x, y, lastX: x, lastY: y, moved: false, startedAt: Date.now() }
     return true
   }
@@ -148,7 +148,7 @@ export class XCUITestInput implements InputChannel {
 
   /** Types `text` into the focused element in one request — what `input:type` wants, rather than a key per character. */
   typeText(text: string): boolean {
-    if (this.inputState() !== 'ready') return false
+    if (!this.ready()) return false
     this.send(this.withApp('/type'), text)
     return true
   }
@@ -172,9 +172,17 @@ export class XCUITestInput implements InputChannel {
   }
 
   private key(name: string): boolean {
-    if (this.inputState() !== 'ready') return false
+    if (!this.ready()) return false
     this.send(this.withApp(`/key?name=${name}`))
     return true
+  }
+
+  // A runner that died after it was ready, or whose last start failed, is not restarted by anything else: the
+  // write that finds it down asks for a new one (warm is a no-op while a start is under way).
+  private ready(): boolean {
+    if (this.inputState() === 'ready') return true
+    if (!this.stopped) this.deps.runner.warm()
+    return false
   }
 
   private withApp(path: string): string {
@@ -186,7 +194,8 @@ export class XCUITestInput implements InputChannel {
   // One at a time and in order: a tap that focuses a field must land before the text typed into it.
   private send(path: string, body?: string): void {
     this.queue = this.queue
-      .then(() => this.deps.runner.request(path, body))
+      // A write queued before stop() must not reach (or restart) the runner after it.
+      .then(() => (this.stopped ? undefined : this.deps.runner.request(path, body)))
       .catch((e: unknown) => logger.warn(`runner did not take ${path.split('?')[0]}: ${e instanceof Error ? e.message : String(e)}`))
   }
 

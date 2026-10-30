@@ -176,7 +176,9 @@ describe('XCUITestInput', () => {
       expect(runner.request).not.toHaveBeenCalled()
     })
 
-    // Mutation: send while not ready. A key would be acked and queued behind a runner that never starts.
+    // Mutation: send while not ready. The key would be acked and queued, and its request would itself start a new
+    // runner (the client's request starts one when none is ready) — an ack for input that lands, if ever, after a
+    // cold start that last time failed.
     it('takes no key while the runner is unavailable', () => {
       const { input, runner } = make({ state: 'unavailable' })
       expect(input.sendKey(0x04)).toBe(false)
@@ -228,11 +230,50 @@ describe('XCUITestInput', () => {
   })
 
   describe('lifecycle', () => {
-    // Mutation: skip the warm-up. The first tap would then wait out a cold runner start on the device.
+    // Mutation: skip the warm-up. Nothing would start the runner until the first write found it down, so that
+    // write would be refused while a cold start (tens of seconds on a device) began.
     it('warms the runner on start and reports its state', () => {
       const { input, runner } = make({ state: 'starting' })
       expect(runner.warm).toHaveBeenCalledTimes(1)
       expect(input.inputState()).toBe('starting')
+    })
+
+    // Mutation: drop the warm in the not-ready path. A runner that died after it was ready reads `starting` for
+    // good, and nothing else would ever start a new one: every later touch and key refused until the agent restarts.
+    it('asks for the runner again when a write finds it down', () => {
+      const runner = {
+        state: vi.fn((): 'ready' | 'starting' | 'unavailable' => 'ready'),
+        warm: vi.fn(),
+        request: vi.fn(async (_path: string, _body?: string) => {}),
+      } satisfies RunnerInputClient
+      const input = new XCUITestInput({ runner })
+      input.start()
+      expect(runner.warm).toHaveBeenCalledTimes(1)
+      runner.state.mockReturnValue('starting')
+      expect(input.touchStart(0.5, 0.5)).toBe(false)
+      expect(runner.warm).toHaveBeenCalledTimes(2)
+      runner.state.mockReturnValue('unavailable')
+      expect(input.typeText('a')).toBe(false)
+      expect(input.pressLegacyButton(0)).toBe(false)
+      expect(runner.warm).toHaveBeenCalledTimes(4)
+    })
+
+    // Mutation: drop the `stopped` check in the queue. A key queued behind a slow request would still be sent after
+    // stop(), and sending it starts a runner the session no longer wants.
+    it('sends nothing queued before stop once stopped', async () => {
+      const { input, runner } = make()
+      let release!: () => void
+      runner.request.mockImplementationOnce(() => new Promise<void>((r) => { release = r }))
+      input.sendKey(0x04)
+      input.sendKey(0x05)
+      await flush()
+      expect(runner.request).toHaveBeenCalledTimes(1)
+      input.stop()
+      release()
+      await flush()
+      expect(runner.request).toHaveBeenCalledTimes(1)
+      expect(input.touchStart(0.5, 0.5)).toBe(false)
+      expect(runner.warm).toHaveBeenCalledTimes(1)
     })
 
     // Mutation: keep the touch across stop. A relay reconnect would leave a half gesture that the next end replays.
