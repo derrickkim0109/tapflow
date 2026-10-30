@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Agents can say whether a device is a simulator, an emulator or a physical device.** A device may carry an optional `kind`, which the relay passes on to the dashboard and to clients such as `list_devices`. The bundled agents do not report it yet; this is groundwork for USB-connected phones (#152).
+- **Agents can say whether a device is a simulator, an emulator or a physical device.** A device may carry an optional `kind`, which the relay passes on to the dashboard and to clients such as `list_devices`. The Android agent reports it for its emulators and phones; the iOS agent does not report it yet (#152).
+- **An Android phone plugged in over USB can be opened like an emulator.** With USB debugging turned on and authorized on the phone, it appears in the device list next to the emulators, plugged in before the agent starts, and opens with its live screen, touch, keys and app installs. tapflow never starts, stops or erases it: Full reset, network control, the clipboard and folding are refused on a phone, and when the session ends its rotation setting goes back to what it was. A phone that is not authorized yet is named in the agent's output with what to do. Wireless debugging is not offered yet.
 
 ### Changed
 

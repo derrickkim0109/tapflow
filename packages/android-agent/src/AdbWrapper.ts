@@ -29,6 +29,11 @@ export function encodeAdbInputText(text: string): string {
 
 const NO_FILE = '__TAPFLOW_NO_FILE__'
 
+/** Whether `deviceId` names a USB-connected device (`usb:<serial>`) rather than an AVD (`avd:<name>`). */
+export function isPhysicalDevice(deviceId: string): boolean {
+  return deviceId.startsWith('usb:')
+}
+
 // Play Store images fill /data on their own as Google apps update in the background, so this is
 // usually not the build's fault — but any image can fill up, so the message does not blame them.
 const STORAGE_FULL_MESSAGE =
@@ -54,8 +59,11 @@ const RESOLVE_WAIT_SEC = 3
 const PEEK_CALL_TIMEOUT_MS = 10_000
 
 export class AdbWrapper {
-  // avdId ("avd:<name>") → ADB serial ("emulator-5554")
+  // avdId ("avd:<name>") → ADB serial ("emulator-5554"); a USB device's "usb:<serial>" → its serial
   private readonly serialMap = new Map<string, string>()
+  // Per USB serial: what listing it costs a shell round trip to learn, dropped when it is unplugged.
+  private readonly physicalInfo = new Map<string, Pick<Device, 'name' | 'osVersion' | 'formFactor'>>()
+  private readonly unauthorizedWarned = new Set<string>()
   // Per serial: whether the tree dump jar is on the device (one push per agent run), and devices whose image lacks
   // the classes it needs, which go straight to `uiautomator dump` from then on.
   private readonly uidumpPushed = new Map<string, Promise<string | undefined>>()
@@ -81,24 +89,31 @@ export class AdbWrapper {
   }
 
   async listDevices(): Promise<Device[]> {
-    const [avdNames, bootedMap] = await Promise.all([
+    const [avdNames, attached] = await Promise.all([
       this.runner.listAvds(),
-      this.getBootedAvdMap(),
+      this.getAttached(),
     ])
+    const bootedMap = attached.emulators
 
     // Sync serial map
+    const present = new Set<string>()
     for (const [serial, avdName] of bootedMap) {
       this.serialMap.set(`avd:${avdName}`, serial)
+      present.add(`avd:${avdName}`)
     }
-    // Remove stale serials (emulator was killed externally)
-    const bootedAvdNames = new Set(bootedMap.values())
-    for (const [avdId] of this.serialMap) {
-      if (!bootedAvdNames.has(avdId.replace('avd:', ''))) {
-        this.serialMap.delete(avdId)
-      }
+    for (const serial of attached.usb) {
+      this.serialMap.set(`usb:${serial}`, serial)
+      present.add(`usb:${serial}`)
+    }
+    // Remove stale serials (emulator was killed externally, phone unplugged)
+    for (const [id] of this.serialMap) {
+      if (!present.has(id)) this.serialMap.delete(id)
+    }
+    for (const serial of this.physicalInfo.keys()) {
+      if (!attached.usb.includes(serial)) this.physicalInfo.delete(serial)
     }
 
-    return this.describe(avdNames, bootedMap)
+    return this.describe(avdNames, attached)
   }
 
   /**
@@ -110,19 +125,19 @@ export class AdbWrapper {
     // Bounded, unlike the boot path: the watcher runs one read at a time, so a read stuck on a wedged emulator's
     // console or an offline device's shell would otherwise stop every later re-read for the life of the agent.
     const run = (...args: string[]) => this.runner.execBounded?.(PEEK_CALL_TIMEOUT_MS, ...args) ?? this.runner.exec(...args)
-    const [avdNames, bootedMap] = await Promise.all([
+    const [avdNames, attached] = await Promise.all([
       this.runner.listAvds(),
-      this.getBootedAvdMap(run),
+      this.getAttached(run),
     ])
-    return this.describe(avdNames, bootedMap, run)
+    return this.describe(avdNames, attached, run)
   }
 
   private async describe(
     avdNames: string[],
-    bootedMap: Map<string, string>,
+    attached: { emulators: Map<string, string>; usb: string[] },
     run: (...args: string[]) => Promise<string> = (...args) => this.runner.exec(...args),
   ): Promise<Device[]> {
-    const serialOf = new Map([...bootedMap].map(([serial, avdName]) => [avdName, serial]))
+    const serialOf = new Map([...attached.emulators].map(([serial, avdName]) => [avdName, serial]))
     const devices: Device[] = []
     for (const avdName of avdNames) {
       const avdId = `avd:${avdName}`
@@ -141,35 +156,105 @@ export class AdbWrapper {
         platform: 'android',
         status: isBooted ? 'booted' : 'shutdown',
         osVersion,
+        kind: 'emulator',
       })
     }
+
+    const phones = await Promise.all(attached.usb.map((serial) => this.describePhysical(serial, run)))
+    for (const phone of phones) if (phone) devices.push(phone)
 
     return devices
   }
 
-  private async getBootedAvdMap(
+  /**
+   * The emulators (serial → AVD name) and the USB-connected devices adb can drive. A device in any state but `device`
+   * cannot be driven; an unauthorized one is said once, since it is the one a person can fix from the phone. Network
+   * serials — `ip:port` and mDNS `adb-…._adb-tls-connect._tcp` — are left out: only USB is offered for now.
+   */
+  private async getAttached(
     run: (...args: string[]) => Promise<string> = (...args) => this.runner.exec(...args),
-  ): Promise<Map<string, string>> {
-    const result = new Map<string, string>()
+  ): Promise<{ emulators: Map<string, string>; usb: string[] }> {
+    const emulators = new Map<string, string>()
+    const usb: string[] = []
     try {
       const output = await run('devices')
-      const serials = output
+      const rows = output
         .split('\n')
         .slice(1)
-        .map((l) => l.split('\t'))
-        .filter(([serial, state]) => serial?.startsWith('emulator-') && state?.trim() === 'device')
-        .map(([serial]) => serial.trim())
+        .map((l) => l.trim().split(/\s+/))
+        .filter(([serial]) => Boolean(serial))
+      const serials: string[] = []
+      for (const [serial, state = '', ...rest] of rows) {
+        if (serial.startsWith('emulator-')) {
+          if (state === 'device') serials.push(serial)
+          continue
+        }
+        if (serial.includes(':') || /\._adb-tls-(connect|pairing)\._tcp\.?$/.test(serial)) continue
+        if (state === 'device') {
+          usb.push(serial)
+          this.unauthorizedWarned.delete(serial)
+        } else if ((state === 'unauthorized' || state === 'no') && !this.unauthorizedWarned.has(serial)) {
+          this.unauthorizedWarned.add(serial)
+          const why = state === 'no' ? `adb has ${[state, ...rest].join(' ')}` : 'authorize USB debugging on the phone'
+          logger.warn(`USB device ${serial} is not offered: ${why}, then reconnect the agent`)
+        }
+      }
 
       await Promise.all(
         serials.map(async (serial) => {
           const avdName = await run('-s', serial, 'emu', 'avd', 'name')
             .then((o) => o.split('\n')[0].trim())
             .catch(() => null)
-          if (avdName) result.set(serial, avdName)
+          if (avdName) emulators.set(serial, avdName)
         }),
       )
     } catch { /* adb server not running */ }
-    return result
+    return { emulators, usb }
+  }
+
+  /**
+   * A USB-connected device as listed: one shell round trip per serial, kept until it is unplugged. The name is the
+   * marketing name where the build has one, else the device name the phone shows in its own settings (Samsung sets
+   * that and no marketing name — a Galaxy Z Flip4 reads `SM-F721N` as its model), else the model.
+   */
+  private async describePhysical(
+    serial: string,
+    run: (...args: string[]) => Promise<string> = (...args) => this.runner.exec(...args),
+  ): Promise<Device | null> {
+    let info = this.physicalInfo.get(serial)
+    if (!info) {
+      const out = await run('-s', serial, 'shell',
+        'for p in ro.product.marketname ro.product.model ro.build.version.release ro.build.characteristics; ' +
+        'do echo "$p=$(getprop $p)"; done; echo "device_name=$(settings get global device_name)"',
+      ).catch((e: unknown) => {
+        logger.warn(`USB device ${serial}: cannot read its properties: ${(e as Error).message}`)
+        return null
+      })
+      if (out === null) return null
+      const props = new Map<string, string>()
+      for (const line of out.split('\n')) {
+        const eq = line.indexOf('=')
+        if (eq > 0) props.set(line.slice(0, eq), line.slice(eq + 1).trim())
+      }
+      const named = (key: string) => {
+        const v = props.get(key)
+        return v && v !== 'null' ? v : undefined
+      }
+      const release = named('ro.build.version.release')
+      info = {
+        name: named('ro.product.marketname') ?? named('device_name') ?? named('ro.product.model') ?? serial,
+        ...(release ? { osVersion: `Android ${release}` } : {}),
+        formFactor: (named('ro.build.characteristics') ?? '').split(',').includes('tablet') ? 'tablet' : 'phone',
+      }
+      this.physicalInfo.set(serial, info)
+    }
+    return {
+      id: `usb:${serial}`,
+      platform: 'android',
+      status: 'booted',
+      kind: 'physical',
+      ...info,
+    }
   }
 
   async getScreenSize(serial: string): Promise<{ width: number; height: number }> {
