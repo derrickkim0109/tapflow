@@ -1,0 +1,45 @@
+{
+  "info": {
+    "commandType": "devicectl.device.info.apps",
+    "jsonVersion": 3,
+    "outcome": "success",
+    "version": "506.7",
+    "arguments": [
+      "devicectl",
+      "device",
+      "info",
+      "apps",
+      "--device",
+      "00000000-0000000000000001",
+      "--bundle-id",
+      "com.example.app",
+      "--include-all-apps",
+      "-j",
+      "-",
+      "-q"
+    ]
+  },
+  "result": {
+    "apps": [
+      {
+        "appClip": false,
+        "builtByDeveloper": true,
+        "bundleIdentifier": "com.example.app",
+        "bundleVersion": "4",
+        "defaultApp": false,
+        "hidden": false,
+        "internalApp": false,
+        "name": "Example",
+        "removable": true,
+        "url": "file:///private/var/containers/Bundle/Application/00000000-0000-0000-0000-000000000001/Example.app/",
+        "version": "3.0.3"
+      }
+    ],
+    "defaultAppsIncluded": true,
+    "deviceIdentifier": "00000000-0000-0000-0000-00000000000A",
+    "hiddenAppsIncluded": true,
+    "internalAppsIncluded": true,
+    "matchingBundleIdentifier": "com.example.app",
+    "removableAppsIncluded": true
+  }
+}

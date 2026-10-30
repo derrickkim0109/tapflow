@@ -111,7 +111,7 @@ import { IOSAgent, leanSupported, streamRestartPlan } from '../IOSAgent'
 import type { DeviceChromeLoader, ChromeData } from '../DeviceChromeLoader'
 import { ScreenCaptureStreamer, type StreamFrame } from '../ScreenCaptureStreamer'
 import type { CaptureStreamer, PhysicalCaptureFactory } from '../CaptureStreamer'
-import { DevicectlWrapper } from '../DevicectlWrapper'
+import { DevicectlWrapper, type AppBundleInfo } from '../DevicectlWrapper'
 import type { Device } from '@tapflowio/agent-core'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
 import { enumerateSimPids } from '../SimProcessTree'
@@ -3998,10 +3998,10 @@ describe('IOSAgent', () => {
     }
 
     /** An agent with one simulator and `PHONE`, connected, recording everything it sends. */
-    async function connected(options: { capture?: PhysicalCaptureFactory | null } = {}) {
+    async function connected(options: { capture?: PhysicalCaptureFactory | null; devicectl?: DevicectlWrapper } = {}) {
       const simctl = mockSimctl(false)
       const capture = options.capture === null ? undefined : (options.capture ?? vi.fn(fakeCapture))
-      const agent = new IOSAgent({ intervalMs: 50, devicectl: devicectlWith([PHONE]), physicalCaptureFactory: capture }, simctl)
+      const agent = new IOSAgent({ intervalMs: 50, devicectl: options.devicectl ?? devicectlWith([PHONE]), physicalCaptureFactory: capture }, simctl)
       const internal = agent as unknown as Internals
       const sent: Sent[] = []
       const origOn = internal.sendOn.bind(agent)
@@ -4130,8 +4130,6 @@ describe('IOSAgent', () => {
     // Mutation: drop any one handler's `physicalRefusal` check — that message then reaches simctl with a hardware
     // UDID instead of answering with the reason.
     it.each([
-      { type: 'app:install', payload: { filePath: '/tmp/x.app' }, reply: 'app:install-error', message: /Installing a build/, call: 'installApp' },
-      { type: 'app:launch', payload: { bundleId: 'com.example.app' }, reply: 'app:launch-error', message: /Launching an app/, call: 'launchApp' },
       { type: 'app:clear-state', payload: { bundleId: 'com.example.app' }, reply: 'app:clear-state-error', message: /Clearing app data/, call: 'clearAppData' },
       { type: 'clipboard:read', payload: {}, reply: 'clipboard:error', message: /clipboard is not available/, call: 'getPasteboard' },
       { type: 'clipboard:write', payload: { text: 'x' }, reply: 'clipboard:error', message: /clipboard is not available/, call: 'setPasteboard' },
@@ -4146,6 +4144,107 @@ describe('IOSAgent', () => {
       expect(ctx.sent.find((m) => m.type === reply)?.message).toMatch(message)
       expect(ctx.simctl[call]).not.toHaveBeenCalled()
       ctx.agent.disconnect()
+    })
+
+    // A phone installs and launches through devicectl, never simctl. The devicectl half is scripted; what it runs is
+    // DevicectlWrapper's tests'.
+    describe('installing and launching on a phone', () => {
+      const devicectlFor = (info: AppBundleInfo, installed = false) => ({
+        listPhysicalDevices: vi.fn().mockResolvedValue([PHONE]),
+        appBundleInfo: vi.fn().mockResolvedValue(info),
+        isAppInstalled: vi.fn().mockResolvedValue(installed),
+        installApp: vi.fn().mockResolvedValue(undefined),
+        uninstallApp: vi.fn().mockResolvedValue(undefined),
+        launchApp: vi.fn().mockResolvedValue(undefined),
+      })
+      const ipa = (): string => {
+        const src = fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-ipa-src-'))
+        fs.mkdirSync(path.join(src, 'Payload', 'Example.app'), { recursive: true })
+        fs.writeFileSync(path.join(src, 'Payload', 'Example.app', 'Info.plist'), '<plist><dict/></plist>')
+        const out = path.join(src, 'Example.ipa')
+        spawnSync('zip', ['-r', out, 'Payload'], { cwd: src })
+        return out
+      }
+      async function phoneWith(devicectl: ReturnType<typeof devicectlFor>) {
+        const ctx = await connected({ devicectl: devicectl as unknown as DevicectlWrapper })
+        ctx.deliver({ type: 'device:boot', requestId: 'rq-phone', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+        await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:ready')).toBe(true))
+        return ctx
+      }
+      async function reply(ctx: Awaited<ReturnType<typeof phoneWith>>, msg: Record<string, unknown>, prefix: string) {
+        ctx.deliver({ ...msg, requestId: `rq-${prefix}`, sessionId: ctx.phoneSession })
+        await vi.waitFor(() => expect(ctx.sent.some((m) => m.type.startsWith(`${prefix}-`))).toBe(true))
+        return ctx.sent.find((m) => m.type.startsWith(`${prefix}-`))!
+      }
+
+      // Mutations: skip the Payload/ lookup (an .ipa reads as "no .app"), or install through simctl.
+      it('installs an .ipa clean, through devicectl', async () => {
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'device' })
+        const ctx = await phoneWith(devicectl)
+        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: ipa(), bundleId: 'com.example.app' } }, 'app:install')
+        expect(answer.type).toBe('app:install-done')
+        expect(devicectl.uninstallApp).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
+        expect(devicectl.installApp).toHaveBeenCalledWith(PHONE.id, expect.stringMatching(/Payload\/Example\.app$/))
+        expect(devicectl.uninstallApp.mock.invocationCallOrder[0]).toBeLessThan(devicectl.installApp.mock.invocationCallOrder[0]!)
+        expect(ctx.simctl.installApp).not.toHaveBeenCalled()
+        ctx.agent.disconnect()
+      })
+
+      // Mutation: uninstall whatever the build is. A bundle whose Info.plist could not be read may still be refused,
+      // and the tester would lose the copy they had.
+      it('keeps the installed copy when it cannot tell what the build is for', async () => {
+        const devicectl = devicectlFor({ platform: 'unknown' })
+        const ctx = await phoneWith(devicectl)
+        await reply(ctx, { type: 'app:install', payload: { filePath: ipa(), bundleId: 'com.example.app' } }, 'app:install')
+        expect(devicectl.uninstallApp).not.toHaveBeenCalled()
+        expect(devicectl.installApp).toHaveBeenCalled()
+        ctx.agent.disconnect()
+      })
+
+      // Mutation: install a simulator build anyway — devicectl refuses it, after the clean install removed the
+      // TestFlight copy the tester was going to use.
+      it('uses the copy already on the phone for a simulator build', async () => {
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'simulator' }, true)
+        const ctx = await phoneWith(devicectl)
+        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: '/builds/Example.app', bundleId: 'com.example.app' } }, 'app:install')
+        expect(answer.type).toBe('app:install-done')
+        expect(devicectl.isAppInstalled).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
+        expect(devicectl.installApp).not.toHaveBeenCalled()
+        expect(devicectl.uninstallApp).not.toHaveBeenCalled()
+        ctx.agent.disconnect()
+      })
+
+      // Mutation: answer done whatever the check said. A run would then go on against an app that is not there.
+      it('asks for a device build when a simulator build\'s app is not on the phone', async () => {
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'simulator' }, false)
+        const ctx = await phoneWith(devicectl)
+        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: '/builds/Example.app' } }, 'app:install')
+        expect(answer.type).toBe('app:install-error')
+        expect(answer.message).toMatch(/Install com\.example\.app on the phone first .*device build \(\.ipa\)/)
+        ctx.agent.disconnect()
+      })
+
+      // Mutations: launch through simctl, or forget the bundle id — the tree reader and typing would then not know
+      // which app is in front.
+      it('launches through devicectl and remembers the app in front', async () => {
+        const devicectl = devicectlFor({ platform: 'device' })
+        const ctx = await phoneWith(devicectl)
+        const answer = await reply(ctx, { type: 'app:launch', payload: { bundleId: 'com.example.app', arguments: { Mode: 'qa' } } }, 'app:launch')
+        expect(answer).toMatchObject({ type: 'app:launch-done', applied: { arguments: ['Mode'] } })
+        expect(devicectl.launchApp).toHaveBeenCalledWith(PHONE.id, 'com.example.app', { arguments: { Mode: 'qa' } })
+        expect(ctx.simctl.launchApp).not.toHaveBeenCalled()
+        expect((ctx.agent as unknown as { lastBundleIds: Map<string, string> }).lastBundleIds.get(PHONE.id)).toBe('com.example.app')
+        ctx.agent.disconnect()
+      })
+
+      it('answers a failed launch with devicectl\'s reason', async () => {
+        const devicectl = devicectlFor({ platform: 'device' })
+        devicectl.launchApp.mockRejectedValue(new Error('could not launch com.example.app: the app is not installed'))
+        const ctx = await phoneWith(devicectl)
+        const answer = await reply(ctx, { type: 'app:launch', payload: { bundleId: 'com.example.app' } }, 'app:launch')
+        expect(answer).toMatchObject({ type: 'app:launch-error', message: 'could not launch com.example.app: the app is not installed' })
+        ctx.agent.disconnect()
+      })
     })
 
     // Mutation: drop the guard in `input:rotate` — `simctl io … rotate` runs against a hardware UDID.
