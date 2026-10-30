@@ -5,15 +5,16 @@ import { createLogger, type Device } from '@tapflowio/agent-core'
 const logger = createLogger('ios-agent:devicectl')
 const execFileAsync = promisify(execFile)
 
-// One `devicectl list devices` measured 0.22–0.72 s with ten paired devices (Xcode 26.3); a hung CoreDevice daemon
-// must not hold up the simulator list it is merged into.
-const LIST_TIMEOUT_MS = 15_000
+// The default ceiling on one devicectl call. A list merged into the simulators' holds them up for as long as it
+// takes, so a caller someone is waiting on passes a shorter one (a boot passes 3 s); one `devicectl list devices`
+// measured 0.22–0.72 s with ten paired devices (Xcode 26.3).
+const DEFAULT_TIMEOUT_MS = 15_000
 
-/** Runs `xcrun <args>` and resolves with its stdout. */
-export type XcrunExec = (args: string[]) => Promise<string>
+/** Runs `xcrun <args>` and resolves with its stdout; rejects with the exit status and stderr on failure. */
+export type XcrunExec = (args: string[], timeoutMs?: number) => Promise<string>
 
-const defaultExec: XcrunExec = async (args) =>
-  (await execFileAsync('xcrun', args, { timeout: LIST_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 })).stdout
+const defaultExec: XcrunExec = async (args, timeoutMs) =>
+  (await execFileAsync('xcrun', args, { timeout: timeoutMs ?? DEFAULT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 })).stdout
 
 type Obj = Record<string, unknown>
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -59,10 +60,12 @@ export class DevicectlWrapper {
   constructor(private readonly exec: XcrunExec = defaultExec) {}
 
   /** USB-connected iPhones and iPads (see `parsePhysicalDevices`). **Never rejects**: a Mac whose devicectl is
-   *  missing or failing still has its simulators to offer, and this list is merged into theirs. */
-  async listPhysicalDevices(): Promise<Device[]> {
+   *  missing, failing or slower than `timeoutMs` still has its simulators to offer, and this list is merged into
+   *  theirs. */
+  async listPhysicalDevices(timeoutMs?: number): Promise<Device[]> {
+    const args = ['devicectl', 'list', 'devices', '-j', '-', '-q']
     try {
-      return parsePhysicalDevices(JSON.parse(await this.exec(['devicectl', 'list', 'devices', '-j', '-', '-q'])))
+      return parsePhysicalDevices(JSON.parse(await (timeoutMs === undefined ? this.exec(args) : this.exec(args, timeoutMs))))
     } catch (e) {
       logger.warn(`physical devices unavailable: ${e instanceof Error ? e.message : String(e)}`)
       return []
