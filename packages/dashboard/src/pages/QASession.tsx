@@ -283,9 +283,11 @@ export function QASession() {
                     // **Says who is driving an AI-held device, and offers no way in.** Watching an AI session
                     // is for the person who started it, through the link their coding agent hands them; the
                     // device list only explains why the device is taken.
+                    const isPhysical = d.kind === 'physical'
+                    // A phone on the desk is connected rather than booted: nothing starts it, and it stays on when the session ends.
                     const statusLabel = isBusy
                       ? (d.holder ? `${holderKindLabel(d.holder.kind)} is driving it` : 'In use')
-                      : needsMemory ? 'Not enough memory to start' : isBooted ? 'Booted' : 'Available'
+                      : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
                     const statusDot = isBusy
                       ? 'bg-amber-400'
                       : isBooted
@@ -301,7 +303,12 @@ export function QASession() {
                           'hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50',
                         )}
                       >
-                        <span className="text-sm font-medium leading-tight">{d.name}</span>
+                        <span className="flex items-center gap-2">
+                          <span className="text-sm font-medium leading-tight">{d.name}</span>
+                          {isPhysical && (
+                            <span className="rounded border px-1 text-[10px] font-medium text-muted-foreground">USB</span>
+                          )}
+                        </span>
                         {d.osVersion && (
                           <span className="font-mono text-xs text-muted-foreground">{d.osVersion}</span>
                         )}
@@ -335,6 +342,7 @@ export function QASession() {
                     const res = s.resources
                     const isStale = res ? Date.now() - res.reportedAt > RESOURCE_STALE_MS : false // eslint-disable-line react-hooks/purity
                     const deviceCount = s.devices.filter((d) => d.platform === os).length
+                    const usbCount = s.devices.filter((d) => d.platform === os && d.kind === 'physical').length
                     const cpuPercent = res?.cpuPercent ?? 0
                     const memPercent = res ? (res.memUsedMB / res.memTotalMB) * 100 : 0
                     // The dot and bars show the readings; whether the Mac takes a new session is the relay's call, which
@@ -374,6 +382,12 @@ export function QASession() {
                                 </div>
                                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                   <span>{deviceCount} device{deviceCount !== 1 ? 's' : ''}</span>
+                                  {usbCount > 0 && (
+                                    <>
+                                      <span>·</span>
+                                      <span>{usbCount} USB</span>
+                                    </>
+                                  )}
                                   {res && (
                                     <>
                                       <span>·</span>
