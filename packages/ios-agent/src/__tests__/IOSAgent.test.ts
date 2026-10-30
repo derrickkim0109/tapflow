@@ -4161,7 +4161,7 @@ describe('IOSAgent', () => {
       { type: 'clipboard:read', payload: {}, reply: 'clipboard:error', message: /clipboard is not available/, call: 'getPasteboard' },
       { type: 'clipboard:write', payload: { text: 'x' }, reply: 'clipboard:error', message: /clipboard is not available/, call: 'setPasteboard' },
       // No pasteboard on a phone: `input:type` goes to its runner, and with no runner channel it is refused as input.
-      { type: 'input:type', payload: { text: 'x' }, reply: 'input:type-error', message: /Input on a USB-connected device/, call: 'setPasteboard' },
+      { type: 'input:type', payload: { text: 'x' }, reply: 'input:type-error', message: /UI-test runner on this USB-connected device is not ready/, call: 'setPasteboard' },
       { type: 'network:set', payload: { offline: true }, reply: 'network:error', message: /Network control is not available/, call: 'setSimulatorEnv' },
       { type: 'open-url', payload: { url: 'https://example.com' }, reply: 'open-url:error', message: /Opening a URL/, call: 'openUrl' },
       { type: 'screenshot:request', payload: {}, reply: 'screenshot:error', message: /Screenshots of a USB-connected device/, call: 'screenshot' },
@@ -4287,8 +4287,8 @@ describe('IOSAgent', () => {
       ctx.agent.disconnect()
     })
 
-    // Mutation: drop the guard in `input:rotate` — `simctl io … rotate` runs against a hardware UDID.
-    it('does not rotate a USB-connected device', async () => {
+    // Mutation: drop the guard in `input:rotate` or `input:keyboard:toggle` — simctl runs against a hardware UDID.
+    it('does not rotate a USB-connected device or toggle its keyboard', async () => {
       const ctx = await bootPhone()
       ctx.deliver({ type: 'input:rotate', sessionId: ctx.phoneSession, payload: { direction: 'clockwise' } })
       ctx.deliver({ type: 'input:keyboard:toggle', sessionId: ctx.phoneSession })
@@ -4300,7 +4300,7 @@ describe('IOSAgent', () => {
 
     // Mutation: hand a physical device a `TouchHelper` in `createInputChannel`, or drop the `UnavailableInput` check
     // in `refusalReason` — input then either drives a simulator or answers "reconnect", which never helps.
-    it('answers input on a USB-connected device with "not available yet"', async () => {
+    it('answers input on a USB-connected device without a runner with "the runner is not ready"', async () => {
       const ctx = await bootPhone()
       ctx.deliver({ type: 'input:touch:start', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
       ctx.deliver({ type: 'input:touch:end', requestId: 'rq-tap', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
@@ -4308,7 +4308,7 @@ describe('IOSAgent', () => {
       await vi.waitFor(() => expect(ctx.sent.filter((m) => m.type === 'input:error')).toHaveLength(2))
       for (const e of ctx.sent.filter((m) => m.type === 'input:error')) {
         expect(e.reason).toBe('unsupported')
-        expect(e.message).toMatch(/Input on a USB-connected device is not available in this build yet/)
+        expect(e.message).toMatch(/The UI-test runner on this USB-connected device is not ready/)
       }
       expect(MockTouchHelper).not.toHaveBeenCalledWith(PHONE.id)
       ctx.agent.disconnect()

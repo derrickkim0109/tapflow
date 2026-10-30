@@ -49,9 +49,10 @@ const INPUT_ERROR_MESSAGES: Record<InputErrorReason, string> = {
 const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
 
 /**
- * What a USB-connected iPhone or iPad cannot do yet, and what the requester is told. Each is a simctl-only path —
- * run against a hardware UDID it would fail with xcrun's noise at best — so it is refused up front, through the
- * reply that message type already uses for a failure.
+ * What a USB-connected iPhone or iPad cannot do yet, and what the requester is told. Each would otherwise reach a
+ * simctl-only path — run against a hardware UDID it would fail with xcrun's noise at best — so it is refused up
+ * front, through the reply that message type already uses for a failure. `input` is the exception: input on a phone
+ * goes through its UI-test runner, and this is what a write is told while that runner is not ready.
  */
 const PHYSICAL_REFUSALS = {
   'full-erase': 'Full reset is not available on a USB-connected device',
@@ -62,7 +63,8 @@ const PHYSICAL_REFUSALS = {
   rotation: 'Rotation is not available on a USB-connected device yet',
   'open-url': 'Opening a URL on a USB-connected device is not supported yet',
   screenshot: 'Screenshots of a USB-connected device are not supported yet',
-  input: 'Input on a USB-connected device is not available in this build yet',
+  input: 'The UI-test runner on this USB-connected device is not ready — it is still starting, or its last start failed (see the agent log); retry in a moment',
+  keyboard: 'The software keyboard cannot be shown or hidden on a USB-connected device',
 } as const
 type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
 
@@ -254,14 +256,15 @@ interface DeviceState {
   /** Seqs held by a `handleDeviceBoot` that has not returned yet. */
   bootsInFlight: Set<number>
   deviceId: string
-  /** The device's input channel — `TouchHelper` or `FoldableInput`, chosen in `createInputChannel` only. */
+  /** The device's input channel, chosen in `createInputChannel` only: `TouchHelper` or `FoldableInput` for a
+   *  simulator, `XCUITestInput` (its UI-test runner) for a USB-connected device. */
   touchHelper: InputChannel | null
-  // Device-booted flag for truthful input acks — set on device:boot, cleared on shutdown; false after a reconnect until the ack path re-verifies once via simctl.
+  // Device-booted flag for truthful input acks — set on device:boot, cleared on shutdown; false after a reconnect until the ack path re-verifies once (simctl, or devicectl for a USB-connected device).
   booted: boolean
   streamWs: WebSocket | null
   streamReader: ReadableStreamDefaultReader<StreamFrame> | null
-  // Current capture streamer (ScreenCaptureStreamer path only) — lets the relay
-  // request an on-demand IDR for drop-to-keyframe recovery. null on the MjpegStreamer path.
+  // Current capture streamer (ScreenCaptureStreamer, or DeviceCaptureStreamer for a USB-connected device) — lets the
+  // relay request an on-demand IDR for drop-to-keyframe recovery. null on the MjpegStreamer path.
   captureStreamer: CaptureStreamer | null
   bootSeq: number
   loadedChrome: ChromeData | null
@@ -2245,7 +2248,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       case 'input:keyboard:toggle': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
-        const keyboardRefusal = this.physicalRefusal(state.deviceId, 'input')
+        const keyboardRefusal = this.physicalRefusal(state.deviceId, 'keyboard')
         if (keyboardRefusal) { logger.warn(`keyboard toggle ${state.deviceId}: ${keyboardRefusal}`); break }
         const showing = !state.softKeyboardVisible
         const op = showing
@@ -2897,7 +2900,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     throw new ValidationError('.app 디렉토리를 찾을 수 없습니다. iphonesimulator 로 빌드한 .app 을 .app.zip 또는 .tar.gz 로 업로드하세요.')
   }
 
-  // DeviceAgent interface — delegate to SimctlWrapper
+  // DeviceAgent interface — SimctlWrapper for a simulator, devicectl (or nothing) for a USB-connected device
   listDevices(): Promise<Device[]> { return this.listAllDevices() }
   // A USB-connected device is on whenever it is listed, and is not tapflow's to power off.
   boot(deviceId: string): Promise<void> { return this.isPhysical(deviceId) ? Promise.resolve() : this.simctl.boot(deviceId) }
