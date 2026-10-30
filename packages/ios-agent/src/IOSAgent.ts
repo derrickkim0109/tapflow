@@ -45,6 +45,9 @@ const INPUT_ERROR_MESSAGES: Record<InputErrorReason, string> = {
   'not-session-owner': 'this input was addressed to a session the sender does not hold',
 }
 
+// A devicectl list answers in under a second (see `DevicectlWrapper`); a boot does not wait longer for a stuck one.
+const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
+
 /**
  * What a USB-connected iPhone or iPad cannot do yet, and what the requester is told. Each is a simctl-only path —
  * run against a hardware UDID it would fail with xcrun's noise at best — so it is refused up front, through the
@@ -504,15 +507,10 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     return this.connectOnce(relayUrl)
   }
 
-  /**
-   * `listTimeoutMs` is set only by the reconnect loop. `simctl list` is left unbounded elsewhere on purpose
-   * (see `SimctlWrapper.listDevices`), but here a hang has a worse outcome than a failure: the attempt never
-   * settles, `_scheduleReconnect` is never reached, and the agent stays offline with nothing in its output
-   * even after CoreSimulator recovers. A bounded attempt fails and the loop tries again.
-   */
-  /** The simulators, marked as such, and the USB-connected devices. A devicectl that fails costs only its own devices. */
-  private async listAllDevices(listTimeoutMs?: number): Promise<Device[]> {
-    const [simulators, physical] = await Promise.all([this.simctl.listDevices(listTimeoutMs), this.devicectl.listPhysicalDevices()])
+  /** The simulators, marked as such, and the USB-connected devices. A devicectl that fails costs only its own devices;
+   *  `devicectlTimeoutMs` bounds how long a slow one can hold up the simulators (default: devicectl's own 15 s). */
+  private async listAllDevices(listTimeoutMs?: number, devicectlTimeoutMs?: number): Promise<Device[]> {
+    const [simulators, physical] = await Promise.all([this.simctl.listDevices(listTimeoutMs), this.devicectl.listPhysicalDevices(devicectlTimeoutMs)])
     for (const d of physical) this.physicalDevices.add(d.id)
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
   }
@@ -532,6 +530,13 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     if (refusal) throw new PlatformError(refusal)
   }
 
+  /**
+   * `listTimeoutMs` is set only by the reconnect loop. `simctl list` is left unbounded elsewhere on purpose
+   * (see `SimctlWrapper.listDevices`), but here a hang has a worse outcome than a failure: the attempt never
+   * settles, `_scheduleReconnect` is never reached, and the agent stays offline with nothing in its output
+   * even after CoreSimulator recovers. A bounded attempt fails and the loop tries again. devicectl is bounded
+   * on its own (see `DevicectlWrapper`), so this registers every device, a USB-connected one included.
+   */
   private async connectOnce(relayUrl: string, listTimeoutMs?: number): Promise<void> {
     this._stopping = false
     // Paired with the `dispose()` in `disconnect()`. This method is public and reuses the network, so
@@ -1155,7 +1160,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       state.streamWs = null
 
       this.sendOn(ws, { type: 'device:booting', sessionId })
-      const devices = await this.listAllDevices()
+      // Every boot, a simulator's too, waits on this list, so a hung devicectl gets seconds rather than its default.
+      const devices = await this.listAllDevices(undefined, BOOT_DEVICECTL_TIMEOUT_MS)
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
 
       const target = devices.find((d) => d.id === deviceId)
