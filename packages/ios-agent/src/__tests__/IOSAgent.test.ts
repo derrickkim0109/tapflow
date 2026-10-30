@@ -109,7 +109,10 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { RelayServer, initDb, closeDb, getDb } from '@tapflowio/relay'
 import { IOSAgent, leanSupported, streamRestartPlan } from '../IOSAgent'
 import type { DeviceChromeLoader, ChromeData } from '../DeviceChromeLoader'
-import { ScreenCaptureStreamer } from '../ScreenCaptureStreamer'
+import { ScreenCaptureStreamer, type StreamFrame } from '../ScreenCaptureStreamer'
+import type { CaptureStreamer, PhysicalCaptureFactory } from '../CaptureStreamer'
+import { DevicectlWrapper } from '../DevicectlWrapper'
+import type { Device } from '@tapflowio/agent-core'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
 import { enumerateSimPids } from '../SimProcessTree'
 import { launchAudioHelper } from '@tapflowio/audiotap-helper'
@@ -3969,6 +3972,204 @@ describe('IOSAgent', () => {
 
       agent.disconnect()
       browser.close()
+    })
+  })
+
+  // A USB-connected iPhone sits in the same list as the simulators, but every simctl step is wrong for it: there is
+  // nothing to boot or erase, and a hardware UDID handed to a simulator path either fails noisily or drives a simulator.
+  describe('USB-connected devices', () => {
+    const PHONE: Device = {
+      id: '00008110-000A1B2C3D4E5F60', name: 'Test iPhone', platform: 'ios', status: 'booted',
+      osVersion: 'iOS 26.1', formFactor: 'phone', kind: 'physical',
+    }
+    const devicectlWith = (devices: Device[]): DevicectlWrapper =>
+      ({ listPhysicalDevices: vi.fn().mockResolvedValue(devices) }) as unknown as DevicectlWrapper
+    const fakeCapture = (): CaptureStreamer => ({
+      start: () => new ReadableStream<StreamFrame>({ start() {} }),
+      requestKeyframe: vi.fn(),
+      selectPanel: vi.fn(),
+    })
+    type Sent = { type: string; message?: string; reason?: string; payload?: unknown }
+    type Internals = {
+      sendOn(ws: unknown, m: unknown): void
+      sendMsg(m: unknown): void
+      handleRelayMessage(msg: Record<string, unknown>): void
+      deviceStates: Map<string, { deviceId: string }>
+    }
+
+    /** An agent with one simulator and `PHONE`, connected, recording everything it sends. */
+    async function connected(options: { capture?: PhysicalCaptureFactory | null } = {}) {
+      const simctl = mockSimctl(false)
+      const capture = options.capture === null ? undefined : (options.capture ?? vi.fn(fakeCapture))
+      const agent = new IOSAgent({ intervalMs: 50, devicectl: devicectlWith([PHONE]), physicalCaptureFactory: capture }, simctl)
+      const internal = agent as unknown as Internals
+      const sent: Sent[] = []
+      const origOn = internal.sendOn.bind(agent)
+      internal.sendOn = (ws, m) => { sent.push(m as Sent); origOn(ws, m) }
+      const origMsg = internal.sendMsg.bind(agent)
+      internal.sendMsg = (m) => { sent.push(m as Sent); origMsg(m) }
+      await agent.connect(`ws://localhost:${port}`)
+      const phoneSession = [...internal.deviceStates.entries()].find(([, s]) => s.deviceId === PHONE.id)![0]
+      const deliver = (msg: Record<string, unknown>) => internal.handleRelayMessage(msg)
+      return { agent, simctl, capture, sent, phoneSession, deliver }
+    }
+
+    async function bootPhone(payload: Record<string, unknown> = {}) {
+      const ctx = await connected()
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-phone', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id, ...payload } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:ready' || m.type === 'device:boot-error')).toBe(true))
+      return ctx
+    }
+
+    // Mutation: drop `kind` from the register literal (or the `kind: 'simulator'` stamp in `listAllDevices`) — the
+    // dashboard's USB badge and the relay's device kind then read nothing.
+    it('registers the USB-connected device as physical and each simulator as a simulator', async () => {
+      const { agent, sent } = await connected()
+      const register = sent.find((m) => m.type === 'agent:register') as unknown as { devices: Array<{ id: string; kind?: string; formFactor?: string; serviceTier?: unknown }> }
+      expect(register.devices.map((d) => [d.id, d.kind])).toEqual([['dev-1', 'simulator'], [PHONE.id, 'physical']])
+      expect(register.devices[1].formFactor).toBe('phone')
+      expect(register.devices[1].serviceTier).toBe('unsupported')
+      agent.disconnect()
+    })
+
+    // Mutation: let a devicectl failure propagate out of the list (e.g. `Promise.all` over a rejecting call) — the
+    // whole Mac then drops out of the relay over a missing USB cable.
+    it('still registers the simulators when devicectl fails', async () => {
+      const failing = new DevicectlWrapper(() => Promise.reject(new Error('devicectl not found')))
+      const sent: Sent[] = []
+      const agent = new IOSAgent({ devicectl: failing }, mockSimctl(false))
+      const internal = agent as unknown as Internals
+      const orig = internal.sendOn.bind(agent)
+      internal.sendOn = (ws, m) => { sent.push(m as Sent); orig(ws, m) }
+      await agent.connect(`ws://localhost:${port}`)
+      const register = sent.find((m) => m.type === 'agent:register') as unknown as { devices: Array<{ id: string; kind?: string }> }
+      expect(register.devices).toEqual([expect.objectContaining({ id: 'dev-1', kind: 'simulator' })])
+      agent.disconnect()
+    })
+
+    // Mutation: drop `deviceFilter` from the merged list — a filter naming one simulator would expose the phone too.
+    it('applies deviceFilter to the USB-connected devices as well', async () => {
+      const sent: Sent[] = []
+      const agent = new IOSAgent({ deviceFilter: 'iPhone 15', devicectl: devicectlWith([PHONE]) }, mockSimctl(false))
+      const internal = agent as unknown as Internals
+      const orig = internal.sendOn.bind(agent)
+      internal.sendOn = (ws, m) => { sent.push(m as Sent); orig(ws, m) }
+      await agent.connect(`ws://localhost:${port}`)
+      const register = sent.find((m) => m.type === 'agent:register') as unknown as { devices: Array<{ id: string }> }
+      expect(register.devices.map((d) => d.id)).toEqual(['dev-1'])
+      agent.disconnect()
+    })
+
+    // Mutation: drop the `kind === 'physical'` branch in `handleDeviceBoot` — the boot then runs `simctl boot` and
+    // waits for a simulator that does not exist, and (with `intervalMs`) streams `simctl screenshot` of nothing.
+    it('boots a USB-connected device without simctl and streams it through the physical capture', async () => {
+      MockTouchHelper.mockClear()
+      const { agent, simctl, capture, sent } = await bootPhone()
+      const ready = sent.find((m) => m.type === 'device:ready')
+      expect(ready?.payload).toEqual({ deviceId: PHONE.id, cold: false, serviceTier: 'unsupported' })
+      expect(capture).toHaveBeenCalledWith(PHONE.id, 30, 'jpeg', expect.any(Number))
+      expect(simctl.boot).not.toHaveBeenCalled()
+      expect(simctl.erase).not.toHaveBeenCalled()
+      expect(simctl.waitUntilBooted).not.toHaveBeenCalled()
+      expect(simctl.rotate).not.toHaveBeenCalled()
+      expect(simctl.syncKeyboardsFromLanguages).not.toHaveBeenCalled()
+      // The input channel is not the simulator's (`createInputChannel`'s physical branch).
+      expect(MockTouchHelper).not.toHaveBeenCalled()
+      agent.disconnect()
+    })
+
+    // Mutation: default the factory to `ScreenCaptureStreamer` — a physical boot would then stream a simulator path.
+    it('fails the boot, saying why, while this build has no physical capture', async () => {
+      const ctx = await connected({ capture: null })
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-nocap', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:boot-error')).toBe(true))
+      expect(ctx.sent.find((m) => m.type === 'device:boot-error')?.message).toMatch(/Physical iPhone screen capture is not available in this build/)
+      expect(ctx.sent.some((m) => m.type === 'device:ready')).toBe(false)
+      expect(vi.mocked(ScreenCaptureStreamer)).not.toHaveBeenCalledWith(PHONE.id, expect.anything(), expect.anything(), expect.anything(), expect.anything())
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: remove either refusal in `bootPhysical` — a Full reset or a run reset would answer ready having done
+    // none of what it promised.
+    it.each([
+      { name: 'Full reset', payload: { resetMode: 'full-erase' }, message: /Full reset is not available/ },
+      { name: 'a run reset', payload: { runReset: { uninstall: [], clear: [] } }, message: /run reset is not available/ },
+    ])('refuses $name on a USB-connected device', async ({ payload, message }) => {
+      const { agent, simctl, sent } = await bootPhone(payload)
+      expect(sent.find((m) => m.type === 'device:boot-error')?.message).toMatch(message)
+      expect(simctl.erase).not.toHaveBeenCalled()
+      expect(simctl.shutdown).not.toHaveBeenCalled()
+      agent.disconnect()
+    })
+
+    // Mutation: drop the physical branch in `handleDeviceShutdown` — `simctl shutdown` runs against a hardware UDID
+    // and the session answers `shutdown-error`.
+    it('ends a USB-connected device\'s session without simctl shutdown', async () => {
+      const ctx = await bootPhone()
+      ctx.deliver({ type: 'device:shutdown', requestId: 'rq-off', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:shutdown-done')).toBe(true))
+      expect(ctx.simctl.shutdown).not.toHaveBeenCalled()
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: drop any one handler's `physicalRefusal` check — that message then reaches simctl with a hardware
+    // UDID instead of answering with the reason.
+    it.each([
+      { type: 'app:install', payload: { filePath: '/tmp/x.app' }, reply: 'app:install-error', message: /Installing a build/, call: 'installApp' },
+      { type: 'app:launch', payload: { bundleId: 'com.example.app' }, reply: 'app:launch-error', message: /Launching an app/, call: 'launchApp' },
+      { type: 'app:clear-state', payload: { bundleId: 'com.example.app' }, reply: 'app:clear-state-error', message: /Clearing app data/, call: 'clearAppData' },
+      { type: 'clipboard:read', payload: {}, reply: 'clipboard:error', message: /clipboard is not available/, call: 'getPasteboard' },
+      { type: 'clipboard:write', payload: { text: 'x' }, reply: 'clipboard:error', message: /clipboard is not available/, call: 'setPasteboard' },
+      { type: 'input:type', payload: { text: 'x' }, reply: 'input:type-error', message: /clipboard is not available/, call: 'setPasteboard' },
+      { type: 'network:set', payload: { offline: true }, reply: 'network:error', message: /Network control is not available/, call: 'setSimulatorEnv' },
+      { type: 'open-url', payload: { url: 'https://example.com' }, reply: 'open-url:error', message: /Opening a URL/, call: 'openUrl' },
+      { type: 'screenshot:request', payload: {}, reply: 'screenshot:error', message: /Screenshots of a USB-connected device/, call: 'screenshot' },
+    ] as const)('refuses $type on a USB-connected device', async ({ type, payload, reply, message, call }) => {
+      const ctx = await bootPhone()
+      ctx.deliver({ type, requestId: `rq-${type}`, sessionId: ctx.phoneSession, payload })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === reply)).toBe(true))
+      expect(ctx.sent.find((m) => m.type === reply)?.message).toMatch(message)
+      expect(ctx.simctl[call]).not.toHaveBeenCalled()
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: drop the guard in `input:rotate` — `simctl io … rotate` runs against a hardware UDID.
+    it('does not rotate a USB-connected device', async () => {
+      const ctx = await bootPhone()
+      ctx.deliver({ type: 'input:rotate', sessionId: ctx.phoneSession, payload: { direction: 'clockwise' } })
+      ctx.deliver({ type: 'input:keyboard:toggle', sessionId: ctx.phoneSession })
+      // Both handlers return synchronously on the refusal, so nothing can reach simctl after this point.
+      expect(ctx.simctl.rotate).not.toHaveBeenCalled()
+      expect(ctx.simctl.showSoftwareKeyboard).not.toHaveBeenCalled()
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: hand a physical device a `TouchHelper` in `createInputChannel`, or drop the `UnavailableInput` check
+    // in `refusalReason` — input then either drives a simulator or answers "reconnect", which never helps.
+    it('answers input on a USB-connected device with "not available yet"', async () => {
+      const ctx = await bootPhone()
+      ctx.deliver({ type: 'input:touch:start', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
+      ctx.deliver({ type: 'input:touch:end', requestId: 'rq-tap', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
+      ctx.deliver({ type: 'input:key', requestId: 'rq-key', sessionId: ctx.phoneSession, payload: { code: 'KeyA' } })
+      await vi.waitFor(() => expect(ctx.sent.filter((m) => m.type === 'input:error')).toHaveLength(2))
+      for (const e of ctx.sent.filter((m) => m.type === 'input:error')) {
+        expect(e.reason).toBe('unsupported')
+        expect(e.message).toMatch(/Input on a USB-connected device is not available in this build yet/)
+      }
+      expect(MockTouchHelper).not.toHaveBeenCalledWith(PHONE.id)
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: route the `DeviceAgent` delegates to simctl alone — the MCP server's `list_devices` would miss the
+    // phone, and its `boot`/`shutdown` would hand a hardware UDID to simctl.
+    it('the DeviceAgent delegates list the phone and never pass it to simctl', async () => {
+      const simctl = mockSimctl(false)
+      const agent = new IOSAgent({ devicectl: devicectlWith([PHONE]) }, simctl)
+      expect((await agent.listDevices()).map((d) => [d.id, d.kind])).toEqual([['dev-1', 'simulator'], [PHONE.id, 'physical']])
+      await agent.boot(PHONE.id)
+      await agent.shutdown(PHONE.id)
+      expect(simctl.boot).not.toHaveBeenCalled()
+      expect(simctl.shutdown).not.toHaveBeenCalled()
     })
   })
 
