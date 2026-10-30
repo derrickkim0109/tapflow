@@ -45,6 +45,30 @@ const INPUT_ERROR_MESSAGES: Record<InputErrorReason, string> = {
   'not-session-owner': 'this input was addressed to a session the sender does not hold',
 }
 
+/**
+ * What a USB-connected iPhone or iPad cannot do yet, and what the requester is told. Each is a simctl-only path —
+ * run against a hardware UDID it would fail with xcrun's noise at best — so it is refused up front, through the
+ * reply that message type already uses for a failure.
+ */
+const PHYSICAL_REFUSALS = {
+  'full-erase': 'Full reset is not available on a USB-connected device',
+  'run-reset': 'A run reset is not available on a USB-connected device yet',
+  'app:install': 'Installing a build on a USB-connected device is not supported yet',
+  'app:launch': 'Launching an app on a USB-connected device is not supported yet',
+  'app:clear-state': 'Clearing app data on a USB-connected device is not supported yet',
+  clipboard: 'The clipboard is not available on a USB-connected device yet',
+  network: 'Network control is not available on a USB-connected device',
+  rotation: 'Rotation is not available on a USB-connected device yet',
+  'open-url': 'Opening a URL on a USB-connected device is not supported yet',
+  screenshot: 'Screenshots of a USB-connected device are not supported yet',
+  input: 'Input on a USB-connected device is not available in this build yet',
+} as const
+type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
+
+const physicalCaptureUnavailable: PhysicalCaptureFactory = () => {
+  throw new PlatformError('Physical iPhone screen capture is not available in this build')
+}
+
 // Cross-platform button name → iOS device-chrome button name. Chrome uses
 // hyphens and "power" (not "lock"); MCP's vocabulary uses underscores. Names
 // not listed here (incl. the raw chrome names the dashboard sends) pass through.
@@ -93,6 +117,9 @@ import {
   type AgentCapability,
 } from '@tapflowio/agent-core'
 import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer.js'
+import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
+import { DevicectlWrapper } from './DevicectlWrapper.js'
+import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
 import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio/audiotap-helper'
 import { enumerateSimPids } from './SimProcessTree.js'
@@ -167,6 +194,10 @@ export interface IOSAgentOptions {
   panelQuietMs?: number
   /** How long a boot waits for a multi-panel device's helper to be ready. Injectable for the same reason. */
   helperBootReadyMs?: number
+  /** USB-connected iPhones and iPads. Injectable so a suite never runs devicectl; under vitest the default lists none. */
+  devicectl?: DevicectlWrapper
+  /** How a USB-connected device's screen is captured. */
+  physicalCaptureFactory?: PhysicalCaptureFactory
 }
 
 // The postures of a multi-panel device (iPhone Duo), most closed first as the protocol requires. Two, not
@@ -226,7 +257,7 @@ interface DeviceState {
   streamReader: ReadableStreamDefaultReader<StreamFrame> | null
   // Current capture streamer (ScreenCaptureStreamer path only) — lets the relay
   // request an on-demand IDR for drop-to-keyframe recovery. null on the MjpegStreamer path.
-  captureStreamer: ScreenCaptureStreamer | null
+  captureStreamer: CaptureStreamer | null
   bootSeq: number
   loadedChrome: ChromeData | null
   /** The boot's first frame load has finished, whatever it returned — `resendChrome`'s gate. Not `loadedChrome`:
@@ -261,6 +292,11 @@ interface DeviceState {
 
 export class IOSAgent implements DeviceAgent, NetworkControlCapability, PosturableAgent {
   private readonly simctl: SimctlWrapper
+  private readonly devicectl: DevicectlWrapper
+  private readonly physicalCaptureFactory: PhysicalCaptureFactory
+  /** Every USB-connected device any list has returned. Never pruned: a hardware UDID never names a simulator, and a
+   *  device unplugged mid-session must still be kept off simctl's paths (a shutdown must not `simctl shutdown` it). */
+  private readonly physicalDevices = new Set<string>()
   private readonly network: SimulatorNetwork
   private readonly fps: number
   private readonly intervalMs: number | undefined
@@ -394,6 +430,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       throw new PlatformError('IOSAgent requires macOS (xcrun simctl is macOS-only)')
     }
     this.simctl = simctl ?? new SimctlWrapper()
+    this.devicectl = options.devicectl ?? new DevicectlWrapper(process.env.VITEST ? () => Promise.resolve('{}') : undefined)
+    this.physicalCaptureFactory = options.physicalCaptureFactory ?? physicalCaptureUnavailable
     // **Never the real filter under vitest.** Layer 1 is a system extension installed on the
     // developer's Mac, and `arm()` runs on every boot — so a suite that booted a mock device was
     // launching the notarized container app and rewriting the host's live filter configuration, once
@@ -457,6 +495,28 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * settles, `_scheduleReconnect` is never reached, and the agent stays offline with nothing in its output
    * even after CoreSimulator recovers. A bounded attempt fails and the loop tries again.
    */
+  /** The simulators, marked as such, and the USB-connected devices. A devicectl that fails costs only its own devices. */
+  private async listAllDevices(listTimeoutMs?: number): Promise<Device[]> {
+    const [simulators, physical] = await Promise.all([this.simctl.listDevices(listTimeoutMs), this.devicectl.listPhysicalDevices()])
+    for (const d of physical) this.physicalDevices.add(d.id)
+    return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
+  }
+
+  private isPhysical(deviceId: string): boolean {
+    return this.physicalDevices.has(deviceId)
+  }
+
+  /** The refusal message when `deviceId` is a USB-connected device, which cannot do `op` yet; null for a simulator. */
+  private physicalRefusal(deviceId: string, op: PhysicalRefusal): string | null {
+    return this.isPhysical(deviceId) ? PHYSICAL_REFUSALS[op] : null
+  }
+
+  /** The same, thrown — for the `DeviceAgent` entry points, whose failures are rejections. */
+  private refusePhysical(deviceId: string, op: PhysicalRefusal): void {
+    const refusal = this.physicalRefusal(deviceId, op)
+    if (refusal) throw new PlatformError(refusal)
+  }
+
   private async connectOnce(relayUrl: string, listTimeoutMs?: number): Promise<void> {
     this._stopping = false
     // Paired with the `dispose()` in `disconnect()`. This method is public and reuses the network, so
@@ -464,8 +524,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.network.resume()
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null }
     this.relayUrl = relayUrl
-    const allDevices = await this.simctl.listDevices(listTimeoutMs)
-    this.revertLeftoverLean(allDevices)
+    const allDevices = await this.listAllDevices(listTimeoutMs)
+    this.revertLeftoverLean(allDevices.filter((d) => !this.isPhysical(d.id)))
     const devices = this.deviceFilter
       ? allDevices.filter((d) => d.name === this.deviceFilter || d.id === this.deviceFilter)
       : allDevices
@@ -532,8 +592,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
             status: d.status,
             osVersion: d.osVersion,
             // A device with more than one panel folds, whatever its product family says (the Duo is an iPhone).
-            formFactor: this.multiPanelDevices.has(d.id) ? 'foldable' : d.typeId ? formFactors.get(d.typeId) : undefined,
+            formFactor: this.multiPanelDevices.has(d.id) ? 'foldable' : d.typeId ? formFactors.get(d.typeId) : d.formFactor,
             serviceTier: this.reportedTier(d),
+            kind: d.kind,
           })),
         })
       })
@@ -743,9 +804,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     // so a simulator that goes away while offline would otherwise keep its udid named there for the
     // rest of the Mac's uptime — and the next boot of that same device would come up offline with
     // nothing on screen saying why.
-    void this.network.forget(state.deviceId).catch((e: unknown) => {
-      logger.warn('could not clear the network rule for a retired device:', (e as Error).message)
-    })
+    if (!this.isPhysical(state.deviceId)) {
+      void this.network.forget(state.deviceId).catch((e: unknown) => {
+        logger.warn('could not clear the network rule for a retired device:', (e as Error).message)
+      })
+    }
     state.streamReader?.cancel().catch(() => { /* an errored stream rejects cancel(); unhandled, it ends the CLI */ })
     state.streamReader = null
     state.captureStreamer = null // reader.cancel() kills the helper proc; drop the ref so a stale requestKeyframe() no-ops
@@ -830,22 +893,28 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     // Only on the ScreenCaptureStreamer path — the MjpegStreamer fallback is always JPEG, and now
     // genuinely produces it rather than only being stamped that way.
     const envAllowsH264 = process.env.TAPFLOW_IOS_CODEC !== 'jpeg'
-    const useH264 = this.intervalMs === undefined && envAllowsH264 && state.acceptH264
+    // A USB-connected device has no `simctl screenshot`, so `intervalMs` (the MJPEG fallback) never applies to it.
+    const physical = this.isPhysical(state.deviceId)
+    const useH264 = (physical || this.intervalMs === undefined) && envAllowsH264 && state.acceptH264
     const codec = useH264 ? CODEC_H264 : CODEC_JPEG
+    const maxSize = (): number => pickMaxSize({
+      secureContext: state.secureContext,
+      external: state.external,
+      override: process.env.TAPFLOW_IOS_MAX_SIZE ?? process.env.TAPFLOW_MAX_SIZE,
+    })
     let stream: ReadableStream<StreamFrame>
-    if (this.intervalMs !== undefined) {
+    if (physical) {
+      const capture = this.physicalCaptureFactory(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize())
+      state.captureStreamer = capture
+      stream = capture.start()
+    } else if (this.intervalMs !== undefined) {
       state.captureStreamer = null
       stream = new MjpegStreamer(this.simctl, state.deviceId, this.intervalMs).start()
     } else {
-      const maxSize = pickMaxSize({
-        secureContext: state.secureContext,
-        external: state.external,
-        override: process.env.TAPFLOW_IOS_MAX_SIZE ?? process.env.TAPFLOW_MAX_SIZE,
-      })
       // A multi-panel device is captured at its lit panel; a restart re-applies it here, since a stdin switch
       // lives only as long as the helper it was written to.
       const panel = this.multiPanelDevices.has(state.deviceId) ? this.litPanel(state.deviceId) : null
-      const capture = new ScreenCaptureStreamer(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize,
+      const capture = new ScreenCaptureStreamer(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize(),
         panel ? { width: panel.width, height: panel.height } : null)
       state.captureStreamer = capture
       stream = capture.start()
@@ -1016,11 +1085,15 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       state.streamWs = null
 
       this.sendOn(ws, { type: 'device:booting', sessionId })
-      const devices = await this.simctl.listDevices()
+      const devices = await this.listAllDevices()
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
 
       const target = devices.find((d) => d.id === deviceId)
       if (!target) throw new PlatformError(`Device not found: ${deviceId}`)
+      if (target.kind === 'physical') {
+        await this.bootPhysical(state, ws, target, seq, sessionId, requestId, fullErase, runReset)
+        return
+      }
       // A running device on another tier than the run asked for is restarted onto it: the services have to be off
       // from launch, and replaying on whatever the last boot left is what the tier exists to stop.
       const retier = !fullErase && target.status === 'booted' && serviceTier !== undefined && leanSupported(target.osVersion)
@@ -1234,6 +1307,39 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     }
   }
 
+  /**
+   * A USB-connected device's boot, run inside `handleDeviceBoot`'s try. It is already on, so there is nothing to boot,
+   * erase or wait for, and none of the simulator's set-up applies: no service tier, network arming, keyboard sync,
+   * rotation, audio tap or tree warm-up. What is left is the stream, then the same `device:ready` a simulator sends.
+   */
+  private async bootPhysical(state: DeviceState, ws: WebSocket, device: Device, seq: number, sessionId: string, requestId: string | undefined, fullErase: boolean, runReset: RunResetRequest | undefined): Promise<void> {
+    if (fullErase) throw new PlatformError(PHYSICAL_REFUSALS['full-erase'])
+    if (runReset) throw new PlatformError(PHYSICAL_REFUSALS['run-reset'])
+    this.sendOn(ws, {
+      type: 'session:deviceInfo',
+      sessionId,
+      payload: { deviceName: device.name, osVersion: device.osVersion ?? '' },
+    })
+    const streamWs = await this.openStreamWs(state)
+    if (seq !== state.bootSeq) {
+      streamWs.close()
+      this.abandonBoot(state, seq, sessionId, requestId)
+      return
+    }
+    try {
+      this.startBinaryStream(state, streamWs)
+    } catch (e) {
+      streamWs.close()
+      state.streamWs = null
+      throw e
+    }
+    state.touchHelper = this.createInputChannel(device.id)
+    state.touchHelper.start()
+    state.booted = true
+    this.ownedDevices.add(device.id)
+    this.sendMsg({ type: 'device:ready', sessionId, requestId, payload: { deviceId: device.id, cold: false, serviceTier: 'unsupported' } })
+  }
+
   // Boot a device, auto-recovering from a vanished data dir. simctl lists the device
   // as available but `boot` fails; erase regenerates the data and we retry once. Guarded
   // by isDeviceMissingError so an unrelated boot failure never erases a healthy device.
@@ -1257,7 +1363,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
 
   /** What the device boots with now, for the relay: the marker's tier, or `unsupported` on a runtime that cannot take one. */
   private reportedTier(device: Device): ServiceTier | 'unsupported' {
-    return leanSupported(device.osVersion) ? this.leanStore.currentTier(device.id) : 'unsupported'
+    return leanSupported(device.osVersion) && !this.isPhysical(device.id) ? this.leanStore.currentTier(device.id) : 'unsupported'
   }
 
   /**
@@ -1326,9 +1432,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     // screen saying why. The two bodies have already diverged in another respect (this one does not
     // stop the audio tap), which is why this is a call rather than a merge: unifying them changes
     // audio teardown on a path nobody asked about.
-    void this.network.forget(deviceId).catch((e: unknown) => {
-      logger.warn('could not clear the network rule for a shut-down device:', (e as Error).message)
-    })
+    if (!this.isPhysical(deviceId)) {
+      void this.network.forget(deviceId).catch((e: unknown) => {
+        logger.warn('could not clear the network rule for a shut-down device:', (e as Error).message)
+      })
+    }
     state.streamReader?.cancel().catch(() => { /* an errored stream rejects cancel(); unhandled, it ends the CLI */ })
     state.streamReader = null
     state.captureStreamer = null // reader.cancel() kills the helper proc; drop the ref so a stale requestKeyframe() no-ops
@@ -1341,6 +1449,13 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.lastBundleIds.delete(deviceId)
     // Each device has its own tree runner; stop this one's, never another device's.
     this.uiTreeReader.stopIfDevice(deviceId)
+
+    // A USB-connected device is not tapflow's to power off: ending the session is stopping the stream and helpers.
+    if (this.isPhysical(deviceId)) {
+      this.ownedDevices.delete(deviceId)
+      this.sendMsg({ type: 'device:shutdown-done', sessionId, requestId, payload: { deviceId } })
+      return
+    }
 
     try {
       await this.simctl.shutdown(deviceId)
@@ -1435,6 +1550,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * answer success and land on a dark panel or nowhere.
    */
   private createInputChannel(deviceId: string): InputChannel {
+    if (this.isPhysical(deviceId)) return new UnavailableInput()
     if (!this.multiPanelDevices.has(deviceId)) return new TouchHelper(deviceId)
     this.ensureGuest(deviceId)
     return new FoldableInput({
@@ -1840,6 +1956,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * but only for the question readiness answers. That is why ownership is asked separately.
    */
   private refusalReason(helper: InputChannel | null, kind: 'continuation' | 'standalone'): InputErrorReason {
+    // Not `channel-unavailable`, which tells the caller to reconnect: no reconnect brings input to this device.
+    if (helper instanceof UnavailableInput) return 'unsupported'
     const state = helper?.inputState() ?? 'unavailable'
     // No channel at all dominates: the caller must reconnect, and telling it to re-open a gesture
     // would send it round a loop that cannot succeed.
@@ -1872,12 +1990,12 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.sendMsg(
       reason === null
         ? { type: 'input:done', sessionId: state.sessionId, requestId }
-        : { type: 'input:error', sessionId: state.sessionId, requestId, message: INPUT_ERROR_MESSAGES[reason], reason })
+        : { type: 'input:error', sessionId: state.sessionId, requestId, message: (reason === 'unsupported' && this.physicalRefusal(state.deviceId, 'input')) || INPUT_ERROR_MESSAGES[reason], reason })
   }
 
   private async isBooted(deviceId: string): Promise<boolean> {
     try {
-      const devices = await this.simctl.listDevices()
+      const devices = this.isPhysical(deviceId) ? await this.devicectl.listPhysicalDevices() : await this.simctl.listDevices()
       return devices.find((d) => d.id === deviceId)?.status === 'booted'
     } catch { return false }
   }
@@ -1929,6 +2047,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           respond({ type: 'app:install-error', message: 'No booted device' })
           break
         }
+        const installRefusal = this.physicalRefusal(installState.deviceId, 'app:install')
+        if (installRefusal) {
+          respond({ type: 'app:install-error', message: installRefusal })
+          break
+        }
         this.installBuild(installState.deviceId, filePath, bundleId, { buildTicket, buildName, buildBytes })
           .then(() => respond({ type: 'app:install-done' }))
           .catch((e: unknown) => {
@@ -1951,6 +2074,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         const launchState = this.deviceStates.get(sessionId!)
         if (!launchState) {
           respond({ type: 'app:launch-error', message: 'No booted device' })
+          break
+        }
+        const launchRefusal = this.physicalRefusal(launchState.deviceId, 'app:launch')
+        if (launchRefusal) {
+          respond({ type: 'app:launch-error', message: launchRefusal })
           break
         }
         // Checked again here rather than trusted: the relay checks with the same function, but an agent is the last
@@ -2044,6 +2172,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       case 'input:rotate': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
+        // No ack by declaration, so a refusal is logged, as a failed turn is.
+        const rotateRefusal = this.physicalRefusal(state.deviceId, 'rotation')
+        if (rotateRefusal) { logger.warn(`rotate ${state.deviceId}: ${rotateRefusal}`); break }
         // **A target when the viewer sends one, a toggle when it does not** (#910) — an older
         // dashboard's. The memory is read when the step runs, not when it was queued, and written only
         // once the simulator took it: a step queued behind another toggles from what that one applied.
@@ -2087,6 +2218,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       case 'input:keyboard:toggle': {
         const state = this.deviceStates.get(msg.sessionId)
         if (!state) break
+        const keyboardRefusal = this.physicalRefusal(state.deviceId, 'input')
+        if (keyboardRefusal) { logger.warn(`keyboard toggle ${state.deviceId}: ${keyboardRefusal}`); break }
         const showing = !state.softKeyboardVisible
         const op = showing
           ? this.simctl.showSoftwareKeyboard(state.deviceId)
@@ -2112,6 +2245,12 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         const { text } = (msg.payload ?? {}) as { text?: string }
         if (!state?.touchHelper) {
           this.sendMsg({ type: 'input:type-error', sessionId, requestId, message: 'No booted device' })
+          break
+        }
+        // Typing goes through the pasteboard.
+        const typeRefusal = this.physicalRefusal(state.deviceId, 'clipboard')
+        if (typeRefusal) {
+          this.sendMsg({ type: 'input:type-error', sessionId, requestId, message: typeRefusal })
           break
         }
         // simctl pbcopy → Cmd+V paste. Works for arbitrary Unicode (unlike a
@@ -2258,6 +2397,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           respond({ type: 'open-url:error', message: 'no booted device' })
           break
         }
+        const openRefusal = this.physicalRefusal(state.deviceId, 'open-url')
+        if (openRefusal) {
+          respond({ type: 'open-url:error', message: openRefusal })
+          break
+        }
         this.simctl.openUrl(state.deviceId, url)
           .then(() => respond({ type: 'open-url:done' }))
           .catch((e: unknown) => {
@@ -2273,6 +2417,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         const shotState = this.deviceStates.get(sessionId!)
         if (!shotState) {
           this.sendMsg({ type: 'screenshot:error', sessionId, requestId, message: 'No booted device' })
+          break
+        }
+        const shotRefusal = this.physicalRefusal(shotState.deviceId, 'screenshot')
+        if (shotRefusal) {
+          this.sendMsg({ type: 'screenshot:error', sessionId, requestId, message: shotRefusal })
           break
         }
         // Note for anyone widening this signature again: before the udid parameter existed this
@@ -2305,6 +2454,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         const state = this.deviceStates.get(sessionId!)
         if (!state || !bundleId) {
           respond({ type: 'app:clear-state-error', message: !state ? 'No booted device' : 'bundleId missing' })
+          break
+        }
+        const clearRefusal = this.physicalRefusal(state.deviceId, 'app:clear-state')
+        if (clearRefusal) {
+          respond({ type: 'app:clear-state-error', message: clearRefusal })
           break
         }
         this.simctl.clearAppData(state.deviceId, bundleId)
@@ -2356,6 +2510,14 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         if (!state) {
           this.sendMsg({
             type: 'clipboard:error', sessionId, requestId, message: 'No booted device',
+            payload: { sentinelParked: false } satisfies ClipboardErrorPayload,
+          })
+          break
+        }
+        const readRefusal = this.physicalRefusal(state.deviceId, 'clipboard')
+        if (readRefusal) {
+          this.sendMsg({
+            type: 'clipboard:error', sessionId, requestId, message: readRefusal,
             payload: { sentinelParked: false } satisfies ClipboardErrorPayload,
           })
           break
@@ -2488,6 +2650,14 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         if (!state) {
           this.sendMsg({
             type: 'clipboard:error', sessionId, requestId, message: 'No booted device',
+            payload: { sentinelParked: false } satisfies ClipboardErrorPayload,
+          })
+          break
+        }
+        const writeRefusal = this.physicalRefusal(state.deviceId, 'clipboard')
+        if (writeRefusal) {
+          this.sendMsg({
+            type: 'clipboard:error', sessionId, requestId, message: writeRefusal,
             payload: { sentinelParked: false } satisfies ClipboardErrorPayload,
           })
           break
@@ -2665,16 +2835,19 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   }
 
   // DeviceAgent interface — delegate to SimctlWrapper
-  listDevices(): Promise<Device[]> { return this.simctl.listDevices() }
-  boot(deviceId: string): Promise<void> { return this.simctl.boot(deviceId) }
-  shutdown(deviceId: string): Promise<void> { return this.simctl.shutdown(deviceId) }
+  listDevices(): Promise<Device[]> { return this.listAllDevices() }
+  // A USB-connected device is on whenever it is listed, and is not tapflow's to power off.
+  boot(deviceId: string): Promise<void> { return this.isPhysical(deviceId) ? Promise.resolve() : this.simctl.boot(deviceId) }
+  shutdown(deviceId: string): Promise<void> { return this.isPhysical(deviceId) ? Promise.resolve() : this.simctl.shutdown(deviceId) }
   /** The `DeviceAgent` interface has no device parameter — it predates multi-session agents and is
    *  shared with Android, so widening it would be a breaking change for every implementation and
    *  caller. `AndroidAgent` resolves the single live session internally instead
    *  (`AndroidAgent.ts:1429`); these do the same. Throwing beats falling back to simctl's `booted`
    *  alias, which would quietly act on whichever simulator happened to be up. */
   async installApp(appPath: string): Promise<void> {
-    await this.simctl.installApp(await this.soleLiveDeviceId(), appPath)
+    const deviceId = await this.soleLiveDeviceId()
+    this.refusePhysical(deviceId, 'app:install')
+    await this.simctl.installApp(deviceId, appPath)
   }
   // ── network control (#607) ─────────────────────────────────────────────────
   //
@@ -2721,7 +2894,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    */
   private async reportNetworkState(sessionId: string): Promise<void> {
     const deviceId = await this.deviceFor(sessionId)
-    if (!deviceId) return
+    if (!deviceId || this.isPhysical(deviceId)) return
     this.sendMsg({ type: 'network:state', sessionId, payload: this.network.state(deviceId) })
   }
 
@@ -2756,6 +2929,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       })
       return
     }
+    const networkRefusal = this.physicalRefusal(deviceId, 'network')
+    if (networkRefusal) {
+      this.sendMsg({ type: 'network:error', sessionId, requestId, message: networkRefusal })
+      return
+    }
     try {
       const payload = await this.network.setOffline(deviceId, offline)
       this.sendMsg({ type: 'network:state', sessionId, requestId, payload })
@@ -2782,17 +2960,23 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * is whether that device is up.
    */
   async setNetworkOffline(offline: boolean): Promise<NetworkStatePayload> {
-    return this.network.setOffline(await this.soleLiveDeviceId(), offline)
+    const deviceId = await this.soleLiveDeviceId()
+    this.refusePhysical(deviceId, 'network')
+    return this.network.setOffline(deviceId, offline)
   }
 
   async networkState(): Promise<NetworkStatePayload> {
-    return this.network.state(await this.soleLiveDeviceId())
+    const deviceId = await this.soleLiveDeviceId()
+    this.refusePhysical(deviceId, 'network')
+    return this.network.state(deviceId)
   }
 
   async launchApp(bundleId: string, options?: LaunchOptions): Promise<void> {
     const problem = launchOptionsProblem(options ?? {})
     if (problem) throw new ValidationError(problem)
-    await this.simctl.launchApp(await this.soleLiveDeviceId(), bundleId, compactLaunchOptions(options))
+    const deviceId = await this.soleLiveDeviceId()
+    this.refusePhysical(deviceId, 'app:launch')
+    await this.simctl.launchApp(deviceId, bundleId, compactLaunchOptions(options))
   }
 
   /** The one booted session, or undefined when there is no unambiguous answer. Callers that can
@@ -2867,7 +3051,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     if (cached.length > 0) return this.soleOf(cached)
 
     const booted = new Set(
-      (await this.simctl.listDevices()).filter((d) => d.status === 'booted').map((d) => d.id),
+      (await this.listAllDevices()).filter((d) => d.status === 'booted').map((d) => d.id),
     )
     const up = [...this.deviceStates.values()].filter((s) => booted.has(s.deviceId))
     // **Ownership narrows liveness, and only when it can.** A developer with their own simulator open
@@ -2989,11 +3173,18 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   }
   // async, not a bare `return`: `soleDeviceId` throws, and a synchronous throw out of a method
   // typed `Promise<T>` skips every caller's `.catch`.
-  async screenshot(): Promise<Buffer> { return this.simctl.screenshot(await this.soleLiveDeviceId()) }
+  async screenshot(): Promise<Buffer> {
+    const deviceId = await this.soleLiveDeviceId()
+    this.refusePhysical(deviceId, 'screenshot')
+    return this.simctl.screenshot(deviceId)
+  }
   stream(): ReadableStream<Buffer> {
     const first = this.soleDeviceState()
+    const capture: CaptureStreamer = this.isPhysical(first.deviceId)
+      ? this.physicalCaptureFactory(first.deviceId, this.fps, 'jpeg', 0)
+      : new ScreenCaptureStreamer(first.deviceId, this.fps)
     // DeviceAgent.stream() is the platform-neutral Buffer contract; unwrap StreamFrame payloads.
-    return new ScreenCaptureStreamer(first.deviceId, this.fps).start()
+    return capture.start()
       .pipeThrough(new TransformStream<StreamFrame, Buffer>({
         transform(frame, controller) { controller.enqueue(frame.payload) },
       }))
@@ -3014,7 +3205,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   }
 
   async openUrl(url: string): Promise<void> {
-    return this.simctl.openUrl(await this.soleLiveDeviceId(), url)
+    const deviceId = await this.soleLiveDeviceId()
+    this.refusePhysical(deviceId, 'open-url')
+    return this.simctl.openUrl(deviceId, url)
   }
 }
 
