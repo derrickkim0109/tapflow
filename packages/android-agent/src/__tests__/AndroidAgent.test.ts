@@ -215,7 +215,7 @@ interface AndroidAgentInternals {
   reconcileScreen(state: TestState, serial: string, frameW: number, frameH: number, skin: SkinRotation | null): Promise<boolean>
   toDevicePx(state: TestState, x: number, y: number): { px: number; py: number }
   normaliseOnBoot(state: TestState, serial: string): Promise<void>
-  uprightOnBoot(serial: string): Promise<void>
+  uprightOnBoot(deviceId: string, serial: string): Promise<void>
   watchScreen(state: TestState, serial: string, skin: SkinRotation): void
   prepareBody(state: TestState, serial: string, upright: boolean): Promise<void>
   sendChrome(state: TestState): void
@@ -255,6 +255,23 @@ function mockAdb(booted = false): AdbWrapper {
   return adb
 }
 
+
+const PHONE_SERIAL = 'RFCX00ABCDE'
+const PHONE_ID = `usb:${PHONE_SERIAL}`
+
+/** A USB-connected phone, plugged in and authorized, with `lock` as the rotation lock it came with (#152). */
+function mockPhoneAdb(lock: Awaited<ReturnType<AdbWrapper['getUserRotation']>> = { mode: 'free' }): AdbWrapper {
+  const adb = mockAdb()
+  adb.setSerial(PHONE_ID, PHONE_SERIAL)
+  vi.mocked(adb.getUserRotation).mockResolvedValue(lock)
+  vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
+  vi.spyOn(adb, 'shutdown').mockResolvedValue(undefined)
+  vi.mocked(adb.listDevices).mockResolvedValue([{
+    id: PHONE_ID, name: 'Galaxy Z Flip4', platform: 'android', status: 'booted',
+    osVersion: 'Android 15', formFactor: 'phone', kind: 'physical',
+  }])
+  return adb
+}
 
 // The agent samples `dumpsys` until the display settles — a real ~300ms wait per fold. The suite
 // drives the sampling directly in the test below and does not need the delay anywhere else.
@@ -646,6 +663,201 @@ describe('AndroidAgent', () => {
   })
 
   // ── Lean mode: bundled apps kept disabled, reconciled after every boot ──────────────────────
+  // #152: a phone plugged in over USB opens like an emulator session and is left as it was found.
+  describe('a USB-connected device (#152)', () => {
+    type Launcher = { launcher: { launch: ReturnType<typeof vi.fn> } }
+
+    async function openPhone(adb: AdbWrapper) {
+      const agent = new AndroidAgent({}, adb)
+      await agent.connect(`ws://localhost:${port}`)
+      const browser = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(browser)
+      browser.send(JSON.stringify({ type: 'session:start', sessionId: agent.sessionId }))
+      await waitForType(browser, 'session:joined')
+      const send = (msg: Record<string, unknown>) => browser.send(JSON.stringify({ sessionId: agent.sessionId, ...msg }))
+      const close = () => { agent.disconnect(); browser.close() }
+      return { agent, browser, send, close }
+    }
+
+    async function bootPhone(adb: AdbWrapper) {
+      const opened = await openPhone(adb)
+      const ready = waitForType(opened.browser, 'device:ready')
+      opened.send({ type: 'device:boot', requestId: 'rq-phone', payload: { deviceId: PHONE_ID } })
+      return { ...opened, ready: await ready }
+    }
+
+    // Mutation: drop `kind` from the register literal, or look the form factor up from an AVD config by the phone's name.
+    it('registers the phone as physical, with the form factor its listing gave', async () => {
+      const avdFormFactor = vi.fn(() => 'tablet' as const)
+      const agent = new AndroidAgent({ avdFormFactor }, mockPhoneAdb())
+      const relayWs = new WebSocket(`ws://localhost:${port}`)
+      await waitForOpen(relayWs)
+      await agent.connect(`ws://localhost:${port}`)
+      relayWs.send(JSON.stringify({ type: 'agents:list' }))
+      const listed = await waitForType(relayWs, 'agents:listed')
+      const [device] = (listed['sessions'] as Array<{ devices: Array<{ id: string; kind?: string; formFactor?: string }> }>)[0]!.devices
+      expect(device).toMatchObject({ id: PHONE_ID, kind: 'physical', formFactor: 'phone' })
+      expect(avdFormFactor).not.toHaveBeenCalled()
+      agent.disconnect()
+      relayWs.close()
+    })
+
+    // Mutation: send a phone down the emulator path — it launches an emulator for `usb:…` and waits on its boot.
+    it('opens it on scrcpy without launching an emulator, resetting its network or touching its packages', async () => {
+      const adb = mockPhoneAdb()
+      const packages = vi.spyOn(adb, 'packageStates')
+      vi.mocked(ScrcpySession).mockClear()
+      const { agent, ready, close } = await bootPhone(adb)
+      expect(ready['payload']).toMatchObject({ deviceId: PHONE_ID, cold: false })
+      expect((agent as unknown as Launcher).launcher.launch).not.toHaveBeenCalled()
+      const session = vi.mocked(ScrcpySession).mock.results[0]!.value as { start: ReturnType<typeof vi.fn> }
+      expect(session.start).toHaveBeenCalledWith(PHONE_SERIAL)
+      expect(adb.airplaneMode).not.toHaveBeenCalled()
+      expect(packages).not.toHaveBeenCalled()
+      close()
+    })
+
+    // Mutation: drop the refusal — the boot goes on to stream a phone the tester believes was erased.
+    it('refuses Full reset, and starts nothing', async () => {
+      const adb = mockPhoneAdb()
+      vi.mocked(ScrcpySession).mockClear()
+      const { agent, browser, send, close } = await openPhone(adb)
+      const error = waitForType(browser, 'device:boot-error')
+      send({ type: 'device:boot', requestId: 'rq-erase', payload: { deviceId: PHONE_ID, resetMode: 'full-erase' } })
+      expect((await error)['message']).toMatch(/Full reset is not available on a USB-connected device/)
+      expect((agent as unknown as Launcher).launcher.launch).not.toHaveBeenCalled()
+      expect(vi.mocked(ScrcpySession)).not.toHaveBeenCalled()
+      close()
+    })
+
+    // Mutation: `emu kill` it like an emulator, or clear its serial — the phone is still plugged in.
+    it('shuts the session down without stopping the phone', async () => {
+      const adb = mockPhoneAdb()
+      const { browser, send, close } = await bootPhone(adb)
+      const done = waitForType(browser, 'device:shutdown-done')
+      send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+      expect((await done)['payload']).toMatchObject({ deviceId: PHONE_ID })
+      expect(adb.shutdown).not.toHaveBeenCalled()
+      expect(adb.getSerial(PHONE_ID)).toBe(PHONE_SERIAL)
+      close()
+    })
+
+    describe('its rotation lock (#1033)', () => {
+      async function rotateThenShutDown(adb: AdbWrapper) {
+        const { browser, send, close } = await bootPhone(adb)
+        send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        const done = waitForType(browser, 'device:shutdown-done')
+        send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+        await done
+        return close
+      }
+
+      // Mutation: leave the session's `wm user-rotation lock 3` in place — auto-rotate stays off on the phone.
+      it('gives an auto-rotating phone its auto-rotate back', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const close = await rotateThenShutDown(adb)
+        expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
+        close()
+      })
+
+      // Mutation: write `free` back whatever the phone had — a person's lock is taken away.
+      it('leaves a locked phone locked where it was', async () => {
+        const adb = mockPhoneAdb({ mode: 'lock', rotation: 1 })
+        const close = await rotateThenShutDown(adb)
+        expect(adb.freeRotation).not.toHaveBeenCalled()
+        expect(vi.mocked(adb.setRotation).mock.calls.at(-1)).toEqual([PHONE_SERIAL, 1])
+        close()
+      })
+
+      // Mutation: re-read the lock on a second boot in the session — it remembers the lock the first one wrote.
+      it('remembers the lock from before the session, not one the session wrote', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const { browser, send, close } = await bootPhone(adb)
+        send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        vi.mocked(adb.getUserRotation).mockResolvedValue({ mode: 'lock', rotation: 3 })
+        const again = waitForType(browser, 'device:ready')
+        send({ type: 'device:boot', requestId: 'rq-again', payload: { deviceId: PHONE_ID } })
+        await again
+        const done = waitForType(browser, 'device:shutdown-done')
+        send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+        await done
+        expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
+        close()
+      })
+
+      // Mutation: forget the remembered lock when the write could not be made — an unplugged phone never gets it back.
+      it('puts it back when an unplugged phone is seen again', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const listed = vi.mocked(adb.listDevices).getMockImplementation()!
+        const { agent, browser, send, close } = await bootPhone(adb)
+        send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        adb.clearSerial(PHONE_ID)
+        vi.mocked(adb.listDevices).mockResolvedValue([])
+        const done = waitForType(browser, 'device:shutdown-done')
+        send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+        await done
+        expect(adb.freeRotation).not.toHaveBeenCalled()
+        vi.mocked(adb.listDevices).mockImplementation(async () => { adb.setSerial(PHONE_ID, PHONE_SERIAL); return listed() })
+        await agent.listDevices()
+        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL))
+        close()
+      })
+    })
+
+    describe('what it refuses', () => {
+      // Mutation: drop the network row — airplane mode is written to the phone and outlives the session.
+      it('refuses network control through network:error, and writes nothing', async () => {
+        const adb = mockPhoneAdb()
+        const write = vi.spyOn(adb, 'setAirplaneMode')
+        const { browser, send, close } = await bootPhone(adb)
+        const error = waitForType<NetworkError>(browser, 'network:error')
+        send({ type: 'network:set', requestId: 'rq-net', payload: { offline: true } })
+        expect((await error).message).toMatch(/Network control is not available on a USB-connected device/)
+        expect(write).not.toHaveBeenCalled()
+        close()
+      })
+
+      // Mutation: drop the clipboard row — the reply blames a gRPC backend the tester has never heard of.
+      it('refuses the clipboard as unsupported', async () => {
+        const { browser, send, close } = await bootPhone(mockPhoneAdb())
+        const error = waitForType(browser, 'clipboard:error')
+        send({ type: 'clipboard:read', requestId: 'rq-clip' })
+        const reply = await error
+        expect(reply['message']).toMatch(/clipboard is not available on a USB-connected device/)
+        expect(reply['payload']).toMatchObject({ unsupported: true })
+        close()
+      })
+
+      // Mutation: list a foldable phone's own postures — the viewer offers a fold that `adb emu posture` cannot make.
+      it('offers no postures on a foldable phone, and refuses a fold', async () => {
+        const adb = mockPhoneAdb()
+        vi.spyOn(adb, 'printDeviceStates').mockResolvedValue(
+          "Supported states: [\n  DeviceState{identifier=0, name='CLOSED'},\n  DeviceState{identifier=3, name='OPENED'},\n]\n")
+        const posture = vi.spyOn(adb, 'setPosture')
+        const { agent, close } = await bootPhone(adb)
+        expect(await agent.listPostures(PHONE_ID)).toEqual([])
+        await expect(agent.setPosture(PHONE_ID, '0')).rejects.toThrow(/Folding is not available on a USB-connected device/)
+        expect(posture).not.toHaveBeenCalled()
+        close()
+      })
+
+      // Mutation: let a full phone reclaim storage — it rolls back the updates of the phone's own system apps.
+      it('installs over adb, and never reclaims storage on a full phone', async () => {
+        const adb = mockPhoneAdb()
+        vi.spyOn(adb, 'installApp').mockRejectedValue(new StorageFullError())
+        const updates = vi.spyOn(adb, 'hasSystemUpdates')
+        const { agent, close } = await bootPhone(adb)
+        await expect(agent.installApp('/tmp/app.apk')).rejects.toBeInstanceOf(StorageFullError)
+        expect(adb.installApp).toHaveBeenCalledWith(PHONE_SERIAL, '/tmp/app.apk')
+        expect(updates).not.toHaveBeenCalled()
+        close()
+      })
+    })
+  })
+
   describe('Lean mode', () => {
     let agent: AndroidAgent
     let browser: WebSocket
@@ -4937,7 +5149,7 @@ describe('standing a device up on boot', () => {
     else vi.spyOn(adb, 'getUserRotation').mockResolvedValue(lock)
     const set = vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
     const agent = new AndroidAgent({}, adb)
-    const outcome = internals(agent).uprightOnBoot('emulator-5554')
+    const outcome = internals(agent).uprightOnBoot('usb:emulator-5554', 'emulator-5554')
     return { outcome, set }
   }
 

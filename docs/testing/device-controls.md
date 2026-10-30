@@ -68,7 +68,7 @@ tapflow frees an emulator's rotation lock (auto-rotate off) once per AVD, the fi
 
 The dashboard's screenshots and recordings keep the orientation the body is shown in. The MCP server's screenshots follow the screen Android draws, so they can be turned differently.
 
-A real device, and an emulator started without gRPC, still turn between portrait and landscape on each press of **Rotate**. If you leave the session with one of them in landscape, it is turned back to portrait before it shuts down.
+A real device, and an emulator started without gRPC, still turn between portrait and landscape on each press of **Rotate**. If you leave the session with one of them in landscape, it is turned back to portrait before it shuts down. A phone connected over USB gets back the rotation setting it had before the session when the session ends, auto-rotate included; if it was unplugged first, it gets it back the next time the agent lists it.
 
 ## Fold and unfold {#fold}
 

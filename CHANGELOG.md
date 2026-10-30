@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An Android phone plugged in over USB can be opened like an emulator.** With USB debugging turned on and authorized on the phone, it appears in the device list next to the emulators, plugged in before the agent starts, and opens with its live screen, touch, keys and app installs. tapflow never starts, stops or erases it: Full reset, network control, the clipboard and folding are refused on a phone, and when the session ends its rotation setting goes back to what it was. A phone that is not authorized yet is named in the agent's output with what to do. Wireless debugging is not offered yet.
+
 ### Fixed
 
 - **Reconnecting to a device no longer wipes the app under test.** When the dashboard lost its connection to the relay, even for a second, it reinstalled the build on reconnect, and an install clears the app's data first, so the tester came back to a logged-out, reset app. The relay now remembers the build it installed on each device, and the dashboard asks it to keep that build when it reconnects. Picking a device from the list still installs the build cleanly, and a restart still reinstalls it. A device that was shut down outside tapflow, for example by quitting Simulator.app, is reinstalled when the session comes back. Upgrade the relay: an older relay ignores the request and reinstalls as before.

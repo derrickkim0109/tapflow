@@ -986,3 +986,137 @@ describe('AdbWrapper', () => {
     })
   })
 })
+
+// #152: a phone plugged in over USB is offered beside the emulators. The row shapes are a Galaxy Z Flip4's
+// (Android 15) with the serial replaced; Samsung sets no marketing name, only the device name its settings show.
+describe('listDevices — USB-connected devices (#152)', () => {
+  const SERIAL = 'RFCX00ABCDE'
+  const FLIP4_PROPS = [
+    'ro.product.marketname=',
+    'ro.product.model=SM-F721N',
+    'ro.build.version.release=15',
+    'ro.build.characteristics=phone',
+    'device_name=Galaxy Z Flip4',
+  ].join('\n') + '\n'
+
+  function usbRunner(devices: string, props: Record<string, string> = { [SERIAL]: FLIP4_PROPS }) {
+    const exec = vi.fn(async (...args: string[]) => {
+      if (args[0] === 'devices') return devices
+      if (args.includes('emu') && args.includes('name')) return 'Pixel_8_API_34\nOK\n'
+      if (args.includes('ro.build.version.release')) return '14\n'
+      const at = args.indexOf('-s')
+      if (args.includes('shell') && at >= 0 && props[args[at + 1]!] !== undefined) return props[args[at + 1]!]!
+      return ''
+    })
+    const runner: AdbRunner = { exec, execBinary: vi.fn(), listAvds: vi.fn().mockResolvedValue(['Pixel_8_API_34']) }
+    return { runner, exec, shellsFor: (serial: string) => exec.mock.calls.filter((c) => c[1] === serial && c[2] === 'shell').length }
+  }
+
+  // Mutation: keep the `emulator-` filter on the device rows (USB devices never listed), or drop `kind`.
+  it('offers a USB device in state `device` as usb:<serial>, physical and booted', async () => {
+    const { runner } = usbRunner(`List of devices attached\n${SERIAL}\tdevice\n`)
+    const wrapper = new AdbWrapper(runner)
+    const devices = await wrapper.listDevices()
+    expect(devices.find((d) => d.id === `usb:${SERIAL}`)).toEqual({
+      id: `usb:${SERIAL}`, name: 'Galaxy Z Flip4', platform: 'android', status: 'booted',
+      osVersion: 'Android 15', formFactor: 'phone', kind: 'physical',
+    })
+    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBe(SERIAL)
+  })
+
+  // Mutation: drop `kind: 'emulator'` from the AVD rows.
+  it('marks the emulators as emulators, unchanged otherwise', async () => {
+    const { runner } = usbRunner(`List of devices attached\nemulator-5554\tdevice\n${SERIAL}\tdevice\n`)
+    const devices = await new AdbWrapper(runner).listDevices()
+    expect(devices.find((d) => d.id === 'avd:Pixel_8_API_34')).toEqual({
+      id: 'avd:Pixel_8_API_34', name: 'Pixel_8_API_34', platform: 'android', status: 'booted',
+      osVersion: 'Android 14', kind: 'emulator',
+    })
+  })
+
+  // Mutation: read the name from `ro.product.model` first, or take the literal "null" settings prints for no value.
+  it.each([
+    { props: 'ro.product.marketname=Pixel 8\nro.product.model=GKWS6\ndevice_name=My phone\n', name: 'Pixel 8' },
+    { props: 'ro.product.marketname=\nro.product.model=SM-F721N\ndevice_name=Galaxy Z Flip4\n', name: 'Galaxy Z Flip4' },
+    { props: 'ro.product.marketname=\nro.product.model=SM-F721N\ndevice_name=null\n', name: 'SM-F721N' },
+  ])('names it $name', async ({ props, name }) => {
+    const { runner } = usbRunner(`List of devices attached\n${SERIAL}\tdevice\n`, { [SERIAL]: props })
+    const [device] = (await new AdbWrapper(runner).listDevices()).filter((d) => d.kind === 'physical')
+    expect(device?.name).toBe(name)
+  })
+
+  // Mutation: compare the whole value to `tablet` — the property is a comma-separated list.
+  it('tells a tablet from its build characteristics', async () => {
+    const { runner } = usbRunner(`List of devices attached\n${SERIAL}\tdevice\n`, { [SERIAL]: 'ro.build.characteristics=tablet,nosdcard\n' })
+    const [device] = (await new AdbWrapper(runner).listDevices()).filter((d) => d.kind === 'physical')
+    expect(device?.formFactor).toBe('tablet')
+  })
+
+  // Mutation: accept any row whose serial is not an emulator's — the phone is offered and then fails to open.
+  it('leaves out unauthorized, offline and unpermitted phones, and network serials', async () => {
+    const { runner, exec } = usbRunner([
+      'List of devices attached',
+      'AAAA0001\tunauthorized',
+      'AAAA0002\toffline',
+      'AAAA0003\tno permissions (missing udev rules? user is in the plugdev group); see [http://developer.android.com/tools/device.html]',
+      '192.168.0.5:5555\tdevice',
+      `adb-${SERIAL}-AbCdEf._adb-tls-connect._tcp\tdevice`,
+      '',
+    ].join('\n'))
+    const devices = await new AdbWrapper(runner).listDevices()
+    expect(devices.filter((d) => d.kind === 'physical')).toEqual([])
+    expect(exec.mock.calls.filter((c) => c[2] === 'shell')).toEqual([])
+  })
+
+  // Mutation: warn on every listing (a poll would repeat it), or not at all (the phone is missing with no reason given).
+  it('says once why an unauthorized phone is not offered', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { runner } = usbRunner('List of devices attached\nAAAA0001\tunauthorized\n')
+      const wrapper = new AdbWrapper(runner)
+      await wrapper.listDevices()
+      await wrapper.listDevices()
+      const said = warn.mock.calls.filter((c) => c.some((a) => String(a).includes('authorize USB debugging')))
+      expect(said).toHaveLength(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  // Mutation: read the properties on every listing, or keep the serial once the phone is unplugged.
+  it('reads a phone once while it stays plugged in, and forgets it when unplugged', async () => {
+    const rows = { now: `List of devices attached\n${SERIAL}\tdevice\n` }
+    const { runner, exec, shellsFor } = usbRunner('')
+    exec.mockImplementation(async (...args: string[]) => {
+      if (args[0] === 'devices') return rows.now
+      return args.includes('shell') ? FLIP4_PROPS : ''
+    })
+    const wrapper = new AdbWrapper(runner)
+    await wrapper.listDevices()
+    await wrapper.listDevices()
+    expect(shellsFor(SERIAL)).toBe(1)
+    rows.now = 'List of devices attached\n'
+    expect((await wrapper.listDevices()).some((d) => d.kind === 'physical')).toBe(false)
+    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBeUndefined()
+    rows.now = `List of devices attached\n${SERIAL}\tdevice\n`
+    await wrapper.listDevices()
+    expect(shellsFor(SERIAL)).toBe(2)
+  })
+
+  // Mutation: let one phone's failed read reject the whole listing, which costs the emulators too.
+  it('lists the rest when a phone cannot be read', async () => {
+    const { runner, exec } = usbRunner(`List of devices attached\nemulator-5554\tdevice\n${SERIAL}\tdevice\n`)
+    const base = exec.getMockImplementation()!
+    exec.mockImplementation(async (...args: string[]) => {
+      if (args[1] === SERIAL) throw new Error('device offline')
+      return base(...args)
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const devices = await new AdbWrapper(runner).listDevices()
+      expect(devices.map((d) => d.id)).toEqual(['avd:Pixel_8_API_34'])
+    } finally {
+      warn.mockRestore()
+    }
+  })
+})

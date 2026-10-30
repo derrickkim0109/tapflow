@@ -51,7 +51,7 @@ import {
   type RunResetStep,
 } from '@tapflowio/agent-core/utils'
 import { execFile } from 'child_process'
-import { AdbWrapper } from './AdbWrapper.js'
+import { AdbWrapper, isPhysicalDevice } from './AdbWrapper.js'
 import { EmulatorLauncher, findEmulatorPid, probeEmulator, stopEmulatorProcess } from './EmulatorLauncher.js'
 import { ensureHelperApp, launchMuteOnlyTap, isAudioSupported } from '@tapflowio/audiotap-helper'
 import { AndroidTouchHelper } from './AndroidTouchHelper.js'
@@ -77,6 +77,30 @@ const logger = createLogger('android-agent')
 // split the protocol documents. Added last, after the handler and the boot-time reset, because the
 // string on its own is what puts a control on screen.
 const AGENT_CAPABILITIES: AgentCapability[] = ['clipboard', 'full-reset', 'network-control', 'build-download', 'launch-options']
+
+/**
+ * What a USB-connected phone cannot do, and what the requester is told. Each is an emulator-only path — a console
+ * command, the gRPC endpoint or a launch argument — or one that would leave the phone changed after the session (#152),
+ * so it is refused up front through the reply that message type already uses for a failure.
+ */
+const PHYSICAL_REFUSALS = {
+  'full-erase': 'Full reset is not available on a USB-connected device — it would erase the phone',
+  network: 'Network control is not available on a USB-connected device',
+  posture: 'Folding is not available on a USB-connected device — fold the phone itself',
+  clipboard: 'The clipboard is not available on a USB-connected device yet',
+} as const
+type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
+
+/** The refusal message when `deviceId` is a USB-connected device, which cannot do `op`; null for an emulator. */
+function physicalRefusal(deviceId: string, op: PhysicalRefusal): string | null {
+  return isPhysicalDevice(deviceId) ? PHYSICAL_REFUSALS[op] : null
+}
+
+/** The same, thrown — for the `DeviceAgent` entry points, whose failures are rejections. */
+function refusePhysical(deviceId: string, op: PhysicalRefusal): void {
+  const refusal = physicalRefusal(deviceId, op)
+  if (refusal) throw new PlatformError(refusal)
+}
 
 // Parse H.264 SPS NAL unit to extract frame dimensions.
 // scrcpy sends a new SPS (inside an IDR keyframe) whenever the capture size changes —
@@ -548,7 +572,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     this._stopping = false
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null }
     this.relayUrl = relayUrl
-    const allDevices = await this.adb.listDevices()
+    const allDevices = await this.listAllDevices()
     const devices = this.deviceFilter
       ? allDevices.filter((d) => d.name === this.deviceFilter || d.id === this.deviceFilter)
       : allDevices
@@ -581,7 +605,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
             osVersion: d.osVersion,
             // Read here and nowhere else — `listDevices` runs in the boot and refresh paths too, and
             // the config does not change while the agent is connected.
-            formFactor: this.avdFormFactor(d.name),
+            formFactor: d.kind === 'physical' ? d.formFactor : this.avdFormFactor(d.name),
+            kind: d.kind,
           })),
         })
       })
@@ -905,6 +930,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   private readonly metricsGapMs: number = Number(process.env.TAPFLOW_METRICS_GAP_MS) || METRICS_SAMPLE_GAP_MS
 
   async listPostures(deviceId: string): Promise<DevicePosture[]> {
+    // A foldable phone lists its postures (a Galaxy Z Flip4 offers CLOSED to OPENED), but only the emulator console
+    // can move a device between them — the hinge is the phone's own.
+    if (isPhysicalDevice(deviceId)) return []
     const cached = this.postureCache.get(deviceId)
     if (cached) return cached
     const serial = this.adb.getSerial(deviceId)
@@ -961,6 +989,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    * out after `POSTURE_COMMIT_TIMEOUT_MS`, and the report then says what the device really is.
    */
   private async beginPosture(deviceId: string, postureId: string): Promise<{ serial: string; before: 0 | 90 | 180 | 270 | null }> {
+    refusePhysical(deviceId, 'posture')
     const serial = this.adb.getSerial(deviceId)
     if (!serial) throw new PlatformError(`No device for ${deviceId}`)
     // Checked against the list rather than passed through. The list is what the *guest* says it
@@ -1483,7 +1512,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     if (!opts.restart) {
       await this.enqueueRotation(state.deviceId, () => (serial.startsWith('emulator-')
         ? this.prepareBody(state, serial, opts.upright === true)
-        : this.uprightOnBoot(serial)))
+        : this.uprightOnBoot(state.deviceId, serial)))
     }
 
     // Emulator: capture via gRPC streamScreenshot + Mac VideoToolbox (bypasses the guest SW H.264
@@ -2039,11 +2068,15 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       if (tier) { state.secureContext = tier.secureContext; state.external = tier.external }
       this.sendOn(ws, { type: 'device:booting', sessionId })
       const avdName = avdId.replace(/^avd:/, '')
-      const devices = await this.adb.listDevices()
+      const devices = await this.listAllDevices()
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
 
       const target = devices.find((d) => d.id === avdId)
       if (!target) throw new PlatformError(`Device not found: ${avdId}`)
+      if (target.kind === 'physical') {
+        await this.bootPhysical(state, target, seq, sessionId, requestId, fullErase, runReset)
+        return
+      }
 
       // `-wipe-data` is a **launch** argument, so an emulator that is already up cannot honour it
       // where it stands — the mirror of `simctl erase` refusing a booted device (#439). A device
@@ -2119,7 +2152,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         }
       }
 
-      const refreshed = await this.adb.listDevices()
+      const refreshed = await this.listAllDevices()
       if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
       // **Before the device is described or declared ready** (#611) — `device:booting` has gone out already. `target` was read before this boot waited on anything,
       // and a Full reset another boot began can have stopped the emulator since — adb still listed it
@@ -2177,6 +2210,35 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     }
   }
 
+  /**
+   * A USB-connected device's boot, run inside `handleDeviceBoot`'s try. It is already on and tapflow never starts or
+   * stops it, so there is no launch, wipe, gRPC, Lean mode or network reset — what is left is the scrcpy stream and
+   * input, then the same `device:ready` an emulator sends. The rotation lock it came with is remembered by the stream
+   * start (`uprightOnBoot`) and written back at shutdown.
+   */
+  private async bootPhysical(state: DeviceState, device: Device, seq: number, sessionId: string, requestId: string | undefined, fullErase: boolean, runReset: RunResetRequest | undefined): Promise<void> {
+    if (fullErase) throw new PlatformError(PHYSICAL_REFUSALS['full-erase'])
+    if (!this.adb.getSerial(device.id)) throw new PlatformError(`Device not found: ${device.id}`)
+    this.sendDeviceInfo(state, device)
+    const streamWs = await this.openStreamWs(state)
+    if (seq !== state.bootSeq) {
+      streamWs.close()
+      this.abandonBoot(state, seq, sessionId, requestId)
+      return
+    }
+    await this.startVideoStream(state, streamWs, () => seq === state.bootSeq, { restart: false })
+    if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+    const runResetReport = runReset ? await this.resetForRun(state, runReset, () => seq !== state.bootSeq) : undefined
+    if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+    await this.awaitPendingClears(state.deviceId)
+    if (seq !== state.bootSeq) { this.abandonBoot(state, seq, sessionId, requestId); return }
+    this.sendChrome(state)
+    void this.sendPostures(state)
+    state.booted = true
+    this.ownedDevices.add(device.id)
+    this.sendMsg({ type: 'device:ready', sessionId, requestId, payload: { deviceId: device.id, cold: false, ...(runResetReport ? { runReset: runResetReport } : {}) } })
+  }
+
   // ── network on/off (#607) ──────────────────────────────────────────────────────────────────
   //
   // Airplane mode, so the **OS** goes offline rather than the app being lied to. That is what makes
@@ -2196,6 +2258,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    * the callers above refuse with '2 booted devices' on the common two-simulator desk".
    */
   private readonly ownedDevices = new Set<string>()
+
+  /** Per `usb:` device, the rotation lock it had before its session, until it is written back (#1033). */
+  private readonly physicalRotation = new Map<string, { mode: 'free' } | { mode: 'lock'; rotation: 0 | 1 | 2 | 3 }>()
 
   private serialFor(sessionId: string): string | undefined {
     const state = this.deviceStates.get(sessionId)
@@ -2327,6 +2392,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     const serial = this.serialFor(sessionId)
     if (!serial) return
     const state = this.deviceStates.get(sessionId)
+    if (state && isPhysicalDevice(state.deviceId)) return
     const known = lastKnownOffline ?? state?.lastNetworkOffline
     const payload = await this.readNetworkState(serial, known)
     if (trigger === 're-join' && payload.offline === undefined) return
@@ -2348,6 +2414,12 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
         type: 'network:error', sessionId, requestId,
         message: 'No booted device — boot one before changing its network.',
       })
+      return
+    }
+    // Airplane mode would work on a phone, but a session that ends offline would leave it offline.
+    const networkRefusal = physicalRefusal(this.deviceStates.get(sessionId)?.deviceId ?? '', 'network')
+    if (networkRefusal) {
+      this.sendMsg({ type: 'network:error', sessionId, requestId, message: networkRefusal })
       return
     }
 
@@ -2416,6 +2488,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     // **The write #617 was filed about.** This took the first-registered session, so on an agent
     // holding several it took *someone else's* device off the network while they were testing on it.
     const { state, serial } = this.soleLive()
+    refusePhysical(state.deviceId, 'network')
     // Same fallback as the WS path, for the reason recorded there.
     const before = await this.readNetworkState(serial, state.lastNetworkOffline)
     if (before.available) state.lastNetworkOffline = before.offline
@@ -2434,6 +2507,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
 
   async networkState(): Promise<NetworkStatePayload> {
     const live = this.soleLive()
+    refusePhysical(live.state.deviceId, 'network')
     // A device never observed whose read now fails answers `NetworkUnobserved`, where this used to
     // throw because the payload had no way to say "not known" (#667). The capability promises an
     // answer for a device that is there; an absent device still throws, from `soleLive`.
@@ -2457,6 +2531,15 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
 
     const seq = this.bumpBootSeq(state, 'shut-down')
     this.cleanupDeviceState(state)
+
+    // A USB-connected device was never started by tapflow, so it is not stopped either: the stream is down, and its
+    // rotation lock goes back to what it was before the session.
+    if (isPhysicalDevice(avdId)) {
+      await this.restoreRotation(avdId)
+      this.ownedDevices.delete(avdId)
+      this.sendMsg({ type: 'device:shutdown-done', sessionId, requestId, payload: { deviceId: avdId } })
+      return
+    }
 
     // **A failed kill is judged by the process table, not assumed benign** (#455). It used to be logged as
     // "already gone?" and answered done — often right, and exactly why the case where it was wrong stayed
@@ -2655,7 +2738,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
 
   private async isBooted(deviceId: string): Promise<boolean> {
     try {
-      const devices = await this.adb.listDevices()
+      const devices = await this.listAllDevices()
       return devices.find((d) => d.id === deviceId)?.status === 'booted'
     } catch { return false }
   }
@@ -2741,8 +2824,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     }
   }
 
-  private async uprightOnBoot(serial: string): Promise<void> {
+  private async uprightOnBoot(deviceId: string, serial: string): Promise<void> {
     const lock = await this.adb.getUserRotation(serial)
+    // Only the first reading: a re-boot inside the session would otherwise remember the lock tapflow wrote (#1033).
+    if (isPhysicalDevice(deviceId) && !this.physicalRotation.has(deviceId)) this.physicalRotation.set(deviceId, lock)
     if (lock.mode !== 'lock' || lock.rotation === 0) return
     logger.info(`rotation: standing the device up from lock ${lock.rotation}`)
     await this.adb.setRotation(serial, 0)
@@ -3288,6 +3373,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           })
         // Distinguish the three ways this can be unavailable — they need different fixes.
         if (!state || !serial) { fail('No booted device'); break }
+        const clipboardRefusal = physicalRefusal(state.deviceId, 'clipboard')
+        if (clipboardRefusal) { fail(clipboardRefusal, true); break }
         if (!state.grpcClient) {
           // `unsupported` means this backend has no clipboard channel at all, so it can never
           // park a sentinel — which makes it the one error where the viewer may safely press
@@ -3528,9 +3615,45 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     }
   }
 
-  listDevices(): Promise<Device[]> { return this.adb.listDevices() }
+  listDevices(): Promise<Device[]> { return this.listAllDevices() }
+
+  /**
+   * Every device adb offers, and the moment a USB-connected one that left a session without its rotation lock written
+   * back — unplugged mid-session, so the shutdown could not reach it — is free to be put right.
+   */
+  private async listAllDevices(): Promise<Device[]> {
+    const devices = await this.adb.listDevices()
+    for (const id of this.physicalRotation.keys()) {
+      const held = [...this.deviceStates.values()].some((s) => s.deviceId === id && (s.booted || s.bootsInFlight.size > 0))
+      if (!held && devices.some((d) => d.id === id)) void this.restoreRotation(id)
+    }
+    return devices
+  }
+
+  /**
+   * Write back the rotation lock a USB-connected device had before its session (#1033): a session's rotate writes
+   * `wm user-rotation lock`, which turns auto-rotate off on the phone outside tapflow too. Forgotten only once written,
+   * so a device that is gone keeps it for the next listing that sees it again.
+   */
+  private restoreRotation(deviceId: string): Promise<void> {
+    return this.enqueueRotation(deviceId, async () => {
+      const before = this.physicalRotation.get(deviceId)
+      const serial = this.adb.getSerial(deviceId)
+      if (!before || !serial) return
+      if (before.mode === 'free') await this.adb.freeRotation(serial)
+      else await this.adb.setRotation(serial, before.rotation)
+      this.physicalRotation.delete(deviceId)
+      logger.info(`rotation: put ${deviceId} back to ${before.mode === 'free' ? 'auto-rotate' : `lock ${before.rotation}`}`)
+    })
+  }
 
   async boot(avdId: string): Promise<void> {
+    if (isPhysicalDevice(avdId)) {
+      // Nothing to start: listing it is what maps its serial.
+      if (!(await this.listAllDevices()).some((d) => d.id === avdId)) throw new PlatformError(`Device not found: ${avdId}`)
+      this.ownedDevices.add(avdId)
+      return
+    }
     const avdName = avdId.replace(/^avd:/, '')
     this.launcher.launch(avdName)
     const serial = await this.launcher.findSerial(avdName)
@@ -3540,6 +3663,11 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   }
 
   async shutdown(avdId: string): Promise<void> {
+    if (isPhysicalDevice(avdId)) {
+      await this.restoreRotation(avdId)
+      this.ownedDevices.delete(avdId)
+      return
+    }
     const serial = this.adb.getSerial(avdId)
     if (serial) {
       await this.adb.shutdown(serial)
@@ -3639,7 +3767,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     await installReclaimingStorage({
       install: () => adb.installApp(serial, apkPath),
       device,
-      owned: this.ownedDevices.has(state.deviceId),
+      // Never on a phone: reclaiming rolls back its system apps' updates.
+      owned: this.ownedDevices.has(state.deviceId) && !isPhysicalDevice(state.deviceId),
     })
   }
 
