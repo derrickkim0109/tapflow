@@ -75,6 +75,14 @@ describe('DevicectlWrapper.listPhysicalDevices', () => {
     expect(devices.map((d) => d.name)).toEqual(['iPhone A'])
   })
 
+  // Mutation: drop the timeout on its way to exec. A boot would then wait out devicectl's 15 s default on a hung
+  // CoreDevice daemon, simulators included.
+  it('hands a caller\'s timeout to devicectl, and still never rejects', async () => {
+    const exec = vi.fn().mockRejectedValue(new Error('Command failed: timed out'))
+    await expect(new DevicectlWrapper(exec).listPhysicalDevices(3_000)).resolves.toEqual([])
+    expect(exec).toHaveBeenCalledWith(['devicectl', 'list', 'devices', '-j', '-', '-q'], 3_000)
+  })
+
   // A Mac without devicectl (no Xcode 15+) or one where it fails must still list its simulators: the caller merges
   // this list into the simulator one. Mutation: let the error through, and `agent:register` never goes out.
   it('lists no devices when devicectl fails', async () => {

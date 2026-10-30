@@ -4081,6 +4081,21 @@ describe('IOSAgent', () => {
       agent.disconnect()
     })
 
+    // Mutation: list devices on boot without the short devicectl timeout — every boot, a simulator's too, then waits
+    // out devicectl's 15 s default whenever CoreDevice hangs.
+    it('bounds the devicectl list a boot waits on', async () => {
+      const devicectl = devicectlWith([PHONE])
+      const agent = new IOSAgent({ intervalMs: 50, devicectl, physicalCaptureFactory: vi.fn(fakeCapture) }, mockSimctl(false))
+      const internal = agent as unknown as Internals
+      await agent.connect(`ws://localhost:${port}`)
+      const sim = [...internal.deviceStates.entries()].find(([, s]) => s.deviceId === 'dev-1')![0]
+      vi.mocked(devicectl.listPhysicalDevices).mockClear()
+      internal.handleRelayMessage({ type: 'device:boot', requestId: 'rq-sim', sessionId: sim, payload: { deviceId: 'dev-1' } })
+      await vi.waitFor(() => expect(devicectl.listPhysicalDevices).toHaveBeenCalled())
+      expect(devicectl.listPhysicalDevices).toHaveBeenCalledWith(3_000)
+      agent.disconnect()
+    })
+
     // Mutation: default the factory to `ScreenCaptureStreamer` — a physical boot would then stream a simulator path.
     it('fails the boot, saying why, while this build has no physical capture', async () => {
       const ctx = await connected({ capture: null })
