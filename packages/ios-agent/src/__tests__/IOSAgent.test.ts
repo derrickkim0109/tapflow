@@ -112,6 +112,7 @@ import type { DeviceChromeLoader, ChromeData } from '../DeviceChromeLoader'
 import { ScreenCaptureStreamer, type StreamFrame } from '../ScreenCaptureStreamer'
 import type { CaptureStreamer, PhysicalCaptureFactory } from '../CaptureStreamer'
 import { DevicectlWrapper, AppIdentityMismatchError, type AppBundleInfo } from '../DevicectlWrapper'
+import { CameraAccessDeniedError } from '../DeviceCaptureStreamer'
 import type { Device } from '@tapflowio/agent-core'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
 import { enumerateSimPids } from '../SimProcessTree'
@@ -4117,6 +4118,30 @@ describe('IOSAgent', () => {
       await agent.connect(`ws://localhost:${port}`)
       expect(devicectl.listPhysicalDevices).toHaveBeenCalledWith(3_000)
       agent.disconnect()
+    })
+
+    // Mutation: drop the `permanent` check in `pump` — a denied Camera restarts the helper over and over, each start
+    // failing the same way, while any other capture failure must still be retried.
+    it.each([
+      { name: 'not after Camera access was denied', error: () => new CameraAccessDeniedError('camera access denied'), restarts: false },
+      { name: 'after any other capture failure', error: () => new Error('no screen capture device'), restarts: true },
+    ])('restarts the phone capture $name', async ({ error, restarts }) => {
+      const capture = vi.fn((): CaptureStreamer => ({
+        start: () => new ReadableStream<StreamFrame>({ start(c) { c.error(error()) } }),
+        requestKeyframe: vi.fn(),
+        selectPanel: vi.fn(),
+      }))
+      const ctx = await connected({ capture })
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-cam', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(capture).toHaveBeenCalled())
+      if (restarts) {
+        await vi.waitFor(() => expect(capture.mock.calls.length).toBeGreaterThan(1))
+      } else {
+        // The first restart of a frameless run is immediate (`streamRestartPlan`), so one would have come by now.
+        await new Promise((r) => setTimeout(r, 300))
+        expect(capture).toHaveBeenCalledTimes(1)
+      }
+      ctx.agent.disconnect()
     })
 
     // Mutation: remove either refusal in `bootPhysical` — a Full reset or a run reset would answer ready having done

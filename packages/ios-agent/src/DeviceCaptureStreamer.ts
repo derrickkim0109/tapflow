@@ -137,10 +137,13 @@ const defaultDeps: DeviceCaptureDeps = {
   }),
 }
 
+/** Camera access was refused. Only granting it in System Settings helps, so a restart would only fail again. */
+export class CameraAccessDeniedError extends PlatformError {}
+
 function statusError(code: number, udid: string): PlatformError {
   switch (code) {
     case DEVICE_CAPTURE_EXIT.permission:
-      return new PlatformError(`[DeviceCaptureStreamer] camera access denied — ${CAMERA_HINT}`)
+      return new CameraAccessDeniedError(`[DeviceCaptureStreamer] camera access denied — ${CAMERA_HINT}`)
     case DEVICE_CAPTURE_EXIT.noDevice:
       return new PlatformError(`[DeviceCaptureStreamer] ${udid}: no screen capture device — connect the iPhone by USB, trust this Mac and unlock it`)
     default:
