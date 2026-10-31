@@ -44,6 +44,7 @@
 - [Configuring tapflow](https://www.tapflow.dev/operate/configure): `tapflow init` and the `tapflow.config.json` it writes — tunnel choice, streaming profile on a LAN, certificate method, and the `.env` that holds secrets. Skippable if port 4000 over HTTP with no tunnel is fine.
 - [Agent Setup](https://www.tapflow.dev/operate/agents): Start the Mac agent and connect it to the relay. listing and creating devices for iOS and Android, and authenticating a remote agent with a PAT.
 - [iOS Network Extension](https://www.tapflow.dev/operate/network-extension): Install and approve the network extension that iOS network control needs on the agent Mac, and recover when replacing it cuts the Mac off or a device comes back online by itself.
+- [USB-connected iPhones](https://www.tapflow.dev/operate/usb-iphone): Prepare an iPhone plugged into the agent Mac by USB — Developer Mode, `TAPFLOW_IOS_TEAM_ID` for the runner's signing, the Camera permission for screen capture, Auto-Lock — how builds install over the copy on the phone, and what a phone cannot do.
 
 ### Deploy the relay
 
