@@ -300,12 +300,13 @@ export interface MacAdmission {
   /** A cold boot holds this Mac's boot slot (`relay/src/admission/`). Another boot waits or is refused. */
   booting: boolean
   /** No person's `session:start` on this Mac would be let in now (`agent-resources-exhausted`): CPU is over the
-   *  line, or memory is and the relay has no device up here to rejoin. */
+   *  line, or memory is and the relay has no device up here to rejoin. Never while a USB phone (`kind: 'physical'`)
+   *  is attached: its join is not held to the Mac's load. */
   overloaded: boolean
   /** Devices of this agent a person's join would be refused for memory now: memory is over the line and the
    *  relay has not brought these up (`readySent`), so joining would start them. Empty when memory is fine. Per
    *  device rather than a flag, because "running" by the device list's `status` is not the relay's rule — a
-   *  simulator booted before its agent registered reads `booted` and is still refused. */
+   *  simulator booted before its agent registered reads `booted` and is still refused. A USB phone is never listed. */
   memoryRefuses: string[]
 }
 
@@ -1548,6 +1549,13 @@ export interface AppInstallDone {
   type: 'app:install-done'
   sessionId: string
   requestId: string
+  /**
+   * Set when the app is ready, but not as the build that was sent: a simulator build sent to a USB-connected
+   * iPhone cannot be installed there, so the copy already on the phone is used, and the tester has to know they
+   * are not testing the build they picked. Prose for a person; absent on an ordinary install. A relay forwards the
+   * agent's frame as sent, so an older relay passes it on, and an older viewer ignores it.
+   */
+  warning?: string
 }
 
 /** The app was launched. Not that its screen is up: on iOS this follows the process start, on Android the first frame
