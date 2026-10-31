@@ -75,6 +75,7 @@ const enSidebar = [
           { text: 'Configure tapflow', link: '/operate/configure' },
           { text: 'Agents', link: '/operate/agents' },
           { text: 'iOS network extension', link: '/operate/network-extension' },
+          { text: 'Android phones over USB', link: '/operate/android-usb-devices' },
         ],
       },
       {
@@ -189,6 +190,7 @@ const koSidebar = [
           { text: 'tapflow 설정', link: '/ko/operate/configure' },
           { text: '에이전트 설정', link: '/ko/operate/agents' },
           { text: 'iOS 네트워크 확장', link: '/ko/operate/network-extension' },
+          { text: 'USB로 연결한 Android 폰', link: '/ko/operate/android-usb-devices' },
         ],
       },
       {

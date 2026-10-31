@@ -118,6 +118,10 @@ tapflow doctor
 
 See [Troubleshooting](/troubleshooting) for more detailed solutions.
 
+### Phones over USB
+
+Besides emulators, you can open an Android phone connected over USB. It is off by default; turn it on with `TAPFLOW_ANDROID_USB_DEVICES=1`. See [Android phones over USB](/operate/android-usb-devices) for preparing the phone and what it refuses.
+
 ## Stream quality
 
 Resolution and decoder are chosen automatically per viewer connection — tapflow streams in a **Standard**, **Smooth**, or **Remote** profile depending on how each viewer reaches the relay. See [Streaming Quality](/operate/streaming-quality) for the profiles and how to tune them.

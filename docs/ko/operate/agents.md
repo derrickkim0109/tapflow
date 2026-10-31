@@ -118,6 +118,10 @@ tapflow doctor
 
 더 자세한 문제 해결 방법은 [문제 해결](/ko/troubleshooting)을 참고하세요.
 
+### USB로 연결한 폰
+
+에뮬레이터 말고 USB로 연결한 Android 폰도 열 수 있습니다. 기본으로 꺼져 있으며 `TAPFLOW_ANDROID_USB_DEVICES=1`로 켭니다. 준비와 제약은 [USB로 연결한 Android 폰](/ko/operate/android-usb-devices)을 참고하세요.
+
 ## 스트림 품질
 
 해상도와 디코더는 각 시청자의 연결 방식에 따라 자동으로 선택됩니다 — tapflow는 각 시청자가 릴레이에 어떻게 도달하는지에 따라 **Standard**, **Smooth**, **Remote** 프로파일 중 하나로 스트리밍합니다. 프로파일과 튜닝 방법은 [스트림 품질](/ko/operate/streaming-quality)을 참고하세요.
