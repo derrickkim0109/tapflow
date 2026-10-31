@@ -174,7 +174,7 @@ describe('wire payload types are declared once, in @tapflowio/protocol', () => {
     const count = (name) => new Set(resolved(protoDecls, name)).size
     expect(count('ChromeData')).toBe(14) // 14 with `streamRotation`, `screenCornerRadii` and `scaleBasis` (iPhone Duo)
     expect(count('ChromeButton')).toBe(13)
-    expect(count('DeviceSummary')).toBe(10) // 9 with `holder`, the AI client driving a device; 10 with `serviceTier` (L2)
+    expect(count('DeviceSummary')).toBe(11) // 9 with `holder`, the AI client driving a device; 10 with `serviceTier` (L2); 11 with `kind` (#152)
     expect(count('SessionInfo')).toBe(6) // 6 with `admission`, the relay's reading of the Mac (L2)
   })
 

@@ -338,8 +338,8 @@ describe('browser-inbound routing matches the protocol union', () => {
       'device:shutdown-error': 'message requestId? sessionId',
       'network:error': 'message requestId sessionId',
       // Moved here from AgentToBrowser (#1087): the relay answers an install with `keepIfInstalled` itself when the
-      // build is already on the device.
-      'app:install-done': 'requestId sessionId',
+      // build is already on the device. `warning`: the agent's note that a USB phone kept the copy it had (#152).
+      'app:install-done': 'requestId sessionId warning?',
     },
     BrowserToRelay: {
       'agents:list': '',
