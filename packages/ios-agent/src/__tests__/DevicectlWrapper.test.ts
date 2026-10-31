@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { DevicectlWrapper, parsePhysicalDevices, parseAppInstalled, parseAppBundleInfo } from '../DevicectlWrapper.js'
+import { DevicectlWrapper, AppIdentityMismatchError, isIdentityMismatch, parsePhysicalDevices, parseInstalledApp, parseAppBundleInfo } from '../DevicectlWrapper.js'
 
 // Captured from `xcrun devicectl list devices -j -` (devicectl 506.7, Xcode 26.3) with five paired devices, names and
 // identifiers replaced and the fields nothing reads trimmed. Only iPhone A is usable: B is paired over the network,
@@ -100,16 +100,17 @@ const devicectlError = (line: string) => Object.assign(new Error(`Command failed
   stderr: `ERROR: ${line} (com.apple.dt.CoreDeviceError error 1000 (0x3E8))\n       DeviceName = ${UDID}\n`,
 })
 
-describe('parseAppInstalled', () => {
-  it('finds the app by bundle identifier', () => {
-    expect(parseAppInstalled(APPS, 'com.example.app')).toBe(true)
+describe('parseInstalledApp', () => {
+  // Mutation: drop the version. The warning for a simulator build could then not say which build is being tested.
+  it('finds the app by bundle identifier, with its version and build', () => {
+    expect(parseInstalledApp(APPS, 'com.example.app')).toEqual({ version: '3.0.3 (4)' })
   })
 
   // devicectl answers success with an empty `apps` for a bundle id that is not installed (measured).
   it('reads an empty list, or another app, as not installed', () => {
-    expect(parseAppInstalled({ ...APPS, result: { ...APPS.result, apps: [] } }, 'com.example.app')).toBe(false)
-    expect(parseAppInstalled(APPS, 'com.example.other')).toBe(false)
-    expect(parseAppInstalled(null, 'com.example.app')).toBe(false)
+    expect(parseInstalledApp({ ...APPS, result: { ...APPS.result, apps: [] } }, 'com.example.app')).toBeNull()
+    expect(parseInstalledApp(APPS, 'com.example.other')).toBeNull()
+    expect(parseInstalledApp(null, 'com.example.app')).toBeNull()
   })
 })
 
@@ -134,14 +135,14 @@ describe('DevicectlWrapper apps', () => {
   // the App Store reads as not installed (measured: Safari is missing without the flag and present with it).
   it('asks for every app with that bundle id', async () => {
     const exec = vi.fn().mockResolvedValue(JSON.stringify(APPS))
-    await expect(new DevicectlWrapper(exec).isAppInstalled(UDID, 'com.example.app')).resolves.toBe(true)
+    await expect(new DevicectlWrapper(exec).installedApp(UDID, 'com.example.app')).resolves.toEqual({ version: '3.0.3 (4)' })
     expect(exec).toHaveBeenCalledWith(['devicectl', 'device', 'info', 'apps', '--device', UDID, '--bundle-id', 'com.example.app', '--include-all-apps', '-j', '-', '-q'])
   })
 
   // Mutation: answer false on a failure. A phone that is locked or unplugged would then be told to install an app it has.
   it('rejects with devicectl\'s own reason when it cannot list the apps', async () => {
     const exec = vi.fn().mockRejectedValue(devicectlError('The specified device was not found.'))
-    await expect(new DevicectlWrapper(exec).isAppInstalled(UDID, 'com.example.app')).rejects.toThrow(
+    await expect(new DevicectlWrapper(exec).installedApp(UDID, 'com.example.app')).rejects.toThrow(
       `could not list the apps on ${UDID}: The specified device was not found. (com.apple.dt.CoreDeviceError error 1000 (0x3E8))`,
     )
   })
@@ -160,7 +161,24 @@ describe('DevicectlWrapper apps', () => {
 
   it('names the failure with devicectl\'s reason when an install is refused', async () => {
     const exec = vi.fn().mockRejectedValue(devicectlError('Unable to install "Example".'))
-    await expect(new DevicectlWrapper(exec).installApp(UDID, '/tmp/Example.app')).rejects.toThrow(/^install failed: Unable to install "Example"\./)
+    const install = new DevicectlWrapper(exec).installApp(UDID, '/tmp/Example.app')
+    await expect(install).rejects.toThrow(/^install failed: Unable to install "Example"\./)
+    await expect(install).rejects.not.toBeInstanceOf(AppIdentityMismatchError)
+  })
+
+  // Mutation: call every refused install a mismatch, or none. Every failure would then remove the tester's copy
+  // before failing again — or a build signed for another team could never replace the TestFlight one.
+  it('tells an install refused only because the installed copy is signed differently', async () => {
+    const mismatch = {
+      ...devicectlError('Unable to install "Example".'),
+      stderr: 'ERROR: Unable to install "Example". (com.apple.dt.CoreDeviceError error 3002 (0xBBA))\n'
+        + '       NSUnderlyingError = Error Domain=MIInstallerErrorDomain Code=13 "Failed to verify code signature" '
+        + 'UserInfo={LegacyErrorString=MismatchedApplicationIdentifierEntitlement}\n',
+    }
+    await expect(new DevicectlWrapper(vi.fn().mockRejectedValue(mismatch)).installApp(UDID, '/tmp/Example.app'))
+      .rejects.toBeInstanceOf(AppIdentityMismatchError)
+    expect(isIdentityMismatch(new Error("Upgrade's application-identifier entitlement string (A.com.example.app) does not match installed application's application-identifier string (B.com.example.app); rejecting upgrade."))).toBe(true)
+    expect(isIdentityMismatch(new Error('A valid provisioning profile for this executable was not found.'))).toBe(false)
   })
 
   // Mutation: read Info.plist from somewhere else, or let a read failure through. An unreadable bundle is `unknown`,

@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
-import { DeviceCaptureStreamer, DEVICE_CAPTURE_EXIT, CameraAccessDeniedError } from '../DeviceCaptureStreamer'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { DeviceCaptureStreamer, DEVICE_CAPTURE_EXIT, CameraAccessDeniedError, PermanentCaptureError, ensureDeviceCaptureApp, tildePath } from '../DeviceCaptureStreamer'
 import type { DeviceCaptureDeps, HelperSocket } from '../DeviceCaptureStreamer'
 
 // The system boundaries are the LaunchServices launch and the loopback socket; both are doubled here.
@@ -17,18 +20,26 @@ class FakeSocket extends EventEmitter implements HelperSocket {
 function harness(launchResult: Promise<void> = Promise.resolve()) {
   let accept: ((sock: HelperSocket) => void) | null = null
   const server = { port: 54321, close: vi.fn() }
+  const launch = vi.fn((_app: string, _args: string[]) => launchResult)
   const deps: DeviceCaptureDeps = {
-    ensureApp: () => '/apps/device-capture-helper.app',
+    ensureApp: () => Promise.resolve('/apps/device-capture-helper.app'),
     listen: (onConnection) => { accept = onConnection; return Promise.resolve(server) },
-    launch: vi.fn(() => launchResult),
+    launch,
   }
-  const connect = () => {
+  // The nonce the helper was launched with, which it sends before anything else.
+  const nonce = (): string => {
+    const args = launch.mock.calls.at(-1)?.[1] ?? []
+    return args[args.indexOf('--nonce') + 1] ?? ''
+  }
+  // A connection to the capture port: the helper's, opening with its nonce, unless `opening` says otherwise.
+  const connect = (opening: string = nonce()) => {
     const sock = new FakeSocket()
     if (!accept) throw new Error('listen was never called')
     accept(sock)
+    if (opening) sock.emit('data', Buffer.from(opening, 'latin1'))
     return sock
   }
-  return { deps, server, connect }
+  return { deps, server, connect, nonce }
 }
 
 const h264Frame = (flags: number, payload: number[]) => {
@@ -49,7 +60,19 @@ describe('DeviceCaptureStreamer', () => {
     new DeviceCaptureStreamer('00008140-0000000000000001', 30, 'h264', 1280, 'Test Phone', deps).start()
     await vi.advanceTimersByTimeAsync(0)
     expect(deps.launch).toHaveBeenCalledWith('/apps/device-capture-helper.app',
-      ['54321', '00008140-0000000000000001', '30', 'h264', '--max-size', '1280', '--name', 'Test Phone'])
+      ['54321', '00008140-0000000000000001', '30', 'h264', '--max-size', '1280', '--nonce', expect.stringMatching(/^[0-9a-f]{32}$/), '--name', 'Test Phone'])
+  })
+
+  // Mutation: pass `--sole` always (or never). With two phones attached, the helper would take a lone visible device
+  // for this phone when it may be the other; with one, a name that reads differently would fail the only phone there is.
+  it('tells the helper it is the only phone only when the agent says so', async () => {
+    const one = harness()
+    new DeviceCaptureStreamer('udid', 30, 'h264', 0, 'iPhone', one.deps, true).start()
+    const two = harness()
+    new DeviceCaptureStreamer('udid', 30, 'h264', 0, 'iPhone', two.deps).start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.mocked(one.deps.launch).mock.calls[0]![1]).toContain('--sole')
+    expect(vi.mocked(two.deps.launch).mock.calls[0]![1]).not.toContain('--sole')
   })
 
   // Mutations: parse from the first byte instead of skipping the status byte (every length is then off by
@@ -110,7 +133,9 @@ describe('DeviceCaptureStreamer', () => {
     await vi.advanceTimersByTimeAsync(0)
     const sock = connect()
     sock.emit('data', Buffer.from([DEVICE_CAPTURE_EXIT.permission]))
+    // The helper writes why and exits; one that only sent the byte is waited for briefly, then failed all the same.
     const denied = reader.read().catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(2_000)
     await expect(denied).resolves.toBeInstanceOf(CameraAccessDeniedError)
     await expect(Promise.reject(await denied)).rejects.toThrow(/Privacy & Security › Camera/)
     expect(sock.destroy).toHaveBeenCalled()
@@ -169,6 +194,46 @@ describe('DeviceCaptureStreamer', () => {
     expect(early.server.close).toHaveBeenCalled()
   })
 
+  // Mutation: take the first connection for the helper again (drop the nonce check). Any local process that reached the
+  // loopback port first would stream its own frames to the tester, and the real helper would be turned away.
+  it('closes a connection that does not open with the nonce, and still takes the helper after it', async () => {
+    const { deps, connect } = harness()
+    const reader = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, deps).start().getReader()
+    await vi.advanceTimersByTimeAsync(0)
+    const squatter = connect('0'.repeat(32))
+    squatter.emit('data', Buffer.concat([Buffer.from([0x00]), h264Frame(0x01, [6, 6, 6])]))
+    expect(squatter.destroy).toHaveBeenCalled()
+    const helper = connect()
+    helper.emit('data', Buffer.concat([Buffer.from([0x00]), h264Frame(0x01, [1, 2, 3])]))
+    expect((await reader.read()).value).toEqual({ payload: Buffer.from([1, 2, 3]), keyframe: true })
+    expect(helper.destroy).not.toHaveBeenCalled()
+  })
+
+  // Mutation: fail on the status byte alone. What the helper wrote about the failure — the devices it saw, the
+  // capture error — would be lost, since `open` leaves its stderr nowhere the agent can read.
+  it('reports what the helper wrote after a failure status', async () => {
+    const { deps, connect } = harness()
+    const reader = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, deps).start().getReader()
+    await vi.advanceTimersByTimeAsync(0)
+    const sock = connect()
+    sock.emit('data', Buffer.concat([Buffer.from([DEVICE_CAPTURE_EXIT.noDevice]), Buffer.from('no capture device within 10 s; seen: []')]))
+    sock.emit('close')
+    await expect(reader.read()).rejects.toThrow(/no screen capture device .*\(no capture device within 10 s; seen: \[\]\)/)
+  })
+
+  // Mutation: restart after an ambiguous name. Each restart would pick between the two phones again, and fail again.
+  it('refuses for good when two attached phones share the name, saying so', async () => {
+    const { deps, connect } = harness()
+    const reader = new DeviceCaptureStreamer('udid', 30, 'h264', 0, 'iPhone', deps).start().getReader()
+    await vi.advanceTimersByTimeAsync(0)
+    const sock = connect()
+    sock.emit('data', Buffer.concat([Buffer.from([DEVICE_CAPTURE_EXIT.ambiguous]), Buffer.from('2 attached iPhones are named "iPhone"')]))
+    sock.emit('close')
+    const e = await reader.read().catch((err: unknown) => err)
+    expect(e).toBeInstanceOf(PermanentCaptureError)
+    expect((e as Error).message).toMatch(/2 attached iPhones are named "iPhone" — give each iPhone its own name/)
+  })
+
   // Mutation: no status timeout — a phone that stays locked, or a Camera prompt nobody answers, would hang
   // the session silently after the helper connected.
   it('errors when the helper connects but capture never starts', async () => {
@@ -179,5 +244,63 @@ describe('DeviceCaptureStreamer', () => {
     const rejected = expect(reader.read()).rejects.toThrow(/capture did not start/)
     await vi.advanceTimersByTimeAsync(60_000)
     await rejected
+  })
+})
+
+describe('ensureDeviceCaptureApp', () => {
+  // A scripted swiftc/codesign: "compiles" by writing the output file, and lets a test hold a build open.
+  function build() {
+    const root = mkdtempSync(join(tmpdir(), 'tapflow-dch-'))
+    const src = join(root, 'pkg', 'device-capture-helper.swift')
+    mkdirSync(join(root, 'pkg'))
+    writeFileSync(src, '// v1')
+    const exec = vi.fn(async (cmd: string, args: string[], _timeoutMs: number) => {
+      if (cmd === 'swiftc') writeFileSync(args[args.indexOf('-o') + 1]!, 'binary')
+    })
+    return { src, cacheDir: join(root, 'cache'), exec, root }
+  }
+
+  // Mutations: build beside the package (a global install is not writable by the agent's user), or go back to a
+  // synchronous build — the call would then not hand back a promise before swiftc ran, and every simulator's stream
+  // and input stood still for the 3.6 s it takes.
+  it('builds into the cache directory, off the event loop, and signs the bundle', async () => {
+    const b = build()
+    const pending = ensureDeviceCaptureApp(b)
+    expect(b.exec).not.toHaveBeenCalled()
+    const app = await pending
+    expect(app).toBe(join(b.cacheDir, 'device-capture-helper.app'))
+    expect(existsSync(join(app, 'Contents', 'MacOS', 'device-capture-helper'))).toBe(true)
+    expect(readFileSync(join(app, 'Contents', 'Info.plist'), 'utf8')).toMatch(/NSCameraUsageDescription/)
+    expect(b.exec.mock.calls.map((c) => c[0])).toEqual(['swiftc', 'codesign'])
+    expect(existsSync(join(b.root, 'pkg', 'device-capture-helper.app'))).toBe(false)
+  })
+
+  // Mutation: gate on mtime, or not at all. npm unpacks every file with one fixed date, so an upgrade with a changed
+  // source would keep the old bundle; and rebuilding an unchanged one re-signs it, which asks for Camera access again.
+  it('rebuilds only when the source changed, and shares one build between concurrent callers', async () => {
+    const b = build()
+    await Promise.all([ensureDeviceCaptureApp(b), ensureDeviceCaptureApp(b)])
+    expect(b.exec.mock.calls.filter((c) => c[0] === 'swiftc')).toHaveLength(1)
+    await ensureDeviceCaptureApp(b)
+    expect(b.exec.mock.calls.filter((c) => c[0] === 'swiftc')).toHaveLength(1)
+    writeFileSync(b.src, '// v2')
+    await ensureDeviceCaptureApp(b)
+    expect(b.exec.mock.calls.filter((c) => c[0] === 'swiftc')).toHaveLength(2)
+  })
+
+  // Mutation: put the cache path in the build error as is. It reaches the dashboard, and the home directory names the
+  // agent Mac's user to every tester who opens a phone.
+  it('writes the home directory as ~ in what it reports', () => {
+    expect(tildePath('could not build device-capture-helper.app in /Users/someone/Library/Caches/tapflow: /Users/someone/x.swift:1: error', '/Users/someone'))
+      .toBe('could not build device-capture-helper.app in ~/Library/Caches/tapflow: ~/x.swift:1: error')
+    expect(tildePath('nothing to hide', '')).toBe('nothing to hide')
+  })
+
+  // Mutation: build in place. A failed build would leave a half bundle at the real path for the next launch.
+  it('leaves nothing at the bundle path when the build fails, and says why', async () => {
+    const b = build()
+    b.exec.mockRejectedValueOnce(Object.assign(new Error('Command failed'), { stderr: 'error: no such module' }))
+    await expect(ensureDeviceCaptureApp(b)).rejects.toThrow(/could not build device-capture-helper\.app in .*: error: no such module/)
+    expect(existsSync(join(b.cacheDir, 'device-capture-helper.app'))).toBe(false)
   })
 })

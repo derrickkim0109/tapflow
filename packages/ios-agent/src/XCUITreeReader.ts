@@ -44,6 +44,8 @@ interface RunnerHandle {
   // Set once the runner has announced its port and answered /health with `token`. Until then the handle only
   // marks the device as starting, so a stop can still find and kill the process.
   port?: number
+  // The end of xcodebuild's output, which names why a runner that exits early did.
+  tail: string
 }
 
 type ReadyRunner = RunnerHandle & { port: number }
@@ -83,6 +85,19 @@ export function parseTunnelAddress(doc: unknown): string | undefined {
 /** A URL host for an address: IPv6 literals go in brackets. */
 export function urlHost(address: string): string {
   return address.includes(':') ? `[${address}]` : address
+}
+
+/** A device build's stamp: what it was built from, then the devices it was built for. */
+export function formatDeviceStamp(base: string, devices: readonly string[]): string {
+  return `${base}|${[...new Set(devices)].join(',')}`
+}
+
+/** The stamp `formatDeviceStamp` wrote, or undefined for none (or one from before the devices were recorded). */
+export function parseDeviceStamp(stamp: string | undefined): { base: string; devices: string[] } | undefined {
+  if (!stamp) return undefined
+  const bar = stamp.lastIndexOf('|')
+  if (bar < 0) return undefined
+  return { base: stamp.slice(0, bar), devices: stamp.slice(bar + 1).split(',').filter(Boolean) }
 }
 
 /** The xcodebuild arguments that differ per platform: destination, products dir and, for a device, signing. */
@@ -181,6 +196,18 @@ const defaultNative: RunnerNative = {
   },
 }
 
+const TAIL_CHARS = 4096
+
+/** Why a runner that exited before it was ready did, as far as xcodebuild's last lines say, with what to check. */
+function exitedMessage(handle: RunnerHandle): string {
+  const check = handle.platform === 'physical'
+    ? 'check that the device is unlocked, trusts this Mac, and that the runner build is signed for it'
+    : 'check Xcode/simulator state'
+  const lines = handle.tail.split('\n').map((l) => l.trim()).filter(Boolean)
+  const said = lines.filter((l) => /error|fail/i.test(l)).slice(-2).join(' ').slice(0, 300)
+  return `tree runner exited before becoming ready — ${check}${said ? `: ${said}` : ''}`
+}
+
 function refused(e: unknown): boolean {
   return (e as { cause?: { code?: string } }).cause?.code === 'ECONNREFUSED'
 }
@@ -216,6 +243,9 @@ export interface RunnerInputClient {
   state(): 'ready' | 'starting' | 'unavailable'
   /** Sends one input request; rejects with the runner's own error text when it answers `ok: false`. */
   request(path: string, body?: string): Promise<void>
+  /** Why its last start failed, until a start succeeds (a retry under way included); null otherwise. Optional for a
+   *  scripted runner. */
+  lastError?(): string | null
 }
 
 // Drives the resident XCUITest runners, one per device: builds the runner once per platform (simulator, or iphoneos
@@ -227,7 +257,8 @@ export class XCUITreeReader {
   private readonly runners = new Map<string, RunnerHandle>()
   private readonly starting = new Map<string, Promise<ReadyRunner>>()
   private readonly building = new Map<RunnerPlatform, Promise<void>>()
-  private readonly failed = new Set<string>()
+  // Devices whose last runner start failed, with why — the reason a write is refused until a new start is tried.
+  private readonly failed = new Map<string, string>()
   private stamp?: Promise<string>
   // A launch compares the generation it began with before it spawns, because `test-without-building` boots a
   // shut-down simulator and would power a device back up right after someone shut it down. A device's count is
@@ -276,16 +307,23 @@ export class XCUITreeReader {
     // with a runner per device, two first reads at once are the normal case, and the raw xcodebuild error is
     // its whole log.
     let building = this.building.get(platform)
+    // A device that joins another device's build is not in that build's profile; it checks again once it is done.
+    const joined = building !== undefined
     if (!building) {
       building = (async () => {
         const sources = await stamping
         if (platform === 'physical') {
-          // The team signs the products and the prefix names them, so a change to either is a different build.
+          // The team signs the products and the prefix names them, so a change to either is a different build. The
+          // devices are part of it too: the build registers the device it targets and signs with a profile that names
+          // the devices registered then, and `test-without-building` does not re-sign — so a phone the products were
+          // never built for cannot install them.
           const bundlePrefix = this.bundlePrefix()
-          const stamp = bundlePrefix ? `${sources}:${team}:${bundlePrefix}` : `${sources}:${team}`
-          if (this.native.builtStamp('physical') === stamp) return
-          logger.info('building tree runner for a physical device (first run, or its sources, Xcode, team or bundle prefix changed)...')
-          await this.native.build(this.destination(udid), stamp, bundlePrefix ? { team: team!, bundlePrefix } : { team: team! })
+          const base = bundlePrefix ? `${sources}:${team}:${bundlePrefix}` : `${sources}:${team}`
+          const built = parseDeviceStamp(this.native.builtStamp('physical'))
+          if (built?.base === base && built.devices.includes(udid)) return
+          const devices = built?.base === base ? [...built.devices, udid] : [udid]
+          logger.info('building tree runner for a physical device (first run, a device it was not built for, or its sources, Xcode, team or bundle prefix changed)...')
+          await this.native.build(this.destination(udid), formatDeviceStamp(base, devices), bundlePrefix ? { team: team!, bundlePrefix } : { team: team! })
         } else {
           if (this.native.builtStamp() === sources) return
           logger.info('building tree runner (first run, or its sources or Xcode changed — cached afterwards)...')
@@ -306,6 +344,7 @@ export class XCUITreeReader {
     } finally {
       if (this.building.get(platform) === building) this.building.delete(platform)
     }
+    if (joined && platform === 'physical') await this.ensureBuilt(udid)
   }
 
   private runnerAlive(h: RunnerHandle | undefined): h is RunnerHandle {
@@ -332,11 +371,13 @@ export class XCUITreeReader {
     }
     const starting = this.launchRunner(udid)
     this.starting.set(udid, starting)
-    this.failed.delete(udid)
     try {
-      return await starting
+      const ready = await starting
+      // Kept through a retry, so an input refused while the next start is under way can still say why the last failed.
+      this.failed.delete(udid)
+      return ready
     } catch (e) {
-      if (this.starting.get(udid) === starting) this.failed.add(udid)
+      if (this.starting.get(udid) === starting) this.failed.set(udid, e instanceof Error ? e.message : String(e))
       throw e
     } finally {
       if (this.starting.get(udid) === starting) this.starting.delete(udid)
@@ -401,7 +442,7 @@ export class XCUITreeReader {
       ? this.native.spawn(this.destination(udid), token, 'physical')
       : this.native.spawn(this.destination(udid), token)
     proc.on('error', (e) => logger.error('tree runner process error:', e.message))
-    const handle: RunnerHandle = { proc, udid, token, host, platform }
+    const handle: RunnerHandle = { proc, udid, token, host, platform, tail: '' }
     this.runners.set(udid, handle)
     const port = await this.waitReady(handle)
     // Stopped while it was coming up: its xcodebuild takes seconds to exit, and until then the runner still answers.
@@ -425,9 +466,10 @@ export class XCUITreeReader {
         if (err) reject(err)
         else resolve(port as number)
       }
-      const onExit = (): void => settle(new PlatformError('tree runner exited before becoming ready — check Xcode/simulator state'))
+      const onExit = (): void => settle(new PlatformError(exitedMessage(handle)))
       const timer = setTimeout(() => settle(new PlatformError('tree runner did not become ready in time')), Math.max(0, deadline - Date.now()))
       handle.proc.stdout?.on('data', (chunk: Buffer | string) => {
+        handle.tail = (handle.tail + chunk.toString()).slice(-TAIL_CHARS)
         if (settled) return
         // A chunk boundary can split the line, so keep the unfinished tail.
         pending += chunk.toString()
@@ -449,7 +491,7 @@ export class XCUITreeReader {
       // A clock, not an iteration count: a refused connection fails at once, so the count would set the cap
       // through the sleep below.
       while (Date.now() < deadline) {
-        if (!this.runnerAlive(handle)) throw new PlatformError('tree runner exited before becoming ready — check Xcode/simulator state')
+        if (!this.runnerAlive(handle)) throw new PlatformError(exitedMessage(handle))
         try {
           const r = await fetch(`http://${handle.host}:${port}/health`, { headers: tokenHeader(handle.token), signal: AbortSignal.timeout(1000) })
           if (r.ok) {
@@ -542,6 +584,7 @@ export class XCUITreeReader {
         return this.failed.has(udid) && !this.starting.has(udid) ? 'unavailable' : 'starting'
       },
       request: (path, body) => this.input(udid, path, body),
+      lastError: () => this.failed.get(udid) ?? null,
     }
   }
 

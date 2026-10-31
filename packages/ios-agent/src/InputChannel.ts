@@ -43,4 +43,9 @@ export interface InputChannel {
   pressButtonUp(usagePage: number, usage: number): boolean
   /** 0 = home, 1 = lock. */
   pressLegacyButton(code: number): boolean
+
+  /** Why the last write was refused, when no retry and no reconnect could ever send it — a pinch on a device whose
+   *  only input path has none — as prose for the requester; null when it was refused for any other reason.
+   *  `IOSAgent.refusalReason` answers `unsupported` on it. Only a channel with such inputs implements it. */
+  unsupportedReason?(): string | null
 }

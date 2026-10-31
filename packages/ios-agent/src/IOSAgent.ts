@@ -45,14 +45,32 @@ const INPUT_ERROR_MESSAGES: Record<InputErrorReason, string> = {
   'not-session-owner': 'this input was addressed to a session the sender does not hold',
 }
 
+// How long a phone's input ack waits for its runner's answer: under the 2 s a client (mcp-server) waits for the ack,
+// so a key that lands slowly is still answered rather than timed out. `input:type` has its own reply, waited 15 s.
+const RUNNER_ANSWER_WAIT_MS = 1_500
+const RUNNER_TYPE_WAIT_MS = 10_000
+
+/** The runner's refusal of `write` as prose, or null once it took it or `ms` passed without an answer. */
+async function runnerAnswer(write: Promise<void>, ms: number): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), ms) })
+  try {
+    return await Promise.race([write.then(() => null, (e: unknown) => (e instanceof Error ? e.message : String(e))), late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // A devicectl list answers in under a second (see `DevicectlWrapper`); a boot does not wait longer for a stuck one.
 const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
 
 /**
  * What a USB-connected iPhone or iPad cannot do yet, and what the requester is told. Each would otherwise reach a
  * simctl-only path — run against a hardware UDID it would fail with xcrun's noise at best — so it is refused up
- * front, through the reply that message type already uses for a failure. `input` is the exception: input on a phone
- * goes through its UI-test runner, and this is what a write is told while that runner is not ready.
+ * front, through the reply that message type already uses for a failure. `input` and `button` are the exceptions:
+ * input on a phone goes through its UI-test runner, and `input` is what a write is told while that runner is not
+ * ready (with the reason its last start failed, when it did — see `physicalInputMessage`); `button` is a hardware
+ * button the runner has no way to press.
  */
 const PHYSICAL_REFUSALS = {
   'full-erase': 'Full reset is not available on a USB-connected device',
@@ -63,7 +81,8 @@ const PHYSICAL_REFUSALS = {
   rotation: 'Rotation is not available on a USB-connected device yet',
   'open-url': 'Opening a URL on a USB-connected device is not supported yet',
   screenshot: 'Screenshots of a USB-connected device are not supported yet',
-  input: 'The UI-test runner on this USB-connected device is not ready — it is still starting, or its last start failed (see the agent log); retry in a moment',
+  input: 'The UI-test runner on this USB-connected device is not ready — it is still starting; retry in a moment',
+  button: 'cannot be pressed on a USB-connected device: XCUITest presses only home and the volume buttons',
   keyboard: 'The software keyboard cannot be shown or hidden on a USB-connected device',
 } as const
 type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
@@ -121,8 +140,8 @@ import {
 } from '@tapflowio/agent-core'
 import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer.js'
 import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
-import { DevicectlWrapper } from './DevicectlWrapper.js'
-import { DeviceCaptureStreamer, CameraAccessDeniedError } from './DeviceCaptureStreamer.js'
+import { DevicectlWrapper, AppIdentityMismatchError } from './DevicectlWrapper.js'
+import { DeviceCaptureStreamer, PermanentCaptureError } from './DeviceCaptureStreamer.js'
 import { XCUITestInput } from './XCUITestInput.js'
 import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
@@ -309,6 +328,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   /** Every USB-connected device any list has returned. Never pruned: a hardware UDID never names a simulator, and a
    *  device unplugged mid-session must still be kept off simctl's paths (a shutdown must not `simctl shutdown` it). */
   private readonly physicalDevices = new Set<string>()
+  /** How many USB-connected devices the last list returned. With one, the capture helper may take the only phone it
+   *  sees even when its name reads differently there; with two, that phone could be the other one. */
+  private physicalListed = 0
   private readonly network: SimulatorNetwork
   private readonly fps: number
   private readonly intervalMs: number | undefined
@@ -445,7 +467,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.devicectl = options.devicectl ?? new DevicectlWrapper(process.env.VITEST ? () => Promise.resolve('{}') : undefined)
     this.physicalCaptureFactory = options.physicalCaptureFactory ?? (process.env.VITEST
       ? physicalCaptureUnavailable
-      : (udid, fps, codec, maxSize) => new DeviceCaptureStreamer(udid, fps, codec, maxSize, this.physicalNames.get(udid) ?? null))
+      : (udid, fps, codec, maxSize) => new DeviceCaptureStreamer(udid, fps, codec, maxSize, this.physicalNames.get(udid) ?? null, undefined, this.physicalListed === 1))
     this.physicalInputFactory = options.physicalInputFactory ?? (process.env.VITEST
       ? () => new UnavailableInput()
       : (deviceId) => new XCUITestInput({
@@ -514,6 +536,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private async listAllDevices(listTimeoutMs?: number, devicectlTimeoutMs?: number): Promise<Device[]> {
     const [simulators, physical] = await Promise.all([this.simctl.listDevices(listTimeoutMs), this.devicectl.listPhysicalDevices(devicectlTimeoutMs)])
     for (const d of physical) { this.physicalDevices.add(d.id); this.physicalNames.set(d.id, d.name) }
+    this.physicalListed = physical.length
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
   }
 
@@ -972,6 +995,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const pump = async () => {
       let delivered = false
       let permanent = false
+      let failure: string | null = null
       try {
         while (true) {
           const { value, done } = await reader.read()
@@ -989,13 +1013,27 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         }
       } catch (e) {
         // A cancelled reader ends with `done`, so what lands here is the capture failing: camera denied, no device,
-        // a helper that never reported its status.
-        logger.warn(`screen stream for ${state.deviceId} failed: ${e instanceof Error ? e.message : String(e)}`)
-        permanent = e instanceof CameraAccessDeniedError
+        // two phones with one name, a helper that never reported its status.
+        failure = e instanceof Error ? e.message : String(e)
+        logger.warn(`screen stream for ${state.deviceId} failed: ${failure}`)
+        permanent = e instanceof PermanentCaptureError
       }
       if (metricsTimer) clearInterval(metricsTimer)
-      if (!permanent && state.streamReader === reader && streamWs.readyState === WebSocket.OPEN) {
+      const current = state.streamReader === reader && streamWs.readyState === WebSocket.OPEN
+      // **A phone's capture failure is told to the session**, not only logged: the helper runs on the agent's Mac, so
+      // the reason (Camera denied, the phone locked or unplugged) is otherwise somewhere the tester is not, and all
+      // they see is a screen that never comes. Through `device:boot-error` without a correlator — Android's report of
+      // a dead stream, and the field the dashboard shows. Once per run of failures: when it will not be retried, or
+      // on the second failure in a row without a frame (the first is retried at once and usually recovers).
+      const report = (frameless: number): void => {
+        if (!physical || !current || !failure || this._stopping) return
+        if (!permanent && frameless !== 2) return
+        this.sendMsg({ type: 'device:boot-error', sessionId: state.sessionId, message: physicalCaptureFailure(failure) })
+      }
+      if (permanent) report(0)
+      if (!permanent && current) {
         const next = streamRestartPlan(failures, delivered)
+        report(next.failures)
         if (next.failures === 2) {
           logger.warn(`screen stream for ${state.deviceId} keeps ending before its first frame — backing off restarts`)
         }
@@ -1982,10 +2020,16 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * Safe to read at the ack site rather than inside the write, because iOS writes are synchronous —
    * but only for the question readiness answers. That is why ownership is asked separately.
    */
-  private refusalReason(helper: InputChannel | null, kind: 'continuation' | 'standalone'): InputErrorReason {
-    // Not `channel-unavailable`, which tells the caller to reconnect: no reconnect brings input to this device.
-    if (helper instanceof UnavailableInput) return 'unsupported'
+  private refusalReason(helper: InputChannel | null, kind: 'continuation' | 'standalone', fromWrite = true): InputErrorReason {
+    // First, and not `channel-unavailable` (which tells the caller to reconnect) nor `no-gesture` (which tells it to
+    // start another): an input the channel can never send — a pinch, a ⌘ chord, the side button on a phone — fails
+    // the same way however often it is retried. Only for a refusal a write just made (`fromWrite`): asked without
+    // one, the channel's last refusal is some earlier input's.
+    if (fromWrite && helper?.unsupportedReason?.()) return 'unsupported'
     const state = helper?.inputState() ?? 'unavailable'
+    // A phone whose runner failed and is being tried again: `channel-starting` is silent to the tester, and the next
+    // start is likely to fail the same way (no team set, a locked phone), so this says why rather than "a moment".
+    if (state === 'starting' && helper instanceof XCUITestInput && helper.runnerFailure()) return 'channel-unavailable'
     // No channel at all dominates: the caller must reconnect, and telling it to re-open a gesture
     // would send it round a loop that cannot succeed.
     if (state === 'unavailable') return 'channel-unavailable'
@@ -2009,15 +2053,51 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   // `requestId` is a parameter, never read from shared state: a gesture is dozens of frames and two can
   // overlap, so a correlator hoisted out of per-request scope would answer one input with another's id —
   // which is #499 rebuilt inside the agent. Same reason `seq` is passed in on the Android side.
-  private async ackInput(state: DeviceState, outcome: 'delivered' | InputErrorReason, requestId: string): Promise<void> {
-    const reason: InputErrorReason | null = outcome !== 'delivered'
+  //
+  // `message` overrides the prose, for a refusal no channel write produced. On a phone, a key, typed text or a button
+  // is answered once its runner has (see `XCUITestInput.takeLastWrite`, which hands over only those): the runner
+  // refuses a key with nothing focused (409), and `delivered` there would be a success the tester never got. The wait
+  // is capped below a client's own ack deadline (MCP's is 2 s), past which `delivered` stands, as it did before. Taken
+  // before the first await, so it is this write's request and not a later one's.
+  private async ackInput(state: DeviceState, outcome: 'delivered' | InputErrorReason, requestId: string, message?: string): Promise<void> {
+    const write = outcome === 'delivered' && state.touchHelper instanceof XCUITestInput ? state.touchHelper.takeLastWrite() : null
+    // Read now, while the refused write is still the channel's last.
+    const prose = outcome === 'delivered' ? undefined : message ?? this.inputErrorMessage(state, outcome)
+    let reason: InputErrorReason | null = outcome !== 'delivered'
       ? outcome
       : (state.booted || (await this.isBooted(state.deviceId))) ? null : 'not-booted'
-    if (reason === null) state.booted = true // cache the post-reconnect verify so later inputs skip simctl
+    let refused: string | undefined
+    if (reason === null && write) {
+      const failure = await runnerAnswer(write, RUNNER_ANSWER_WAIT_MS)
+      if (failure) {
+        reason = 'dispatch-failed'
+        refused = failure
+      }
+    }
+    if (outcome === 'delivered' && reason !== 'not-booted') state.booted = true // cache the post-reconnect verify so later inputs skip simctl
     this.sendMsg(
       reason === null
         ? { type: 'input:done', sessionId: state.sessionId, requestId }
-        : { type: 'input:error', sessionId: state.sessionId, requestId, message: (reason === 'unsupported' && this.physicalRefusal(state.deviceId, 'input')) || INPUT_ERROR_MESSAGES[reason], reason })
+        : { type: 'input:error', sessionId: state.sessionId, requestId, message: refused ?? prose ?? INPUT_ERROR_MESSAGES[reason], reason })
+  }
+
+  /** The prose for a refused input: on a phone, what its channel says about the refusal, else the reason's own. */
+  private inputErrorMessage(state: DeviceState, reason: InputErrorReason): string {
+    if (this.isPhysical(state.deviceId)) {
+      const unsupported = reason === 'unsupported' ? state.touchHelper?.unsupportedReason?.() : null
+      if (unsupported) return unsupported
+      if (reason === 'channel-unavailable' || reason === 'channel-starting') return this.physicalInputMessage(state)
+    }
+    return INPUT_ERROR_MESSAGES[reason]
+  }
+
+  /** Why a phone's runner is not taking input: the reason its last start failed (no team, a locked phone), or that it
+   *  is still starting. The agent log is on the agent's Mac, which the tester usually is not at. */
+  private physicalInputMessage(state: DeviceState): string {
+    const failure = state.touchHelper instanceof XCUITestInput ? state.touchHelper.runnerFailure() : null
+    return failure
+      ? `The UI-test runner on this USB-connected device did not start: ${failure}`
+      : PHYSICAL_REFUSALS.input
   }
 
   private async isBooted(deviceId: string): Promise<boolean> {
@@ -2075,7 +2155,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           break
         }
         this.installBuild(installState.deviceId, filePath, bundleId, { buildTicket, buildName, buildBytes })
-          .then(() => respond({ type: 'app:install-done' }))
+          .then((warning) => respond(warning ? { type: 'app:install-done', warning } : { type: 'app:install-done' }))
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e)
             respond({ type: 'app:install-error', message })
@@ -2278,11 +2358,23 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           break
         }
         // A physical device has no simctl pasteboard; its runner types the text into the focused field instead.
+        // Answered once the runner has: with nothing focused it refuses the text (409), and `input:type-done` then would
+        // tell the caller the field holds text it never got.
         if (this.isPhysical(state.deviceId)) {
-          const typed = !text || (state.touchHelper instanceof XCUITestInput && state.touchHelper.typeText(text))
-          this.sendMsg(typed
-            ? { type: 'input:type-done', sessionId, requestId }
-            : { type: 'input:type-error', sessionId, requestId, message: PHYSICAL_REFUSALS.input })
+          const helper = state.touchHelper
+          if (!text) {
+            this.sendMsg({ type: 'input:type-done', sessionId, requestId })
+            break
+          }
+          const write = helper instanceof XCUITestInput && helper.typeText(text) ? helper.takeLastWrite() : null
+          if (!write) {
+            this.sendMsg({ type: 'input:type-error', sessionId, requestId, message: this.physicalInputMessage(state) })
+            break
+          }
+          // Capped below MCP's 15 s wait for this reply; past it, done stands as it did before.
+          void runnerAnswer(write, RUNNER_TYPE_WAIT_MS).then((failure) => this.sendMsg(failure
+            ? { type: 'input:type-error', sessionId, requestId, message: failure }
+            : { type: 'input:type-done', sessionId, requestId }))
           break
         }
         // simctl pbcopy → Cmd+V paste. Works for arbitrary Unicode (unlike a
@@ -2380,8 +2472,20 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         // decision, and it is why iOS never sends `unsupported` for a button while Android does.
         let outcome: 'delivered' | InputErrorReason = btnHelper?.inputState() === 'ready'
           ? 'delivered'
-          : this.refusalReason(btnHelper, 'standalone')
-        if (chromeName === 'home') {
+          : this.refusalReason(btnHelper, 'standalone', false)
+        if (this.isPhysical(state.deviceId)) {
+          // A phone has no chrome to look its buttons up in, so they are mapped here. Pressed once, on release (or a
+          // phase-less press), like home below; a held button has no XCUITest equivalent. Any other button — the side
+          // button, the Action button — is refused rather than answered `delivered` having sent nothing.
+          const usage = chromeName === 'volume-up' ? 0xe9 : chromeName === 'volume-down' ? 0xea : undefined
+          if (chromeName !== 'home' && usage === undefined) {
+            void this.ackInput(state, 'unsupported', requestId, `The ${name} button ${PHYSICAL_REFUSALS.button}`)
+            break
+          }
+          if (phase !== 'down') {
+            outcome = wrote(chromeName === 'home' ? btnHelper?.pressLegacyButton(0) ?? false : btnHelper?.pressButton(0x0c, usage!) ?? false)
+          }
+        } else if (chromeName === 'home') {
           // Home has no HID down/up split — always a single legacy press. Send once on release
           // (or on a phase-less legacy message) so a down+up pair doesn't fire it twice.
           if (phase !== 'down') outcome = wrote(btnHelper?.pressLegacyButton(0) ?? false)
@@ -2776,13 +2880,14 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * .app.zip / .tar.gz(.tgz) 이면 임시 디렉토리에 풀어 .app 경로로 설치, 그 외(.apk 등)는
    * 직접 설치. tar 추출은 실행 비트·심볼릭 링크를 보존하고(재압축이 아니라 네이티브 보관),
    * macOS tar(libarchive)가 path traversal·symlink 탈출을 기본 차단한다. 완료 후 임시 정리.
+   * Resolves with a warning for the requester when the app is ready but is not the build sent (see `installOnPhone`).
    */
   private async installBuild(
     udid: string,
     filePath: string,
     bundleId?: string,
     remote?: { buildTicket?: string; buildName?: string; buildBytes?: number },
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const tmpDir = path.join(tmpdir(), `tapflow-install-${randomUUID()}`)
     fs.mkdirSync(tmpDir, { recursive: true })
     try {
@@ -2813,7 +2918,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       if (bundleId) {
         await this.simctl.uninstallApp(udid, bundleId).catch(() => { /* 미설치 상태면 무시 */ })
       }
-      return await this.installFrom(udid, source, tmpDir)
+      await this.installFrom(udid, source, tmpDir)
+      return undefined
     } finally {
       // Async for the same reason as the extraction: a large .app is a lot of files to unlink.
       await fs.promises.rm(tmpDir, { recursive: true, force: true })
@@ -2831,26 +2937,38 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
 
   /**
    * A USB-connected device takes only a device-signed build: an `.ipa` (what Firebase App Distribution and an
-   * ad-hoc or development export produce), or an archived `.app` built for iphoneos. Installed clean, as on a
-   * simulator. A simulator build cannot run there, but the same app is often already on the phone from TestFlight
-   * or Firebase, so that copy is used when it is.
+   * ad-hoc or development export produce), or an archived `.app` built for iphoneos. A simulator build cannot run
+   * there, but the same app is often already on the phone from TestFlight or Firebase, so that copy is used when it
+   * is — and the answer says so (the returned warning), since the tester is then not testing the build they sent.
+   *
+   * **Installed over the copy on the phone, not after removing it.** On a simulator a clean install costs nothing
+   * that cannot be rebuilt; on a phone a refused install is common (a profile without this device, an expired
+   * certificate, a locked phone), and removing first would leave the tester with neither app nor its data. Only the
+   * refusal that removing cures — the installed copy signed for another App ID or team — removes it, once.
    */
-  private async installOnPhone(udid: string, source: string, tmpDir: string, bundleId?: string): Promise<void> {
+  private async installOnPhone(udid: string, source: string, tmpDir: string, bundleId?: string): Promise<string | undefined> {
     const lower = source.toLowerCase()
     const archived = ['.ipa', '.zip', '.tar.gz', '.tgz'].some((ext) => lower.endsWith(ext))
     const appPath = archived ? await this.extractApp(source, tmpDir) : source
     const info = await this.devicectl.appBundleInfo(appPath)
     const id = bundleId ?? info.bundleId
     if (info.platform !== 'simulator') {
-      // Only a build known to be for a device is worth removing the installed copy for: one whose Info.plist could
-      // not be read may still be refused, and the tester would be left with neither.
-      if (id && info.platform === 'device') await this.devicectl.uninstallApp(udid, id).catch(() => { /* not installed */ })
-      await this.devicectl.installApp(udid, appPath)
-      return
+      try {
+        await this.devicectl.installApp(udid, appPath)
+      } catch (e) {
+        if (!(e instanceof AppIdentityMismatchError) || !id) throw e
+        logger.warn(`${id} on ${udid} is signed differently from this build; removing it to install the build`)
+        await this.devicectl.uninstallApp(udid, id)
+        await this.devicectl.installApp(udid, appPath)
+      }
+      return undefined
     }
-    if (id && await this.devicectl.isAppInstalled(udid, id)) {
-      logger.info(`${id}: a simulator build cannot be installed on ${udid}; using the copy already installed there`)
-      return
+    const installed = id ? await this.devicectl.installedApp(udid, id) : null
+    if (id && installed) {
+      const warning = `This is a simulator build, which cannot run on a USB-connected device, so the ${id} already on the phone`
+        + `${installed.version ? ` (version ${installed.version})` : ''} is used instead — you are not testing the build you sent. Upload its device build (.ipa) to test that one.`
+      logger.warn(`${udid}: ${warning}`)
+      return warning
     }
     throw new ValidationError(
       `Install ${id ?? 'the app'} on the phone first (TestFlight or Firebase App Distribution), or upload its device build (.ipa); tapflow cannot install a simulator build on a device`,
@@ -2912,7 +3030,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    *  alias, which would quietly act on whichever simulator happened to be up. */
   async installApp(appPath: string): Promise<void> {
     const deviceId = await this.soleLiveDeviceId()
-    if (this.isPhysical(deviceId)) return this.installBuild(deviceId, appPath)
+    if (this.isPhysical(deviceId)) {
+      // This interface has no way to carry the warning; `installOnPhone` has logged it.
+      await this.installBuild(deviceId, appPath)
+      return
+    }
     await this.simctl.installApp(deviceId, appPath)
   }
   // ── network control (#607) ─────────────────────────────────────────────────
@@ -3297,6 +3419,11 @@ function runExtractor(cmd: string, args: string[]): Promise<{ error?: Error; sta
     child.once('error', (error) => resolve({ error, status: null, stderr }))
     child.once('close', (status) => resolve({ status, stderr }))
   })
+}
+
+/** A phone's capture failure as the dashboard shows it: the cause first (it shows the start of it), without the log's prefix. */
+export function physicalCaptureFailure(message: string): string {
+  return `Screen capture: ${message.replace(/^\[DeviceCaptureStreamer\]\s*(?:[^\s:]+:\s*)?/, '')}`
 }
 
 /**
