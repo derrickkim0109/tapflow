@@ -1550,6 +1550,13 @@ export interface AppInstallDone {
   type: 'app:install-done'
   sessionId: string
   requestId: string
+  /**
+   * Set when the app is ready, but not as the build that was sent: a simulator build sent to a USB-connected
+   * iPhone cannot be installed there, so the copy already on the phone is used, and the tester has to know they
+   * are not testing the build they picked. Prose for a person; absent on an ordinary install. A relay forwards the
+   * agent's frame as sent, so an older relay passes it on, and an older viewer ignores it.
+   */
+  warning?: string
 }
 
 /** The app was launched. Not that its screen is up: on iOS this follows the process start, on Android the first frame
