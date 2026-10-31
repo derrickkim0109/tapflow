@@ -9,6 +9,7 @@ import { ScrcpyVideo } from './ScrcpyVideo.js'
 import { ScrcpyControl } from './ScrcpyControl.js'
 import type { ScrcpyDeviceInfo } from './ScrcpyVideo.js'
 import { getAdbPath } from '../sdk.js'
+import { SCRCPY_SERVER_DEVICE_PATH } from '../adb.js'
 import { createLogger, PlatformError } from '@tapflowio/agent-core'
 
 const logger = createLogger('android-agent:scrcpy')
@@ -19,7 +20,7 @@ const execFileAsync = promisify(execFile)
 // 3.1 captured rotated content in the wrong direction on API 35+, so the client-side CSS
 // rotation showed it sideways. Keep this in sync with download-scrcpy-server.mjs.
 const SCRCPY_SERVER_VERSION = '3.3'
-const DEVICE_PATH = '/data/local/tmp/scrcpy-server.jar'
+const DEVICE_PATH = SCRCPY_SERVER_DEVICE_PATH
 
 function getServerJarPath(): string {
   const dir = path.dirname(fileURLToPath(import.meta.url))
@@ -51,6 +52,11 @@ export class ScrcpySession {
     buf[0]! &= 0x7f  // Java Integer.parseInt rejects values > 0x7FFFFFFF
     this.scid = buf.toString('hex')
     this.socketName = `scrcpy_${this.scid}`
+  }
+
+  /** The `scid=` this session's server runs with: what tells it from any other scrcpy server on the device. */
+  get id(): string {
+    return this.scid
   }
 
   get video(): ScrcpyVideo {

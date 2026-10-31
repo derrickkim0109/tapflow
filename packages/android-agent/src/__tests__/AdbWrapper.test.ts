@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { PlatformError, ValidationError } from '@tapflowio/agent-core'
-import { AdbWrapper } from '../AdbWrapper'
+import { AdbWrapper, usbDevicesEnabled } from '../AdbWrapper'
 import type { AdbRunner } from '../adb'
 
 function mockRunner(responses: {
@@ -1058,7 +1058,7 @@ describe('listDevices — USB-connected devices (#152)', () => {
   // Mutation: keep the `emulator-` filter on the device rows (USB devices never listed), or drop `kind`.
   it('offers a USB device in state `device` as usb:<serial>, physical and booted', async () => {
     const { runner } = usbRunner(`List of devices attached\n${SERIAL}\tdevice\n`)
-    const wrapper = new AdbWrapper(runner)
+    const wrapper = new AdbWrapper(runner, { usbDevices: true })
     const devices = await wrapper.listDevices()
     expect(devices.find((d) => d.id === `usb:${SERIAL}`)).toEqual({
       id: `usb:${SERIAL}`, name: 'Galaxy Z Flip4', platform: 'android', status: 'booted',
@@ -1070,7 +1070,7 @@ describe('listDevices — USB-connected devices (#152)', () => {
   // Mutation: drop `kind: 'emulator'` from the AVD rows.
   it('marks the emulators as emulators, unchanged otherwise', async () => {
     const { runner } = usbRunner(`List of devices attached\nemulator-5554\tdevice\n${SERIAL}\tdevice\n`)
-    const devices = await new AdbWrapper(runner).listDevices()
+    const devices = await new AdbWrapper(runner, { usbDevices: true }).listDevices()
     expect(devices.find((d) => d.id === 'avd:Pixel_8_API_34')).toEqual({
       id: 'avd:Pixel_8_API_34', name: 'Pixel_8_API_34', platform: 'android', status: 'booted',
       osVersion: 'Android 14', kind: 'emulator',
@@ -1084,14 +1084,14 @@ describe('listDevices — USB-connected devices (#152)', () => {
     { props: 'ro.product.marketname=\nro.product.model=SM-F721N\ndevice_name=null\n', name: 'SM-F721N' },
   ])('names it $name', async ({ props, name }) => {
     const { runner } = usbRunner(`List of devices attached\n${SERIAL}\tdevice\n`, { [SERIAL]: props })
-    const [device] = (await new AdbWrapper(runner).listDevices()).filter((d) => d.kind === 'physical')
+    const [device] = (await new AdbWrapper(runner, { usbDevices: true }).listDevices()).filter((d) => d.kind === 'physical')
     expect(device?.name).toBe(name)
   })
 
   // Mutation: compare the whole value to `tablet` — the property is a comma-separated list.
   it('tells a tablet from its build characteristics', async () => {
     const { runner } = usbRunner(`List of devices attached\n${SERIAL}\tdevice\n`, { [SERIAL]: 'ro.build.characteristics=tablet,nosdcard\n' })
-    const [device] = (await new AdbWrapper(runner).listDevices()).filter((d) => d.kind === 'physical')
+    const [device] = (await new AdbWrapper(runner, { usbDevices: true }).listDevices()).filter((d) => d.kind === 'physical')
     expect(device?.formFactor).toBe('tablet')
   })
 
@@ -1106,7 +1106,7 @@ describe('listDevices — USB-connected devices (#152)', () => {
       `adb-${SERIAL}-AbCdEf._adb-tls-connect._tcp\tdevice`,
       '',
     ].join('\n'))
-    const devices = await new AdbWrapper(runner).listDevices()
+    const devices = await new AdbWrapper(runner, { usbDevices: true }).listDevices()
     expect(devices.filter((d) => d.kind === 'physical')).toEqual([])
     expect(exec.mock.calls.filter((c) => c[2] === 'shell')).toEqual([])
   })
@@ -1116,13 +1116,59 @@ describe('listDevices — USB-connected devices (#152)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
       const { runner } = usbRunner('List of devices attached\nAAAA0001\tunauthorized\n')
-      const wrapper = new AdbWrapper(runner)
+      const wrapper = new AdbWrapper(runner, { usbDevices: true })
       await wrapper.listDevices()
       await wrapper.listDevices()
       const said = warn.mock.calls.filter((c) => c.some((a) => String(a).includes('authorize USB debugging')))
       expect(said).toHaveLength(1)
     } finally {
       warn.mockRestore()
+    }
+  })
+
+  // Mutation: say only `unauthorized` (an offline or recovery phone goes missing with no reason), or remember the
+  // serial rather than its state (the second change is not said), or keep it after it is unplugged.
+  it('says why once per state it reaches, and again after it is plugged back in', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const rows = { now: 'List of devices attached\nAAAA0001\toffline\n' }
+      const { runner, exec } = usbRunner('')
+      exec.mockImplementation(async (...args: string[]) => (args[0] === 'devices' ? rows.now : ''))
+      const wrapper = new AdbWrapper(runner, { usbDevices: true })
+      const said = () => warn.mock.calls.map((c) => c.map(String).join(' ')).filter((l) => l.includes('AAAA0001'))
+      await wrapper.listDevices()
+      await wrapper.listDevices()
+      expect(said()).toHaveLength(1)
+      expect(said()[0]).toMatch(/offline/)
+      rows.now = 'List of devices attached\nAAAA0001\trecovery\n'
+      await wrapper.listDevices()
+      expect(said()).toHaveLength(2)
+      expect(said()[1]).toMatch(/recovery mode/)
+      rows.now = 'List of devices attached\n'
+      await wrapper.listDevices()
+      rows.now = 'List of devices attached\nAAAA0001\trecovery\n'
+      await wrapper.listDevices()
+      expect(said()).toHaveLength(3)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  // Mutation: let the shell for one phone's properties run unbounded — a phone that never answers holds up the
+  // listing, and with it the agent's connect and every emulator boot.
+  it('lists the rest when a phone does not answer', async () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { runner, exec } = usbRunner(`List of devices attached\nemulator-5554\tdevice\n${SERIAL}\tdevice\n`)
+      const base = exec.getMockImplementation()!
+      exec.mockImplementation(async (...args: string[]) => (args[1] === SERIAL ? new Promise<string>(() => {}) : base(...args)))
+      const listing = new AdbWrapper(runner, { usbDevices: true }).listDevices()
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect((await listing).map((d) => d.id)).toEqual(['avd:Pixel_8_API_34'])
+    } finally {
+      warn.mockRestore()
+      vi.useRealTimers()
     }
   })
 
@@ -1134,7 +1180,7 @@ describe('listDevices — USB-connected devices (#152)', () => {
       if (args[0] === 'devices') return rows.now
       return args.includes('shell') ? FLIP4_PROPS : ''
     })
-    const wrapper = new AdbWrapper(runner)
+    const wrapper = new AdbWrapper(runner, { usbDevices: true })
     await wrapper.listDevices()
     await wrapper.listDevices()
     expect(shellsFor(SERIAL)).toBe(1)
@@ -1156,10 +1202,73 @@ describe('listDevices — USB-connected devices (#152)', () => {
     })
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
-      const devices = await new AdbWrapper(runner).listDevices()
+      const devices = await new AdbWrapper(runner, { usbDevices: true }).listDevices()
       expect(devices.map((d) => d.id)).toEqual(['avd:Pixel_8_API_34'])
     } finally {
       warn.mockRestore()
     }
+  })
+})
+
+// #152: phones are offered only when the operator turns them on, since a phone plugged in to charge would otherwise be
+// open to everyone who can reach the relay.
+describe('listDevices — USB devices off (the default)', () => {
+  // Mutation: offer USB devices whatever the switch says, or read the switch as on when it is unset.
+  it('lists only the emulators, runs no shell on a phone and says nothing about one', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const exec = vi.fn(async (...args: string[]) => {
+        if (args[0] === 'devices') return 'List of devices attached\nemulator-5554\tdevice\nRFCX00ABCDE\tdevice\nAAAA0001\tunauthorized\n'
+        if (args.includes('emu') && args.includes('name')) return 'Pixel_8_API_34\nOK\n'
+        return '14\n'
+      })
+      const runner: AdbRunner = { exec, execBinary: vi.fn(), listAvds: vi.fn().mockResolvedValue(['Pixel_8_API_34']) }
+      const wrapper = new AdbWrapper(runner, { usbDevices: usbDevicesEnabled({}) })
+      const devices = await wrapper.listDevices()
+      expect(devices.map((d) => d.id)).toEqual(['avd:Pixel_8_API_34'])
+      expect(wrapper.getSerial('usb:RFCX00ABCDE')).toBeUndefined()
+      expect(exec.mock.calls.filter((c) => c[1] !== 'emulator-5554' && c[0] !== 'devices')).toEqual([])
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('is turned on by TAPFLOW_ANDROID_USB_DEVICES=1 only', () => {
+    expect(usbDevicesEnabled({ TAPFLOW_ANDROID_USB_DEVICES: '1' })).toBe(true)
+    expect(usbDevicesEnabled({ TAPFLOW_ANDROID_USB_DEVICES: '0' })).toBe(false)
+    expect(usbDevicesEnabled({})).toBe(false)
+  })
+})
+
+describe('a USB-connected device\'s install and clean-up (#152)', () => {
+  // Mutation: drop the bound — an install waiting on a prompt on the phone holds the session's install forever.
+  it('bounds an install given a timeout, and names a prompt on the phone and a slow install', async () => {
+    vi.useFakeTimers()
+    try {
+      const runner: AdbRunner = { exec: vi.fn(() => new Promise<string>(() => {})), execBinary: vi.fn(), listAvds: vi.fn() }
+      const install = new AdbWrapper(runner).installApp('RFCX00ABCDE', '/tmp/app.apk', 120_000)
+      const failed = expect(install).rejects.toThrow(/did not finish within 120 s.*Verify apps over USB.*slow.*TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS/)
+      await vi.advanceTimersByTimeAsync(120_000)
+      await failed
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Mutation: remove the jars under other names than they are pushed as, or keep the tree dump marked as pushed —
+  // its next use runs a jar that is gone.
+  it('removes the scrcpy server and the tree dump it pushed, and pushes the dump again next time', async () => {
+    const exec = vi.fn().mockResolvedValue('')
+    const runner: AdbRunner = { exec, execBinary: vi.fn(), listAvds: vi.fn() }
+    const wrapper = new AdbWrapper(runner)
+    await wrapper.dumpUiHierarchy('RFCX00ABCDE').catch(() => {})
+    const pushes = () => exec.mock.calls.filter((c) => c[2] === 'push')
+    expect(pushes()).toHaveLength(1)
+    const jar = pushes()[0]![4] as string
+    await wrapper.removePushedFiles('RFCX00ABCDE', 5_000)
+    expect(exec).toHaveBeenCalledWith('-s', 'RFCX00ABCDE', 'shell', 'rm', '-f', '/data/local/tmp/tapflow-scrcpy-server.jar', jar)
+    await wrapper.dumpUiHierarchy('RFCX00ABCDE').catch(() => {})
+    expect(pushes()).toHaveLength(2)
   })
 })

@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import type { FormFactor } from '@tapflowio/protocol'
 
 /** `k=v` and `k = v` both occur in real config.ini files, with CRLF on some. */
@@ -177,4 +177,82 @@ export const avdRotationLockMemory: RotationLockMemory = {
     const dir = avdDirOf(avdName)
     if (dir) rmSync(join(dir, ROTATION_FREED_MARKER), { force: true })
   },
+}
+
+/** A device's rotation lock as `wm user-rotation` reads and writes it. */
+export type UserRotation = { mode: 'free' } | { mode: 'lock'; rotation: 0 | 1 | 2 | 3 }
+
+/**
+ * Per USB-connected device (`usb:<serial>`), the rotation lock it had before its session, until tapflow writes it
+ * back (#1033). **Kept on disk**, as `RotationLockMemory` is: an agent stopped mid-session (Ctrl+C, a crash, the Mac
+ * restarting) would otherwise forget it, and the next session would read the lock tapflow wrote as the phone's own
+ * and write that back at its end, leaving auto-rotate off for good. A phone has no AVD directory, so it lives beside
+ * adb's own keys (`ANDROID_USER_HOME`, else `~/.android`), one file for all phones. The agent goes by its own map and
+ * keeps this as the copy for the next agent, so a write here that fails costs only the next agent's restore.
+ */
+export interface PhysicalRotationMemory {
+  /** Every device with a lock still to write back. */
+  ids(): string[]
+  get(deviceId: string): UserRotation | undefined
+  remember(deviceId: string, lock: UserRotation): void
+  forget(deviceId: string): void
+}
+
+const PHYSICAL_ROTATION_FILE = 'tapflow-usb-rotation.json'
+
+function isUserRotation(v: unknown): v is UserRotation {
+  const r = v as { mode?: unknown; rotation?: unknown } | null
+  return r?.mode === 'free' || (r?.mode === 'lock' && [0, 1, 2, 3].includes(r.rotation as number))
+}
+
+/** The file store `physicalRotationMemory` uses, at `file`. An unreadable or malformed file reads as empty. */
+export function physicalRotationFile(file: string): PhysicalRotationMemory {
+  const read = (): Record<string, UserRotation> => {
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+      return Object.fromEntries(Object.entries(parsed).filter((e): e is [string, UserRotation] => isUserRotation(e[1])))
+    } catch {
+      return {}
+    }
+  }
+  const write = (all: Record<string, UserRotation>) => {
+    if (Object.keys(all).length === 0) rmSync(file, { force: true })
+    else {
+      // Whole or not at all: an agent killed mid-write would otherwise leave a truncated file, read as empty, and the
+      // locks it held would never be written back. A rename within one directory is atomic.
+      mkdirSync(dirname(file), { recursive: true })
+      const tmp = `${file}.${process.pid}.tmp`
+      writeFileSync(tmp, `${JSON.stringify(all, null, 2)}\n`)
+      renameSync(tmp, file)
+    }
+  }
+  return {
+    ids: () => Object.keys(read()),
+    get: (deviceId) => read()[deviceId],
+    remember(deviceId, lock) { write({ ...read(), [deviceId]: lock }) },
+    forget(deviceId) {
+      const all = read()
+      if (!(deviceId in all)) return
+      delete all[deviceId]
+      write(all)
+    },
+  }
+}
+
+/** Where adb keeps its own state, and so where `physicalRotationMemory` is kept. */
+export function androidUserHome(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  return env.ANDROID_USER_HOME || join(home, '.android')
+}
+
+export const physicalRotationMemory: PhysicalRotationMemory = physicalRotationFile(join(androidUserHome(), PHYSICAL_ROTATION_FILE))
+
+/** The same in memory only — for tests, which must not write beside the real adb keys. */
+export function inMemoryPhysicalRotation(): PhysicalRotationMemory {
+  const all = new Map<string, UserRotation>()
+  return {
+    ids: () => [...all.keys()],
+    get: (deviceId) => all.get(deviceId),
+    remember(deviceId, lock) { all.set(deviceId, lock) },
+    forget(deviceId) { all.delete(deviceId) },
+  }
 }

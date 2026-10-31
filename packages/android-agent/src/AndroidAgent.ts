@@ -5,7 +5,10 @@ import type {
   AndroidButton, BootAbandonReason, ClipboardErrorPayload, Device, DeviceAgent,
   NetworkControlCapability, NetworkStatePayload, UIElement,
 } from '@tapflowio/agent-core'
-import { avdRotationLockMemory, formFactorOf, osVersionOf, type RotationLockMemory } from './avdConfig.js'
+import {
+  avdRotationLockMemory, formFactorOf, inMemoryPhysicalRotation, osVersionOf, physicalRotationMemory,
+  type PhysicalRotationMemory, type RotationLockMemory, type UserRotation,
+} from './avdConfig.js'
 import type {
   AgentControlOutbound, AgentDevicesApplied, DeviceReport, ClipboardReplyBody, OpenUrlReplyBody,
   AppInstallReplyBody, AppLaunchReplyBody, AppLaunchToAgent, LaunchOptions, AppClearStateReplyBody, DevicePosture, FormFactor, RunResetReport, RunResetRequest,
@@ -53,6 +56,7 @@ import {
 } from '@tapflowio/agent-core/utils'
 import { execFile } from 'child_process'
 import { AdbWrapper, isPhysicalDevice } from './AdbWrapper.js'
+import { SCRCPY_SERVER_DEVICE_PATH } from './adb.js'
 import { EmulatorLauncher, findEmulatorPid, probeEmulator, stopEmulatorProcess } from './EmulatorLauncher.js'
 import { ensureHelperApp, launchMuteOnlyTap, isAudioSupported } from '@tapflowio/audiotap-helper'
 import { AndroidTouchHelper } from './AndroidTouchHelper.js'
@@ -89,6 +93,7 @@ const PHYSICAL_REFUSALS = {
   network: 'Network control is not available on a USB-connected device',
   posture: 'Folding is not available on a USB-connected device — fold the phone itself',
   clipboard: 'The clipboard is not available on a USB-connected device yet',
+  'clear-state': 'On a USB-connected device, only the data of an app tapflow installed in this session can be cleared — install the build first',
 } as const
 type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
 
@@ -385,11 +390,12 @@ interface PointerControl {
 
 // Video backend per device: emulators (serial `emulator-*`) default to the gRPC host-encode path
 // (bypasses the guest SW H.264 encoder); real devices use scrcpy (their SoC has a HW encoder).
-// `TAPFLOW_ANDROID_BACKEND=scrcpy|grpc` overrides either way.
+// `TAPFLOW_ANDROID_BACKEND=scrcpy|grpc` overrides it for an emulator only. A real device has no gRPC endpoint, and
+// forcing one sent its session to the first emulator's port (8554): the phone's viewer streamed and tapped that
+// emulator instead.
 export function pickAndroidBackend(serial: string, env: NodeJS.ProcessEnv = process.env): 'grpc' | 'scrcpy' {
-  if (env.TAPFLOW_ANDROID_BACKEND === 'scrcpy') return 'scrcpy'
-  if (env.TAPFLOW_ANDROID_BACKEND === 'grpc') return 'grpc'
-  return serial.startsWith('emulator-') ? 'grpc' : 'scrcpy'
+  if (!serial.startsWith('emulator-')) return 'scrcpy'
+  return env.TAPFLOW_ANDROID_BACKEND === 'scrcpy' ? 'scrcpy' : 'grpc'
 }
 
 export interface AndroidAgentOptions {
@@ -416,10 +422,23 @@ export interface AndroidAgentOptions {
   /** Which AVDs have had their rotation lock freed once. Beside each AVD by default (`avdRotationLockMemory`);
    *  never the real AVD directories under vitest. */
   rotationLockMemory?: RotationLockMemory
+  /** The rotation lock each USB-connected device had before its session. On disk beside adb's keys by default
+   *  (`physicalRotationMemory`); in memory under vitest. */
+  physicalRotationMemory?: PhysicalRotationMemory
 }
 
 /** One `pm clear` or clipboard write of a run reset. */
 const RUN_RESET_CMD_TIMEOUT_MS = 10_000
+
+/** Writing a USB-connected device's rotation lock back, so a phone that stopped answering cannot hold up its
+ *  shutdown's reply or the rotation queue behind it. At the agent's exit it blocks the exit, so it is shorter there. */
+const ROTATION_RESTORE_TIMEOUT_MS = 10_000
+const ROTATION_RESTORE_AT_EXIT_TIMEOUT_MS = 3_000
+/** The base bound on an install on a USB-connected device, which can wait on a prompt on the phone that nobody at the
+ *  viewer sees. A second per MB of the APK is added (`physicalInstallTimeoutMs`). */
+const PHYSICAL_INSTALL_TIMEOUT_MS = 120_000
+/** Removing what tapflow pushed to a USB-connected device when its session ends. */
+const PHYSICAL_CLEANUP_TIMEOUT_MS = 5_000
 
 // Everything inside the per-device clipboard section must be bounded, or one stuck call wedges
 // every later copy/paste on that device. gRPC carries its own deadline; adb does not (and a
@@ -438,6 +457,10 @@ function bounded<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
   ]).finally(() => clearTimeout(timer))
 }
 const ADB_KEYEVENT_TIMEOUT_MS = 5_000
+
+function describeRotation(lock: UserRotation): string {
+  return lock.mode === 'free' ? 'auto-rotate' : `lock ${lock.rotation}`
+}
 
 // `implements NetworkControlCapability` as well as `DeviceAgent`, and the clause is the whole
 // point: without it the two methods are just methods, and a change to the interface reaches this
@@ -542,6 +565,11 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   /** Re-reads the device list for a relay that takes `agent:devices` (#1085). */
   private readonly deviceWatcher: DeviceListWatcher
   private readonly rotationLock: RotationLockMemory
+  /** Per `usb:` device, the rotation lock it had before its session, until it is written back (#1033). **This map is
+   *  what the agent goes by**; `physicalRotationDisk` is a copy for the next agent, so a write to disk that fails
+   *  costs only that, and the lock still goes back within this one. Loaded from the copy once, at construction. */
+  private readonly physicalRotation = new Map<string, UserRotation>()
+  private readonly physicalRotationDisk: PhysicalRotationMemory
   /** How long a shutdown whose kill failed watches for the emulator to finish exiting. A field so tests can
    *  shorten it — see `handleDeviceShutdown` for why it waits at all. */
   private shutdownSettleMs = 3_000
@@ -566,6 +594,16 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     })
     this.rotationLock = options.rotationLockMemory
       ?? (process.env.VITEST ? { freed: () => true, markFreed: () => {}, forget: () => {} } : avdRotationLockMemory)
+    this.physicalRotationDisk = options.physicalRotationMemory
+      ?? (process.env.VITEST ? inMemoryPhysicalRotation() : physicalRotationMemory)
+    try {
+      for (const id of this.physicalRotationDisk.ids()) {
+        const lock = this.physicalRotationDisk.get(id)
+        if (lock) this.physicalRotation.set(id, lock)
+      }
+    } catch (e) {
+      logger.warn(`could not read the phones' remembered rotation locks: ${(e as Error).message}`)
+    }
     this.reconnectDelays = options.reconnectDelays ?? [1000, 2000, 4000, 8000, 16000, 30000]
     // No-op under vitest so the suite never spawns real `caffeinate` processes.
     this.sleepBlocker = options.sleepBlocker ?? (process.env.VITEST ? { acquire() {}, release() {} } : createSleepBlocker())
@@ -798,6 +836,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       this.cleanupDeviceState(state)
     }
     this.deviceStates.clear()
+    this.restoreRotationsAtExit()
     this.sleepBlocker.release()
     this.releaseStallWatch?.()
     this.releaseStallWatch = null
@@ -1922,6 +1961,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       return
     }
 
+    const scid = state.scrcpySession?.id
     state.scrcpySession?.stop(serial)
     state.scrcpySession = null
     state.emulatorVideo?.stop()
@@ -1938,8 +1978,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       return
     }
 
-    // kill any lingering scrcpy server process on the device before restarting
-    await this.adb.pkill(serial, 'scrcpy-server').catch(() => {})
+    // Kill this session's scrcpy server if it lingers, before restarting — matched by its `scid`, so a scrcpy a
+    // developer runs on the same phone, or another session's, is left alone. With no session to name it, only
+    // tapflow's own: the server is started through a shell line that names tapflow's jar.
+    await this.adb.pkill(serial, scid ? `scid=${scid}` : SCRCPY_SERVER_DEVICE_PATH).catch(() => {})
     await new Promise<void>((r) => setTimeout(r, 1500))
 
     if (!owns()) {
@@ -2043,6 +2085,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     const ms = this.runResetCmdTimeoutMs
     if (apps.length > 0 && serial) {
       const clear = (id: string) => {
+        // The same limit as `app:clear-state`: a flow file names the packages, and on a phone they can be its owner's.
+        if (isPhysicalDevice(state.deviceId) && !this.installedOnPhone.get(state.deviceId)?.has(id)) {
+          return Promise.reject(new PlatformError(PHYSICAL_REFUSALS['clear-state']))
+        }
         const work = this.adb.clearAppDataIfInstalled(serial, id)
         this.trackClear(state.deviceId, work)
         return bounded(work, ms, `pm clear ${id}`)
@@ -2322,8 +2368,8 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    */
   private readonly ownedDevices = new Set<string>()
 
-  /** Per `usb:` device, the rotation lock it had before its session, until it is written back (#1033). */
-  private readonly physicalRotation = new Map<string, { mode: 'free' } | { mode: 'lock'; rotation: 0 | 1 | 2 | 3 }>()
+  /** Per `usb:` device, the packages tapflow installed on it this session: the only ones `app:clear-state` clears there. */
+  private readonly installedOnPhone = new Map<string, Set<string>>()
 
   private serialFor(sessionId: string): string | undefined {
     const state = this.deviceStates.get(sessionId)
@@ -2598,8 +2644,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     // A USB-connected device was never started by tapflow, so it is not stopped either: the stream is down, and its
     // rotation lock goes back to what it was before the session.
     if (isPhysicalDevice(avdId)) {
-      await this.restoreRotation(avdId)
-      this.ownedDevices.delete(avdId)
+      await this.endPhysicalSession(avdId)
       this.sendMsg({ type: 'device:shutdown-done', sessionId, requestId, payload: { deviceId: avdId } })
       return
     }
@@ -2889,8 +2934,14 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
 
   private async uprightOnBoot(deviceId: string, serial: string): Promise<void> {
     const lock = await this.adb.getUserRotation(serial)
-    // Only the first reading: a re-boot inside the session would otherwise remember the lock tapflow wrote (#1033).
-    if (isPhysicalDevice(deviceId) && !this.physicalRotation.has(deviceId)) this.physicalRotation.set(deviceId, lock)
+    // Only the first reading: a re-boot inside the session, or the next agent after one stopped mid-session, would
+    // otherwise remember the lock tapflow wrote (#1033).
+    if (isPhysicalDevice(deviceId) && !this.physicalRotation.has(deviceId)) {
+      this.physicalRotation.set(deviceId, lock)
+      try { this.physicalRotationDisk.remember(deviceId, lock) } catch (e) {
+        logger.warn(`could not remember ${deviceId}'s rotation lock on disk: ${(e as Error).message}`)
+      }
+    }
     if (lock.mode !== 'lock' || lock.rotation === 0) return
     logger.info(`rotation: standing the device up from lock ${lock.rotation}`)
     await this.adb.setRotation(serial, 0)
@@ -2949,7 +3000,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           // us the bytes instead; without one, this is a relay that predates downloading and the
           // old behaviour is all there is.
           if (!buildTicket || !this.relayUrl) {
-            if (bundleId) await this.adb.clearAppData(serial, bundleId).catch(() => {})
+            await this.clearBeforeInstall(state, serial, bundleId)
             await this.installReclaimingStorage(state, serial, filePath)
             return
           }
@@ -2964,14 +3015,20 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
               destPath: dest,
               expectedBytes: buildBytes ?? 0,
             })
-            if (bundleId) await this.adb.clearAppData(serial, bundleId).catch(() => {})
+            await this.clearBeforeInstall(state, serial, bundleId)
             await this.installReclaimingStorage(state, serial, dest)
           } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true })
           }
         }
         doInstall()
-          .then(() => respond({ type: 'app:install-done' }))
+          .then(() => {
+            if (bundleId && isPhysicalDevice(state.deviceId)) {
+              const installed = this.installedOnPhone.get(state.deviceId) ?? new Set<string>()
+              this.installedOnPhone.set(state.deviceId, installed.add(bundleId))
+            }
+            respond({ type: 'app:install-done' })
+          })
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e)
             respond({ type: 'app:install-error', message })
@@ -3372,6 +3429,11 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           respond({ type: 'app:clear-state-error', message: !serial ? 'No booted device' : 'bundleId missing' })
           break
         }
+        // A phone is someone's: `pm clear` on any package it has would take that app's data — a messenger's, a bank's.
+        if (isPhysicalDevice(state!.deviceId) && !this.installedOnPhone.get(state!.deviceId)?.has(bundleId)) {
+          respond({ type: 'app:clear-state-error', message: PHYSICAL_REFUSALS['clear-state'] })
+          break
+        }
         this.adb.clearAppData(serial, bundleId)
           .then(() => respond({ type: 'app:clear-state-done' }))
           .catch((e: unknown) => {
@@ -3686,7 +3748,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    */
   private async listAllDevices(): Promise<Device[]> {
     const devices = await this.adb.listDevices()
-    for (const id of this.physicalRotation.keys()) {
+    // Nothing to read with no phone listed — which is every listing while USB devices are off.
+    if (!devices.some((d) => d.kind === 'physical')) return devices
+    for (const id of [...this.physicalRotation.keys()]) {
       const held = [...this.deviceStates.values()].some((s) => s.deviceId === id && (s.booted || s.bootsInFlight.size > 0))
       if (!held && devices.some((d) => d.id === id)) void this.restoreRotation(id)
     }
@@ -3696,18 +3760,62 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   /**
    * Write back the rotation lock a USB-connected device had before its session (#1033): a session's rotate writes
    * `wm user-rotation lock`, which turns auto-rotate off on the phone outside tapflow too. Forgotten only once written,
-   * so a device that is gone keeps it for the next listing that sees it again.
+   * so a device that is gone keeps it for the next listing that sees it again — in this agent or, from disk, the next.
    */
   private restoreRotation(deviceId: string): Promise<void> {
     return this.enqueueRotation(deviceId, async () => {
       const before = this.physicalRotation.get(deviceId)
       const serial = this.adb.getSerial(deviceId)
       if (!before || !serial) return
-      if (before.mode === 'free') await this.adb.freeRotation(serial)
-      else await this.adb.setRotation(serial, before.rotation)
-      this.physicalRotation.delete(deviceId)
-      logger.info(`rotation: put ${deviceId} back to ${before.mode === 'free' ? 'auto-rotate' : `lock ${before.rotation}`}`)
+      await bounded(before.mode === 'free' ? this.adb.freeRotation(serial) : this.adb.setRotation(serial, before.rotation),
+        ROTATION_RESTORE_TIMEOUT_MS, `writing back ${deviceId}'s rotation lock`)
+      this.forgetRotation(deviceId)
+      logger.info(`rotation: put ${deviceId} back to ${describeRotation(before)}`)
     })
+  }
+
+  /**
+   * What a USB-connected device's shutdown leaves behind it: the rotation lock it came with, and no files of tapflow's
+   * in its `/data/local/tmp`. Before the reply, so a boot right after it cannot push the scrcpy server only for this
+   * to remove it. Each step is bounded, so a phone that stopped answering still gets its shutdown answered.
+   */
+  private async endPhysicalSession(deviceId: string): Promise<void> {
+    await this.restoreRotation(deviceId)
+    this.ownedDevices.delete(deviceId)
+    this.installedOnPhone.delete(deviceId)
+    const serial = this.adb.getSerial(deviceId)
+    if (serial) {
+      await this.adb.removePushedFiles(serial, PHYSICAL_CLEANUP_TIMEOUT_MS).catch((e: unknown) => {
+        logger.warn(`could not remove tapflow's files from ${deviceId}: ${(e as Error).message}`)
+      })
+    }
+  }
+
+  /**
+   * The same for every phone still owed one, **synchronously**, from `disconnect()`: the CLI exits right after it, so
+   * an `adb` call left on the queue would never run. Best-effort — what cannot be written stays on disk, and the next
+   * agent writes it back when it first lists the phone.
+   */
+  private restoreRotationsAtExit(): void {
+    for (const deviceId of [...this.physicalRotation.keys()]) {
+      const before = this.physicalRotation.get(deviceId)
+      const serial = this.adb.getSerial(deviceId)
+      if (!before || !serial) continue
+      try {
+        this.adb.restoreRotationNow(serial, before, ROTATION_RESTORE_AT_EXIT_TIMEOUT_MS)
+        this.forgetRotation(deviceId)
+        logger.info(`rotation: put ${deviceId} back to ${describeRotation(before)} on exit`)
+      } catch (e) {
+        logger.warn(`could not put ${deviceId}'s rotation lock back on exit, the next agent will: ${(e as Error).message}`)
+      }
+    }
+  }
+
+  private forgetRotation(deviceId: string): void {
+    this.physicalRotation.delete(deviceId)
+    try { this.physicalRotationDisk.forget(deviceId) } catch (e) {
+      logger.warn(`could not forget ${deviceId}'s rotation lock on disk: ${(e as Error).message}`)
+    }
   }
 
   async boot(avdId: string): Promise<void> {
@@ -3727,8 +3835,7 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
 
   async shutdown(avdId: string): Promise<void> {
     if (isPhysicalDevice(avdId)) {
-      await this.restoreRotation(avdId)
-      this.ownedDevices.delete(avdId)
+      await this.endPhysicalSession(avdId)
       return
     }
     const serial = this.adb.getSerial(avdId)
@@ -3813,6 +3920,29 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    * Only on an emulator this agent launched, and each rollback rechecks the boot, so a shutdown or a
    * newer boot arriving mid-way stops it the way it stops Lean mode.
    */
+  /**
+   * An emulator's install starts from empty data, as every install does on iOS. **Not on a USB-connected device:**
+   * `bundleId` is what the uploaded build's record says, so a build named like an app the phone's owner has would take
+   * that app's data before `install -r` even ran — and kept it gone when the install then failed on the signature. A
+   * phone keeps an installed app's data across a reinstall; `app:clear-state` clears it once tapflow installed it.
+   */
+  private async clearBeforeInstall(state: DeviceState, serial: string, bundleId: string | undefined): Promise<void> {
+    if (!bundleId || isPhysicalDevice(state.deviceId)) return
+    await this.adb.clearAppData(serial, bundleId).catch(() => {})
+  }
+
+  /** How long an install on a USB-connected device may take: `TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS` when set (`0`
+   *  for no bound), else 120 s plus a second per MB of the APK, so a large build on a slow cable is not cut short. */
+  private physicalInstallTimeoutMs(apkPath: string): number | undefined {
+    const set = process.env.TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS
+    if (set !== undefined && set.trim() !== '' && Number.isFinite(Number(set)) && Number(set) >= 0) {
+      return Number(set) === 0 ? undefined : Number(set)
+    }
+    let bytes = 0
+    try { bytes = fs.statSync(apkPath).size } catch { /* unknown size: the base alone */ }
+    return PHYSICAL_INSTALL_TIMEOUT_MS + Math.ceil(bytes / (1024 * 1024)) * 1_000
+  }
+
   private async installReclaimingStorage(state: DeviceState, serial: string, apkPath: string): Promise<void> {
     const adb = this.adb
     const seq = state.bootSeq
@@ -3828,7 +3958,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       },
     }
     await installReclaimingStorage({
-      install: () => adb.installApp(serial, apkPath),
+      install: () => (isPhysicalDevice(state.deviceId)
+        ? adb.installApp(serial, apkPath, this.physicalInstallTimeoutMs(apkPath))
+        : adb.installApp(serial, apkPath)),
       device,
       // Never on a phone: reclaiming rolls back its system apps' updates.
       owned: this.ownedDevices.has(state.deviceId) && !isPhysicalDevice(state.deviceId),
