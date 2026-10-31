@@ -1874,7 +1874,8 @@ export class RelayServer {
         const session = this.sessions.get(msg.sessionId)
         if (session && (msg.type === 'app:install-done' || msg.type === 'app:install-error')) {
           const reason = typeof raw['message'] === 'string' ? raw['message'] : undefined
-          this.settleInstall(session, msg.requestId, msg.type === 'app:install-done', reason)
+          const warning = msg.type === 'app:install-done' && typeof raw['warning'] === 'string' ? raw['warning'] : undefined
+          this.settleInstall(session, msg.requestId, msg.type === 'app:install-done', reason, warning)
         }
         if (session?.browserSocket?.readyState === WebSocket.OPEN) {
           session.browserSocket.send(JSON.stringify(raw))
@@ -3607,7 +3608,8 @@ export class RelayServer {
         return
       }
       if (!pending && session.installed && sameBuild(session.installed, thisBuild)) {
-        this.sendTo(ws, { type: 'app:install-done', sessionId, requestId })
+        const { warning } = session.installed
+        this.sendTo(ws, { type: 'app:install-done', sessionId, requestId, ...(warning ? { warning } : {}) })
         return
       }
     }
@@ -3662,14 +3664,14 @@ export class RelayServer {
    * forwarded as before and changes no record. Read whether or not a browser holds the session — an install that
    * finishes while the tester is reconnecting is exactly the one they are coming back to.
    */
-  private settleInstall(session: Session, requestId: string, done: boolean, reason?: string): void {
+  private settleInstall(session: Session, requestId: string, done: boolean, reason?: string, warning?: string): void {
     const pending = session.pendingInstall
     if (!pending || pending.requestId !== requestId) return
     session.pendingInstall = undefined
-    session.installed = done ? { buildId: pending.buildId, filePath: pending.filePath } : undefined
+    session.installed = done ? { buildId: pending.buildId, filePath: pending.filePath, ...(warning ? { warning } : {}) } : undefined
     for (const waiter of pending.waiters) {
       // The agent's own reason. Its reply goes out under the original id, which a reconnected viewer has let go of.
-      this.answerInstallWaiter(session, waiter, done ? null : (reason ?? 'The install this was waiting on failed'))
+      this.answerInstallWaiter(session, waiter, done ? null : (reason ?? 'The install this was waiting on failed'), warning)
     }
   }
 
@@ -3688,12 +3690,13 @@ export class RelayServer {
     for (const waiter of pending.waiters) this.answerInstallWaiter(session, waiter, reason)
   }
 
-  /** To whoever holds the session now, as the agent's own reply is: a waiter joined from a socket that held it. */
-  private answerInstallWaiter(session: Session, requestId: string, failure: string | null): void {
+  /** To whoever holds the session now, as the agent's own reply is: a waiter joined from a socket that held it. A done
+   *  carries the agent's `warning`, or a reconnected viewer would believe it has the build it sent. */
+  private answerInstallWaiter(session: Session, requestId: string, failure: string | null, warning?: string): void {
     const holder = session.browserSocket
     if (!holder) return
     this.sendTo(holder, failure === null
-      ? { type: 'app:install-done', sessionId: session.id, requestId }
+      ? { type: 'app:install-done', sessionId: session.id, requestId, ...(warning ? { warning } : {}) }
       : { type: 'app:install-error', sessionId: session.id, requestId, message: failure })
   }
 

@@ -100,7 +100,9 @@ export interface Session {
    * again outside tapflow before tapflow's next boot (which then reads as warm), stays recorded until the next shutdown
    * or cold boot, and a `keepIfInstalled` install is answered as done. Picking the device again installs it.
    */
-  installed?: InstalledBuild
+  /** `warning` is the agent's note on that install (a USB phone kept the copy it had), repeated to whoever is told
+   *  the build is already there. */
+  installed?: InstalledBuild & { warning?: string }
   /** The install last sent to the agent, and the `keepIfInstalled` requests of the same build waiting on it. Only the
    *  latest: a reply to an older one says nothing about what is on the device now. */
   pendingInstall?: InstalledBuild & { requestId: string; waiters: string[] }

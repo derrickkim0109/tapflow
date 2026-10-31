@@ -168,6 +168,25 @@ describe('app:install with keepIfInstalled', () => {
     expect(replies.map((r) => r.requestId).sort()).toEqual([first, second].sort())
   })
 
+  // Mutations: drop `warning` from the record, or from the waiter's reply. A viewer that reconnects to a USB phone
+  // that kept its installed copy would be told its build is there, with nothing saying it is not the one it sent.
+  it('repeats the agent\'s install warning when it answers for the agent', async () => {
+    const warning = 'This is a simulator build, so the copy already on the phone is used instead'
+    const first = rid()
+    install(browser, buildA, first, false)
+    const sent = await waitForType<AgentInstall>(agent, 'app:install')
+    const joined = rid()
+    install(browser, buildA, joined, true)
+    expect(await agentGotNoInstall()).toBe(true)
+    agent.send(JSON.stringify({ type: 'app:install-done', sessionId, requestId: sent.requestId, warning }))
+    const replies = [await waitForType<AppInstallDone>(browser, 'app:install-done'), await waitForType<AppInstallDone>(browser, 'app:install-done')]
+    expect(replies.find((r) => r.requestId === joined)?.warning).toBe(warning)
+
+    const cached = rid()
+    install(browser, buildA, cached, true)
+    expect(await waitForType<AppInstallDone>(browser, 'app:install-done')).toEqual({ type: 'app:install-done', sessionId, requestId: cached, warning })
+  })
+
   it('records an install that finished while no browser held the session', async () => {
     const first = rid()
     install(browser, buildA, first, false)
