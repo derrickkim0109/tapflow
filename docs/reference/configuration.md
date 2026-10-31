@@ -176,7 +176,9 @@ These variables are set on the **agent** process (`tapflow agent start` / `tapfl
 | `TAPFLOW_MAX_SIZE_EXTERNAL` | `1000` | Cap (px) for external connections when `TAPFLOW_MAX_SIZE` is unset. |
 | `TAPFLOW_IOS_MAX_SIZE` / `TAPFLOW_ANDROID_MAX_SIZE` | *(per connection)* | Per-platform override of `TAPFLOW_MAX_SIZE`. |
 | `TAPFLOW_ANDROID_FPS` | `30` | Android emulator capture frame rate (gRPC path). |
-| `TAPFLOW_ANDROID_BACKEND` | *(auto)* | Force the Android backend — `grpc` or `scrcpy`. Auto-selected by device type when unset. |
+| `TAPFLOW_ANDROID_BACKEND` | *(auto)* | Force an emulator's backend — `grpc` or `scrcpy`. Auto-selected by device type when unset. A phone connected over USB always uses scrcpy. |
+| `TAPFLOW_ANDROID_USB_DEVICES` | *(off)* | `1` lists Android phones connected over USB beside the emulators. Off by default, because a listed phone is open to everyone who can reach the relay. See [Android phones over USB](/operate/android-usb-devices). |
+| `TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS` | 120 s + 1 s per MB of the APK | How long an install on a phone connected over USB may take before it is reported as failed. A phone can hold an install on a prompt of its own. `0` removes the bound. |
 | `TAPFLOW_ANDROID_GRPC_PORT` | `8554` | First port tried when picking a gRPC port for an emulator tapflow boots. The first free port from here, stepping by 2, is used. |
 | `TAPFLOW_AUDIO` | *(on)* | `off` turns off device audio streaming. See [Audio](/testing/audio). |
 | `TAPFLOW_ALLOW_DISPLAY_SLEEP` | *(empty)* | Any value lets the host display sleep during a session. System sleep is still prevented. See [Agent Setup](/operate/agents#host-display-and-sleep). |
