@@ -317,6 +317,59 @@ describe('the relay routes boots through the per-Mac boot gate', () => {
     await join(mac.session.get('b')!)
   })
 
+  /** An iOS agent on `mac-1` with simulator `a` (shut down) and USB phone `p`, which reports itself booted. */
+  async function agentWithPhone() {
+    const ws = await open()
+    ws.send(JSON.stringify({
+      type: 'agent:register', agentId: 'mac-1', agentName: 'mac-1-ios', platform: 'ios',
+      devices: [
+        { id: 'a', name: 'a', platform: 'ios', status: 'shutdown', kind: 'simulator' },
+        { id: 'p', name: 'p', platform: 'ios', status: 'booted', kind: 'physical' },
+      ],
+    }))
+    const reply = await waitForType<AgentRegistered>(ws, 'agent:registered')
+    return { ws, session: new Map(reply.registeredSessions.map((r) => [r.deviceId, r.sessionId])) }
+  }
+  const loaded = (cpuPercent: number, memUsedMB: number) => JSON.stringify({
+    type: 'agent:resources',
+    resources: { cpuPercent, memUsedMB, memTotalMB: 16_000, slotsAvailable: 1, slotsTotal: 2, reportedAt: Date.now() },
+  })
+
+  // Mutation: drop the `runsOnMac` check in `handleSessionStart` — a phone on a loaded Mac is refused like a simulator.
+  it('lets a person and a run join a USB phone on a Mac over on both CPU and memory, and still refuses its simulator', async () => {
+    await start()
+    const mac = await agentWithPhone()
+    mac.ws.send(loaded(95, 15_500))
+    await new Promise((r) => setTimeout(r, 50))
+
+    const refused = await open()
+    refused.send(JSON.stringify({ type: 'session:start', sessionId: mac.session.get('a') }))
+    expect((await waitForType<GenericError>(refused, 'error')).reason).toBe('agent-resources-exhausted')
+
+    const person = await join(mac.session.get('p')!)
+    person.send(JSON.stringify({ type: 'session:leave', sessionId: mac.session.get('p') }))
+    await new Promise((r) => setTimeout(r, 50))
+    // An AI client keeps the memory half on a simulator; a phone is spared both halves for it too.
+    await join(mac.session.get('p')!, 'flow-runner')
+  })
+
+  // Mutations: list `group` instead of the on-Mac devices in `memoryRefuses` (the list would grey out a phone the join
+  // lets in), or clear `overloaded` because a phone is attached — the viewer would then offer the Mac's simulators,
+  // and the relay refuse every one of them.
+  it('never lists a USB phone as refused for memory, and still says the Mac is overloaded for its simulators', async () => {
+    await start()
+    const mac = await agentWithPhone()
+    const lister = await open()
+    const admission = async () => {
+      lister.send(JSON.stringify({ type: 'agents:list' }))
+      return (await waitForType<AgentsListed>(lister, 'agents:listed')).sessions[0]!.admission
+    }
+    mac.ws.send(loaded(10, 15_500))
+    await vi.waitFor(async () => expect(await admission()).toEqual({ booting: false, overloaded: true, memoryRefuses: ['a'] }))
+    mac.ws.send(loaded(95, 4_000))
+    await vi.waitFor(async () => expect(await admission()).toEqual({ booting: false, overloaded: true, memoryRefuses: [] }))
+  })
+
   it('keeps the slot past the boot correlator\'s TTL — the device is still booting', async () => {
     await start({ pendingBootTtlMs: 30 })
     const mac = await agent('mac-1', ['a', 'b'])

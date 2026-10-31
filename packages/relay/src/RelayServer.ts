@@ -158,6 +158,13 @@ function ownershipRefusal(session: Session): string {
   return session.browserSocket ? 'session held by another client' : 'session not joined'
 }
 
+/** Whether this session's device runs on its agent's Mac, so the Mac's CPU and memory are what it spends. A USB phone
+ *  boots nothing there, so the resource gate protects nothing by refusing it. An absent `kind` reads as a simulator
+ *  or emulator: an agent that predates the field reports only those. */
+function runsOnMac(session: Session): boolean {
+  return session.deviceKind !== 'physical'
+}
+
 function sameBuild(a: InstalledBuild, b: InstalledBuild): boolean {
   return a.buildId === b.buildId && a.filePath === b.filePath
 }
@@ -1867,7 +1874,8 @@ export class RelayServer {
         const session = this.sessions.get(msg.sessionId)
         if (session && (msg.type === 'app:install-done' || msg.type === 'app:install-error')) {
           const reason = typeof raw['message'] === 'string' ? raw['message'] : undefined
-          this.settleInstall(session, msg.requestId, msg.type === 'app:install-done', reason)
+          const warning = msg.type === 'app:install-done' && typeof raw['warning'] === 'string' ? raw['warning'] : undefined
+          this.settleInstall(session, msg.requestId, msg.type === 'app:install-done', reason, warning)
         }
         if (session?.browserSocket?.readyState === WebSocket.OPEN) {
           session.browserSocket.send(JSON.stringify(raw))
@@ -2247,14 +2255,19 @@ export class RelayServer {
    * What a person picking one of this agent's devices would meet, summarised for the Mac card. The same reading
    * `handleSessionStart` applies, with its memory exemption: a person rejoining a device the relay has up
    * (`readySent`) is not held to memory, so memory alone blocks the Mac only when there is no such device.
+   *
+   * A USB phone is never refused for the Mac's load (`runsOnMac`), so it is never in `memoryRefuses`. `overloaded`
+   * keeps its meaning — no simulator or emulator join here would be let in — and is judged on those devices alone;
+   * a viewer that lists the Mac's phones keeps them open itself.
    */
   private macAdmission(group: Session[]): MacAdmission {
     const load = this.resourceLoad(group[0]!)
     const memOver = load?.memOver ?? false
+    const onMac = group.filter(runsOnMac)
     return {
       booting: this.bootGate.isBooting(hostKeyOf(group[0]!)),
-      overloaded: (load?.cpuOver ?? false) || (memOver && !group.some((s) => s.readySent)),
-      memoryRefuses: memOver ? group.filter((s) => !s.readySent).map((s) => s.deviceId) : [],
+      overloaded: (load?.cpuOver ?? false) || (memOver && !onMac.some((s) => s.readySent)),
+      memoryRefuses: memOver ? onMac.filter((s) => !s.readySent).map((s) => s.deviceId) : [],
     }
   }
 
@@ -2923,8 +2936,11 @@ export class RelayServer {
     // a full Mac. An AI client keeps the memory half: its boot warms the UI-tree runner, which does cost
     // memory on a device already up. The CPU half applies to every join — a join usually starts a stream, and a
     // stream's encoding is the load #107 is about.
+    //
+    // Neither half applies to a USB phone (`runsOnMac`): it boots nothing on the Mac, so a loaded Mac is no reason
+    // to keep a person or a run off it.
     const agentAway = session.agentSocket.readyState !== WebSocket.OPEN
-    const load = this.resourceLoad(session)
+    const load = runsOnMac(session) ? this.resourceLoad(session) : null
     if (load) {
       const memSpent = session.readySent && !isAiClientKind(msg.clientKind)
       if (load.cpuOver || (load.memOver && !memSpent)) {
@@ -3592,7 +3608,8 @@ export class RelayServer {
         return
       }
       if (!pending && session.installed && sameBuild(session.installed, thisBuild)) {
-        this.sendTo(ws, { type: 'app:install-done', sessionId, requestId })
+        const { warning } = session.installed
+        this.sendTo(ws, { type: 'app:install-done', sessionId, requestId, ...(warning ? { warning } : {}) })
         return
       }
     }
@@ -3647,14 +3664,14 @@ export class RelayServer {
    * forwarded as before and changes no record. Read whether or not a browser holds the session — an install that
    * finishes while the tester is reconnecting is exactly the one they are coming back to.
    */
-  private settleInstall(session: Session, requestId: string, done: boolean, reason?: string): void {
+  private settleInstall(session: Session, requestId: string, done: boolean, reason?: string, warning?: string): void {
     const pending = session.pendingInstall
     if (!pending || pending.requestId !== requestId) return
     session.pendingInstall = undefined
-    session.installed = done ? { buildId: pending.buildId, filePath: pending.filePath } : undefined
+    session.installed = done ? { buildId: pending.buildId, filePath: pending.filePath, ...(warning ? { warning } : {}) } : undefined
     for (const waiter of pending.waiters) {
       // The agent's own reason. Its reply goes out under the original id, which a reconnected viewer has let go of.
-      this.answerInstallWaiter(session, waiter, done ? null : (reason ?? 'The install this was waiting on failed'))
+      this.answerInstallWaiter(session, waiter, done ? null : (reason ?? 'The install this was waiting on failed'), warning)
     }
   }
 
@@ -3673,12 +3690,13 @@ export class RelayServer {
     for (const waiter of pending.waiters) this.answerInstallWaiter(session, waiter, reason)
   }
 
-  /** To whoever holds the session now, as the agent's own reply is: a waiter joined from a socket that held it. */
-  private answerInstallWaiter(session: Session, requestId: string, failure: string | null): void {
+  /** To whoever holds the session now, as the agent's own reply is: a waiter joined from a socket that held it. A done
+   *  carries the agent's `warning`, or a reconnected viewer would believe it has the build it sent. */
+  private answerInstallWaiter(session: Session, requestId: string, failure: string | null, warning?: string): void {
     const holder = session.browserSocket
     if (!holder) return
     this.sendTo(holder, failure === null
-      ? { type: 'app:install-done', sessionId: session.id, requestId }
+      ? { type: 'app:install-done', sessionId: session.id, requestId, ...(warning ? { warning } : {}) }
       : { type: 'app:install-error', sessionId: session.id, requestId, message: failure })
   }
 
