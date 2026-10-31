@@ -2680,8 +2680,15 @@ export class RelayServer {
 
     const excluded = new Set(payload.exclude ?? [])
     const now = Date.now()
-    const ofPlatform = this.sessions.all().filter((s) => s.devicePlatform === platform && !excluded.has(s.id))
-    if (ofPlatform.length === 0) return refuse('no-device', `no ${platform} device on this relay`)
+    // A phone on USB is someone's own device, and a lease only names a platform: a run uses one only by naming its
+    // session. Once a session on it is shut down the relay reads it as off, so a lease would boot it and reset it.
+    const ofPlatform = this.sessions.all().filter((s) => s.devicePlatform === platform && !excluded.has(s.id) && s.deviceKind !== 'physical')
+    if (ofPlatform.length === 0) {
+      const phones = this.sessions.all().some((s) => s.devicePlatform === platform && !excluded.has(s.id) && s.deviceKind === 'physical')
+      return refuse('no-device', phones
+        ? `no ${platform} device this relay can lease: a USB-connected phone is used only when a run names it by device id`
+        : `no ${platform} device on this relay`)
+    }
 
     // Boot records nobody answered expire where the cap reads them (`capacityDevices`), which a lease meeting only
     // devices already up would never reach; an expired one would otherwise hide its device from every lease.
