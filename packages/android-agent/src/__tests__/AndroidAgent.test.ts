@@ -143,7 +143,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { RelayServer, initDb, closeDb } from '@tapflowio/relay'
 import { hasEnvelope, readEnvelopeFlags, CODEC_H264, CODEC_JPEG } from '@tapflowio/agent-core/utils'
 import { AndroidAgent, pickAndroidBackend, parseSpsFromNal, toNaturalPoint } from '../AndroidAgent'
-import { isPosturable, SHUTDOWN_NO_SESSION_STATE } from '@tapflowio/agent-core'
+import { isPosturable, SHUTDOWN_NO_SESSION_STATE, ValidationError } from '@tapflowio/agent-core'
 import type { SkinRotation } from '../emulator/EmulatorGrpcClient'
 import { AdbWrapper, StorageFullError } from '../AdbWrapper'
 import { ScrcpySession } from '../scrcpy/ScrcpySession'
@@ -154,6 +154,7 @@ import { isAudioSupported, launchMuteOnlyTap } from '@tapflowio/audiotap-helper'
 import type { ScrcpyControl } from '../scrcpy/ScrcpyControl'
 import type { ScrcpyFrame } from '../scrcpy/ScrcpyVideo'
 import type { AdbRunner } from '../adb'
+import { inMemoryPhysicalRotation } from '../avdConfig'
 import { LEAN_MARKER_PATH, LEAN_PACKAGES } from '../LeanPackages'
 import { barrier, waitForOpen, waitForType, waitForTypeOrNull } from '@tapflowio/test-utils'
 import type { NetworkError, NetworkState, SessionJoined } from '@tapflowio/protocol'
@@ -216,6 +217,7 @@ interface AndroidAgentInternals {
   toDevicePx(state: TestState, x: number, y: number): { px: number; py: number }
   normaliseOnBoot(state: TestState, serial: string): Promise<void>
   uprightOnBoot(deviceId: string, serial: string): Promise<void>
+  restoreRotation(deviceId: string): Promise<void>
   watchScreen(state: TestState, serial: string, skin: SkinRotation): void
   prepareBody(state: TestState, serial: string, upright: boolean): Promise<void>
   sendChrome(state: TestState): void
@@ -667,8 +669,8 @@ describe('AndroidAgent', () => {
   describe('a USB-connected device (#152)', () => {
     type Launcher = { launcher: { launch: ReturnType<typeof vi.fn> } }
 
-    async function openPhone(adb: AdbWrapper) {
-      const agent = new AndroidAgent({}, adb)
+    async function openPhone(adb: AdbWrapper, physicalRotationMemory = inMemoryPhysicalRotation()) {
+      const agent = new AndroidAgent({ physicalRotationMemory }, adb)
       await agent.connect(`ws://localhost:${port}`)
       const browser = new WebSocket(`ws://localhost:${port}`)
       await waitForOpen(browser)
@@ -679,8 +681,8 @@ describe('AndroidAgent', () => {
       return { agent, browser, send, close }
     }
 
-    async function bootPhone(adb: AdbWrapper) {
-      const opened = await openPhone(adb)
+    async function bootPhone(adb: AdbWrapper, physicalRotationMemory = inMemoryPhysicalRotation()) {
+      const opened = await openPhone(adb, physicalRotationMemory)
       const ready = waitForType(opened.browser, 'device:ready')
       opened.send({ type: 'device:boot', requestId: 'rq-phone', payload: { deviceId: PHONE_ID } })
       return { ...opened, ready: await ready }
@@ -743,8 +745,8 @@ describe('AndroidAgent', () => {
     })
 
     describe('its rotation lock (#1033)', () => {
-      async function rotateThenShutDown(adb: AdbWrapper) {
-        const { browser, send, close } = await bootPhone(adb)
+      async function rotateThenShutDown(adb: AdbWrapper, physicalRotationMemory = inMemoryPhysicalRotation()) {
+        const { browser, send, close } = await bootPhone(adb, physicalRotationMemory)
         send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
         await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
         const done = waitForType(browser, 'device:shutdown-done')
@@ -780,11 +782,121 @@ describe('AndroidAgent', () => {
         const again = waitForType(browser, 'device:ready')
         send({ type: 'device:boot', requestId: 'rq-again', payload: { deviceId: PHONE_ID } })
         await again
+        // The second boot's listing must not have written it back already, or the last assertion holds for that.
+        expect(adb.freeRotation).not.toHaveBeenCalled()
         const done = waitForType(browser, 'device:shutdown-done')
         send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
         await done
         expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
         close()
+      })
+
+      // Mutation: drop `!held` from the listing's check — another session's emulator boot lists the devices, gives the
+      // phone its auto-rotate back under the open session and forgets the lock, so the next boot remembers tapflow's.
+      it('leaves a phone in a session alone when something else lists the devices', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const { agent, send, close } = await bootPhone(adb)
+        send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        await agent.listDevices()
+        await new Promise((r) => setTimeout(r, 20))
+        expect(adb.freeRotation).not.toHaveBeenCalled()
+        expect(vi.mocked(adb.setRotation).mock.calls).toEqual([[PHONE_SERIAL, 3]])
+        close()
+      })
+
+      // Mutation: keep the lock in memory only — an agent stopped mid-session leaves the phone locked, and the next one
+      // never writes it back.
+      it('puts back a lock an earlier agent remembered, when it first lists the phone', async () => {
+        const adb = mockPhoneAdb({ mode: 'lock', rotation: 3 })
+        const memory = inMemoryPhysicalRotation()
+        memory.remember(PHONE_ID, { mode: 'free' })
+        const agent = new AndroidAgent({ physicalRotationMemory: memory }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL))
+        expect(memory.ids()).toEqual([])
+        agent.disconnect()
+      })
+
+      // Mutation: let the first boot read the phone afresh when a lock is remembered — it takes the lock the stopped
+      // agent left (`lock 3`) for the phone's own, and writes it back at the end.
+      it('keeps the remembered lock over what the phone reads when its write-back failed', async () => {
+        const adb = mockPhoneAdb({ mode: 'lock', rotation: 3 })
+        vi.mocked(adb.freeRotation).mockRejectedValueOnce(new Error('device offline'))
+        const memory = inMemoryPhysicalRotation()
+        memory.remember(PHONE_ID, { mode: 'free' })
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const { close } = await bootPhone(adb, memory)
+          expect(memory.get(PHONE_ID)).toEqual({ mode: 'free' })
+          close()
+        } finally {
+          warn.mockRestore()
+        }
+      })
+
+      // Mutation: go by the disk copy alone — a lock it could not write to disk is never written back to the phone.
+      it('still writes the lock back in this agent when the disk copy cannot be written', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const disk = inMemoryPhysicalRotation()
+        disk.remember = () => { throw new Error('read-only file system') }
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const close = await rotateThenShutDown(adb, disk)
+          expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
+          close()
+        } finally {
+          warn.mockRestore()
+        }
+      })
+
+      // Mutation: write it back asynchronously on disconnect — the CLI exits first and the phone keeps tapflow's lock.
+      it('writes the lock back synchronously when the agent disconnects', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const now = vi.spyOn(adb, 'restoreRotationNow').mockImplementation(() => {})
+        const memory = inMemoryPhysicalRotation()
+        const { send, close } = await bootPhone(adb, memory)
+        send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        close()
+        expect(now).toHaveBeenCalledWith(PHONE_SERIAL, { mode: 'free' }, 3_000)
+        expect(memory.ids()).toEqual([])
+      })
+
+      // Mutation: forget the lock when the exit's write failed — nothing is left for the next agent to put back.
+      it('keeps the lock for the next agent when the exit cannot write it', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        vi.spyOn(adb, 'restoreRotationNow').mockImplementation(() => { throw new Error('timed out') })
+        const memory = inMemoryPhysicalRotation()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const { close } = await bootPhone(adb, memory)
+          close()
+          expect(memory.get(PHONE_ID)).toEqual({ mode: 'free' })
+        } finally {
+          warn.mockRestore()
+        }
+      })
+
+      // Mutation: drop the bound on the write-back — a phone that stopped answering holds its shutdown's reply and the
+      // rotation queue forever.
+      it('gives up on a write-back the phone does not answer, and keeps the lock', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        vi.mocked(adb.freeRotation).mockImplementation(() => new Promise(() => {}))
+        const memory = inMemoryPhysicalRotation()
+        memory.remember(PHONE_ID, { mode: 'free' })
+        const agent = new AndroidAgent({ physicalRotationMemory: memory }, adb)
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        vi.useFakeTimers()
+        try {
+          const restored = internals(agent).restoreRotation(PHONE_ID)
+          await vi.advanceTimersByTimeAsync(10_000)
+          await restored
+          expect(memory.get(PHONE_ID)).toEqual({ mode: 'free' })
+        } finally {
+          vi.useRealTimers()
+          warn.mockRestore()
+        }
       })
 
       // Mutation: forget the remembered lock when the write could not be made — an unplugged phone never gets it back.
@@ -844,6 +956,97 @@ describe('AndroidAgent', () => {
         close()
       })
 
+      // Mutation: `pm clear` the build's package before installing on a phone too — the record names it, so a build
+      // named like the owner's own app takes that app's data, and keeps it gone when the install then fails.
+      it('does not clear the package an install names before installing on a phone', async () => {
+        const adb = mockPhoneAdb()
+        const clear = vi.spyOn(adb, 'clearAppData').mockResolvedValue(undefined)
+        vi.spyOn(adb, 'installApp').mockRejectedValue(new ValidationError('INSTALL_FAILED_UPDATE_INCOMPATIBLE'))
+        const { agent, close } = await bootPhone(adb)
+        const sent = vi.spyOn(agent as unknown as { sendMsg(m: { type: string }): void }, 'sendMsg')
+        internals(agent).handleRelayMessage({
+          type: 'app:install', sessionId: agent.sessionId, requestId: 'rq-i',
+          payload: { filePath: '/tmp/app.apk', bundleId: 'com.example.messenger' },
+        })
+        await vi.waitFor(() => expect(sent.mock.calls.some(([m]) => m.type === 'app:install-error')).toBe(true))
+        expect(clear).not.toHaveBeenCalled()
+        close()
+      })
+
+      // Mutation: drop the limit from the run reset — a flow file naming the owner's app clears it on a phone.
+      it('clears in a run reset only an app it installed on the phone, and reports the rest failed', async () => {
+        const adb = mockPhoneAdb()
+        const clear = vi.spyOn(adb, 'clearAppDataIfInstalled').mockResolvedValue(undefined)
+        const { browser, send, close } = await openPhone(adb)
+        const ready = waitForType(browser, 'device:ready')
+        send({ type: 'device:boot', requestId: 'rq-run', payload: { deviceId: PHONE_ID, runReset: { uninstall: [], clear: ['com.example.messenger'] } } })
+        expect((await ready)['payload']).toMatchObject({ runReset: { done: [], failed: ['app-data'] } })
+        expect(clear).not.toHaveBeenCalled()
+        close()
+      })
+
+      // Mutation: a fixed bound — a large build on a slow cable is cut off and blamed on a prompt; or ignore the override.
+      it('bounds an install by the APK\'s size, unless TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS says otherwise', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-apk-'))
+        const apk = path.join(dir, 'app.apk')
+        fs.writeFileSync(apk, '')
+        fs.truncateSync(apk, 300 * 1024 * 1024)
+        const agent = new AndroidAgent({}, mockPhoneAdb())
+        const bound = (p: string) => (agent as unknown as { physicalInstallTimeoutMs(p: string): number | undefined }).physicalInstallTimeoutMs(p)
+        try {
+          expect(bound(apk)).toBe(120_000 + 300_000)
+          vi.stubEnv('TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS', '900000')
+          expect(bound(apk)).toBe(900_000)
+          vi.stubEnv('TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS', '0')
+          expect(bound(apk)).toBeUndefined()
+        } finally {
+          vi.unstubAllEnvs()
+          fs.rmSync(dir, { recursive: true, force: true })
+        }
+      })
+
+      // Mutation: drop the clear-state check — any client of the session can `pm clear` the phone owner's own apps.
+      it('clears only the data of an app it installed on the phone', async () => {
+        const adb = mockPhoneAdb()
+        const clear = vi.spyOn(adb, 'clearAppData').mockResolvedValue(undefined)
+        vi.spyOn(adb, 'installApp').mockResolvedValue(undefined)
+        const { agent, browser, send, close } = await bootPhone(adb)
+        const refused = waitForType(browser, 'app:clear-state-error')
+        send({ type: 'app:clear-state', requestId: 'rq-c1', payload: { bundleId: 'com.example.messenger' } })
+        expect((await refused)['message']).toMatch(/only the data of an app tapflow installed/)
+        expect(clear).not.toHaveBeenCalled()
+        // As the relay sends it: a browser's install names a build, which the relay turns into this.
+        internals(agent).handleRelayMessage({
+          type: 'app:install', sessionId: agent.sessionId, requestId: 'rq-i',
+          payload: { filePath: '/tmp/app.apk', bundleId: 'com.example.app' },
+        })
+        await vi.waitFor(() => expect(adb.installApp).toHaveBeenCalled())
+        await new Promise((r) => setTimeout(r, 20))
+        clear.mockClear()
+        const cleared = waitForType(browser, 'app:clear-state-done')
+        send({ type: 'app:clear-state', requestId: 'rq-c2', payload: { bundleId: 'com.example.app' } })
+        await cleared
+        expect(clear).toHaveBeenCalledWith(PHONE_SERIAL, 'com.example.app')
+        close()
+      })
+
+      // Mutation: answer the shutdown before the clean-up — a boot right after it pushes the server only to have it
+      // removed; or leave the files on the phone.
+      it('removes what it pushed to the phone before answering its shutdown', async () => {
+        const adb = mockPhoneAdb()
+        const order: string[] = []
+        vi.spyOn(adb, 'removePushedFiles').mockImplementation(async () => {
+          await new Promise((r) => setTimeout(r, 50))
+          order.push('removed')
+        })
+        const { browser, send, close } = await bootPhone(adb)
+        const done = waitForType(browser, 'device:shutdown-done').then(() => order.push('done'))
+        send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+        await done
+        expect(order).toEqual(['removed', 'done'])
+        close()
+      })
+
       // Mutation: let a full phone reclaim storage — it rolls back the updates of the phone's own system apps.
       it('installs over adb, and never reclaims storage on a full phone', async () => {
         const adb = mockPhoneAdb()
@@ -851,7 +1054,8 @@ describe('AndroidAgent', () => {
         const updates = vi.spyOn(adb, 'hasSystemUpdates')
         const { agent, close } = await bootPhone(adb)
         await expect(agent.installApp('/tmp/app.apk')).rejects.toBeInstanceOf(StorageFullError)
-        expect(adb.installApp).toHaveBeenCalledWith(PHONE_SERIAL, '/tmp/app.apk')
+        // Mutation: install unbounded — a phone holding `adb install` on its own prompt never answers the session.
+        expect(adb.installApp).toHaveBeenCalledWith(PHONE_SERIAL, '/tmp/app.apk', 120_000)
         expect(updates).not.toHaveBeenCalled()
         close()
       })
@@ -2875,6 +3079,37 @@ describe('AndroidAgent', () => {
         expect(state.scrcpySession).not.toBeNull()
         expect(state.restarting).toBe(false)
       })
+
+      // Mutation: go back to `pkill -f scrcpy-server` — it also kills a scrcpy the developer runs on the same phone.
+      it('kills only its own lingering server, by its scid', async () => {
+        vi.useFakeTimers()
+        const pkill = vi.spyOn(internals(agent).adb, 'pkill').mockResolvedValue(undefined)
+        const state = getState()
+        ;(state.scrcpySession as unknown as { id: string }).id = '1a2b3c4d'
+        state.restarting = true
+
+        const restartPromise = internals(agent).restartVideoStream(state)
+        await vi.runAllTimersAsync()
+        await restartPromise
+
+        expect(pkill.mock.calls).toEqual([['emulator-5554', 'scid=1a2b3c4d']])
+      })
+
+      // Mutation: skip the kill with no session to name, or fall back to `scrcpy-server` — a lingering server stays
+      // up, or a developer's own scrcpy is killed.
+      it('kills only tapflow\'s own server when no session names one', async () => {
+        vi.useFakeTimers()
+        const pkill = vi.spyOn(internals(agent).adb, 'pkill').mockResolvedValue(undefined)
+        const state = getState()
+        ;(state as unknown as { scrcpySession: null }).scrcpySession = null
+        state.restarting = true
+
+        const restartPromise = internals(agent).restartVideoStream(state)
+        await vi.runAllTimersAsync()
+        await restartPromise
+
+        expect(pkill.mock.calls).toEqual([['emulator-5554', '/data/local/tmp/tapflow-scrcpy-server.jar']])
+      })
     })
   })
 
@@ -4642,8 +4877,9 @@ describe('pickAndroidBackend', () => {
     expect(pickAndroidBackend('emulator-5554', { TAPFLOW_ANDROID_BACKEND: 'scrcpy' })).toBe('scrcpy')
   })
 
-  it('honors TAPFLOW_ANDROID_BACKEND=grpc even for a real-device serial', () => {
-    expect(pickAndroidBackend('39021FDH2003ZZ', { TAPFLOW_ANDROID_BACKEND: 'grpc' })).toBe('grpc')
+  // Mutation: let `grpc` apply to every serial — see pickAndroidBackend.test.ts.
+  it('keeps a real-device serial on scrcpy under TAPFLOW_ANDROID_BACKEND=grpc', () => {
+    expect(pickAndroidBackend('39021FDH2003ZZ', { TAPFLOW_ANDROID_BACKEND: 'grpc' })).toBe('scrcpy')
   })
 
   it('defaults an emulator-* serial to grpc when unset', () => {

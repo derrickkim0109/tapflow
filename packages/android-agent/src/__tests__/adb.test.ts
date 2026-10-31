@@ -11,7 +11,7 @@ vi.mock('child_process', () => ({ execFile: vi.fn() }))
 // the execFile failure it names, rather than on whichever failure this host happens to produce.
 vi.mock('../sdk', () => ({ getAdbPath: () => process.env['ADB_PATH'], getEmulatorPath: () => '/fake/emulator' }))
 
-import { defaultRunner } from '../adb'
+import { AdbTimeoutError, defaultRunner } from '../adb'
 
 type ExecFileCallback = (error: Error | null, result: { stdout: string | Buffer }) => void
 
@@ -109,5 +109,18 @@ describe('defaultRunner', () => {
 
     expect(warnings(warn)).toHaveLength(2)
     warn.mockRestore()
+  })
+
+  // #152: a phone that stops answering must cost its own call only. Mutation: drop `timeout` (the child is never
+  // killed), or pass the kill through as a plain error (the install's advice to look at the phone is never given).
+  it('execWithin kills adb past its bound and says so', async () => {
+    vi.mocked(execFile).mockImplementation(((_f: unknown, _a: unknown, _o: unknown, cb: (e: Error) => void) => {
+      cb(Object.assign(new Error('Command failed'), { killed: true, signal: 'SIGTERM' }))
+      return {} as ReturnType<typeof execFile>
+    }) as never)
+
+    await expect(defaultRunner.execWithin!(120_000, '-s', 'RFCX00ABCDE', 'install', '-r', '/tmp/app.apk'))
+      .rejects.toBeInstanceOf(AdbTimeoutError)
+    expect(lastCall()[2]).toEqual({ maxBuffer: 64 * 1024 * 1024, timeout: 120_000 })
   })
 })

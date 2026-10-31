@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { avdHomes, avdRotationLockMemory, classifyAvd, formFactorOf, parseIni } from '../avdConfig'
+import { androidUserHome, avdHomes, avdRotationLockMemory, classifyAvd, formFactorOf, parseIni, physicalRotationFile } from '../avdConfig'
 
 // What kind of device an AVD is, read from its config.ini before it boots — the dashboard draws the
 // boot skeleton from it. Fixtures are the keys that matter, copied from AVDs on a real Mac on
@@ -176,5 +176,64 @@ describe('avdRotationLockMemory', () => {
     avdRotationLockMemory.forget('Pixel')
     expect(avdRotationLockMemory.freed('Pixel')).toBe(false)
     avdRotationLockMemory.forget('Missing')
+  })
+})
+
+// #1033: a phone's rotation lock from before its session, kept on disk so an agent stopped mid-session does not lose it.
+describe('physicalRotationFile', () => {
+  const dirs: string[] = []
+  afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }) })
+  const fileIn = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tapflow-usb-rotation-'))
+    dirs.push(dir)
+    return join(dir, 'android-home', 'tapflow-usb-rotation.json')
+  }
+
+  // Mutation: keep it in memory — a second store on the same file (the next agent) reads nothing.
+  it('is read back by the next agent from the same file', () => {
+    const file = fileIn()
+    physicalRotationFile(file).remember('usb:AAAA0001', { mode: 'lock', rotation: 1 })
+    physicalRotationFile(file).remember('usb:AAAA0002', { mode: 'free' })
+    const next = physicalRotationFile(file)
+    expect(next.ids().sort()).toEqual(['usb:AAAA0001', 'usb:AAAA0002'])
+    expect(next.get('usb:AAAA0001')).toEqual({ mode: 'lock', rotation: 1 })
+  })
+
+  // Mutation: leave an empty file behind, or forget every phone at once.
+  it('forgets one phone at a time, and removes the file with the last', () => {
+    const file = fileIn()
+    const memory = physicalRotationFile(file)
+    memory.remember('usb:AAAA0001', { mode: 'free' })
+    memory.remember('usb:AAAA0002', { mode: 'free' })
+    memory.forget('usb:AAAA0001')
+    expect(memory.ids()).toEqual(['usb:AAAA0002'])
+    memory.forget('usb:AAAA0002')
+    expect(existsSync(file)).toBe(false)
+  })
+
+  // Mutation: trust what the file says — a hand-edited or truncated file would write a lock `wm` refuses.
+  it('reads a malformed file as empty, and skips an entry it cannot use', () => {
+    const file = fileIn()
+    mkdirSync(join(file, '..'), { recursive: true })
+    writeFileSync(file, '{ not json')
+    expect(physicalRotationFile(file).ids()).toEqual([])
+    writeFileSync(file, JSON.stringify({ 'usb:A': { mode: 'lock', rotation: 7 }, 'usb:B': { mode: 'free' } }))
+    expect(physicalRotationFile(file).ids()).toEqual(['usb:B'])
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toHaveProperty('usb:A')
+  })
+
+  // Mutation: write the file in place — a write cut short (here, one that cannot be made) costs every lock it held.
+  it('replaces the file whole or not at all', () => {
+    const file = fileIn()
+    const memory = physicalRotationFile(file)
+    memory.remember('usb:AAAA0001', { mode: 'free' })
+    mkdirSync(`${file}.${process.pid}.tmp`)
+    expect(() => memory.remember('usb:AAAA0002', { mode: 'lock', rotation: 2 })).toThrow()
+    expect(physicalRotationFile(file).ids()).toEqual(['usb:AAAA0001'])
+  })
+
+  it('lives beside adb\'s own keys', () => {
+    expect(androidUserHome({ ANDROID_USER_HOME: '/x/android' }, '/home/me')).toBe('/x/android')
+    expect(androidUserHome({}, '/home/me')).toBe(join('/home/me', '.android'))
   })
 })

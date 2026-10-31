@@ -5,7 +5,7 @@ import { createHash } from 'crypto'
 import { readFileSync } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { defaultRunner, type AdbRunner } from './adb.js'
+import { AdbTimeoutError, SCRCPY_SERVER_DEVICE_PATH, defaultRunner, type AdbRunner } from './adb.js'
 import type { LaunchOptions } from '@tapflowio/protocol'
 import { hasLaunchOptions } from '@tapflowio/protocol/launch'
 import { androidLaunchExtras } from './launchExtras.js'
@@ -34,6 +34,32 @@ export function isPhysicalDevice(deviceId: string): boolean {
   return deviceId.startsWith('usb:')
 }
 
+/**
+ * Whether USB-connected devices are offered at all (`TAPFLOW_ANDROID_USB_DEVICES=1`). Off by default: a phone plugged
+ * into the agent Mac to charge would otherwise be open to everyone who can reach the relay — its screen, its apps and
+ * their data. Off, the listing is what it was before phones were offered: emulators only, and no shell on any other
+ * device.
+ */
+export function usbDevicesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.TAPFLOW_ANDROID_USB_DEVICES === '1'
+}
+
+/** How long a phone's properties may take to read before the listing goes on without it (#152). */
+const DESCRIBE_PHYSICAL_TIMEOUT_MS = 10_000
+
+/** Why adb cannot drive a device in `state`, for the one line said when it gets there. */
+function notDrivable(state: string, rest: readonly string[]): string {
+  switch (state) {
+    case 'unauthorized': return 'authorize USB debugging on the phone, then reconnect the agent'
+    case 'authorizing': return 'it is waiting for USB debugging to be authorized on the phone'
+    case 'offline': return 'adb reports it offline; unplug it and plug it in again, then reconnect the agent'
+    case 'recovery': case 'sideload': case 'rescue': case 'bootloader':
+      return `it is in ${state} mode; start Android on it, then reconnect the agent`
+    case 'no': return `adb has ${[state, ...rest].join(' ')}`
+    default: return `adb reports it as ${[state, ...rest].join(' ') || 'unknown'}`
+  }
+}
+
 // Play Store images fill /data on their own as Google apps update in the background, so this is
 // usually not the build's fault — but any image can fill up, so the message does not blame them.
 const STORAGE_FULL_MESSAGE =
@@ -59,7 +85,9 @@ export class AdbWrapper {
   private readonly serialMap = new Map<string, string>()
   // Per USB serial: what listing it costs a shell round trip to learn, dropped when it is unplugged.
   private readonly physicalInfo = new Map<string, Pick<Device, 'name' | 'osVersion' | 'formFactor'>>()
-  private readonly unauthorizedWarned = new Set<string>()
+  // Per USB serial adb lists but cannot drive, the state last said, so each change is said once and a poll says nothing.
+  private readonly undrivableSaid = new Map<string, string>()
+  private readonly usbDevices: boolean
   // Per serial: whether the tree dump jar is on the device (one push per agent run), and devices whose image lacks
   // the classes it needs, which go straight to `uiautomator dump` from then on.
   private readonly uidumpPushed = new Map<string, Promise<string | undefined>>()
@@ -70,7 +98,9 @@ export class AdbWrapper {
   // a flow's is enough to get there.
   private readonly dumpQueue = new Map<string, Promise<unknown>>()
 
-  constructor(private readonly runner: AdbRunner = defaultRunner) {}
+  constructor(private readonly runner: AdbRunner = defaultRunner, options: { usbDevices?: boolean } = {}) {
+    this.usbDevices = options.usbDevices ?? usbDevicesEnabled()
+  }
 
   getSerial(avdId: string): string | undefined {
     return this.serialMap.get(avdId)
@@ -139,8 +169,9 @@ export class AdbWrapper {
 
   /**
    * The emulators (serial → AVD name) and the USB-connected devices adb can drive. A device in any state but `device`
-   * cannot be driven; an unauthorized one is said once, since it is the one a person can fix from the phone. Network
-   * serials — `ip:port` and mDNS `adb-…._adb-tls-connect._tcp` — are left out: only USB is offered for now.
+   * cannot be driven; why is said once per state it reaches — unauthorized, offline, recovery — since each is fixed on
+   * the phone or its cable. Network serials — `ip:port` and mDNS `adb-…._adb-tls-connect._tcp` — are left out: only
+   * USB is offered for now. With USB devices off (`usbDevicesEnabled`), only the emulators are read, as before.
    */
   private async getAttached(): Promise<{ emulators: Map<string, string>; usb: string[] }> {
     const emulators = new Map<string, string>()
@@ -153,21 +184,25 @@ export class AdbWrapper {
         .map((l) => l.trim().split(/\s+/))
         .filter(([serial]) => Boolean(serial))
       const serials: string[] = []
+      const listedUsb = new Set<string>()
       for (const [serial, state = '', ...rest] of rows) {
         if (serial.startsWith('emulator-')) {
           if (state === 'device') serials.push(serial)
           continue
         }
+        if (!this.usbDevices) continue
         if (serial.includes(':') || /\._adb-tls-(connect|pairing)\._tcp\.?$/.test(serial)) continue
+        listedUsb.add(serial)
         if (state === 'device') {
           usb.push(serial)
-          this.unauthorizedWarned.delete(serial)
-        } else if ((state === 'unauthorized' || state === 'no') && !this.unauthorizedWarned.has(serial)) {
-          this.unauthorizedWarned.add(serial)
-          const why = state === 'no' ? `adb has ${[state, ...rest].join(' ')}` : 'authorize USB debugging on the phone'
-          logger.warn(`USB device ${serial} is not offered: ${why}, then reconnect the agent`)
+          this.undrivableSaid.delete(serial)
+        } else if (this.undrivableSaid.get(serial) !== state) {
+          this.undrivableSaid.set(serial, state)
+          logger.warn(`USB device ${serial} is not offered: ${notDrivable(state, rest)}`)
         }
       }
+      // Unplugged: plugged in again in the same state, it is said again.
+      for (const serial of [...this.undrivableSaid.keys()]) if (!listedUsb.has(serial)) this.undrivableSaid.delete(serial)
 
       await Promise.all(
         serials.map(async (serial) => {
@@ -186,11 +221,14 @@ export class AdbWrapper {
    * A USB-connected device as listed: one shell round trip per serial, kept until it is unplugged. The name is the
    * marketing name where the build has one, else the device name the phone shows in its own settings (Samsung sets
    * that and no marketing name — a Galaxy Z Flip4 reads `SM-F721N` as its model), else the model.
+   *
+   * Bounded: the listing runs in `connect()` and before every emulator boot, so a phone that does not answer — a bad
+   * cable, a phone restarting — is left out of this listing rather than holding all of them up.
    */
   private async describePhysical(serial: string): Promise<Device | null> {
     let info = this.physicalInfo.get(serial)
     if (!info) {
-      const out = await this.runner.exec('-s', serial, 'shell',
+      const out = await this.execWithin(DESCRIBE_PHYSICAL_TIMEOUT_MS, '-s', serial, 'shell',
         'for p in ro.product.marketname ro.product.model ro.build.version.release ro.build.characteristics; ' +
         'do echo "$p=$(getprop $p)"; done; echo "device_name=$(settings get global device_name)"',
       ).catch((e: unknown) => {
@@ -372,10 +410,22 @@ export class AdbWrapper {
     }
   }
 
-  async installApp(serial: string, apkPath: string): Promise<void> {
+  /**
+   * `timeoutMs` bounds the install, for a USB-connected device: a phone can hold `adb install` open on a prompt of its
+   * own ("Verify apps over USB", Play Protect) that nobody at the viewer can see. A bound that runs out can also be a
+   * slow install, so the message names both. An emulator's install is unbounded.
+   */
+  async installApp(serial: string, apkPath: string, timeoutMs?: number): Promise<void> {
     try {
-      await this.runner.exec('-s', serial, 'install', '-r', apkPath)
+      if (timeoutMs === undefined) await this.runner.exec('-s', serial, 'install', '-r', apkPath)
+      else await this.execWithin(timeoutMs, '-s', serial, 'install', '-r', apkPath)
     } catch (e) {
+      if (e instanceof AdbTimeoutError) {
+        throw new PlatformError(
+          `The install did not finish within ${Math.round(e.timeoutMs / 1000)} s. The phone may be asking whether to install or scan the app — answer there and install again (turning off "Verify apps over USB" in Developer options stops the question) — or the install is slow for this build on this connection: raise TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS.`,
+          { cause: e },
+        )
+      }
       const stderr = (e as { stderr?: string }).stderr?.trim()
       if (stderr) {
         // Judged without adb's "failed to install <path>:" prefix: the path ends in the uploaded
@@ -791,6 +841,36 @@ export class AdbWrapper {
 
   async pkill(serial: string, pattern: string): Promise<void> {
     await this.runner.exec('-s', serial, 'shell', 'pkill', '-f', pattern)
+  }
+
+  /**
+   * Put a USB-connected device's rotation lock back **synchronously**, for the agent's exit: the process ends right
+   * after `disconnect()`, so an `exec` would never run. Throws when it could not, or when the runner cannot block.
+   */
+  restoreRotationNow(serial: string, lock: { mode: 'free' } | { mode: 'lock'; rotation: 0 | 1 | 2 | 3 }, timeoutMs: number): void {
+    if (!this.runner.execSyncWithin) throw new PlatformError('this adb runner cannot run adb synchronously')
+    const args = lock.mode === 'free' ? ['free'] : ['lock', String(lock.rotation)]
+    this.runner.execSyncWithin(timeoutMs, '-s', serial, 'shell', 'wm', 'user-rotation', ...args)
+  }
+
+  /**
+   * Remove what tapflow pushed to a USB-connected device's `/data/local/tmp` — the scrcpy server and the tree dump —
+   * once its session is over, so a phone is not left holding them. The tree dump is pushed again on its next use.
+   */
+  async removePushedFiles(serial: string, timeoutMs: number): Promise<void> {
+    const files = [SCRCPY_SERVER_DEVICE_PATH, ...(this.uidumpDevicePath ? [this.uidumpDevicePath] : [])]
+    this.uidumpPushed.delete(serial)
+    await this.execWithin(timeoutMs, '-s', serial, 'shell', 'rm', '-f', ...files)
+  }
+
+  /** `exec` with a bound (`AdbRunner.execWithin`). A runner without one is only stopped being waited for. */
+  private execWithin(timeoutMs: number, ...args: string[]): Promise<string> {
+    if (this.runner.execWithin) return this.runner.execWithin(timeoutMs, ...args)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    return Promise.race([
+      this.runner.exec(...args),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AdbTimeoutError(timeoutMs, args)), timeoutMs) }),
+    ]).finally(() => clearTimeout(timer))
   }
 }
 
