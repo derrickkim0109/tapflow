@@ -95,7 +95,7 @@ export function UploadBuildDialog({ onSuccess, appId, canWrite }: Props) {
       <DialogTrigger asChild>
         <Button size="sm"><Upload className="mr-2 h-4 w-4" />Upload build</Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>Upload build</DialogTitle>
         </DialogHeader>

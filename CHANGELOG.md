@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dialogs come in three widths.** Every dashboard dialog except the deeplink bar is now 384, 448 or 512 pixels wide, chosen by what it holds, so similar dialogs line up; at desktop width the Streaming notice moves from 440 to 448.
 - **Build text fields are bounded.** An upload's `label` is trimmed and cut to 100 characters; `PATCH /api/v1/builds/:id` refuses a `version_label` that is not text or is longer than 100 characters with `400`, where it used to store it as sent.
 - **An upload's `label` no longer names the app.** When a build file carries no app name, the new app is named after the file instead of the label, so a label like `staging` does not become an app's name.
 - **A build's platform comes from its file.** The upload's `platform` field is ignored, so an `.apk` sent with `platform=ios` is recorded as Android. Builds already on record are corrected the same way when the relay upgrades.
