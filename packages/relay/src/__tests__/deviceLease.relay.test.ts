@@ -46,12 +46,15 @@ describe('the relay leases a device to an automation client', () => {
   }
 
   /** An agent on Mac `agentId`. Devices are shut down unless named in `booted`. */
-  async function agent(agentId: string, deviceIds: string[], opts: { platform?: string; booted?: string[]; memUsedMB?: number } = {}) {
+  async function agent(agentId: string, deviceIds: string[], opts: { platform?: string; booted?: string[]; memUsedMB?: number; physical?: string[] } = {}) {
     const platform = opts.platform ?? 'ios'
     const ws = await open()
     ws.send(JSON.stringify({
       type: 'agent:register', agentId, agentName: `${agentId}-${platform}`, platform,
-      devices: deviceIds.map((id) => ({ id, name: id, platform, status: opts.booted?.includes(id) ? 'booted' : 'shutdown' })),
+      devices: deviceIds.map((id) => ({
+        id, name: id, platform, status: opts.booted?.includes(id) ? 'booted' : 'shutdown',
+        ...(opts.physical?.includes(id) ? { kind: 'physical' } : {}),
+      })),
     }))
     const reply = await waitForType<AgentRegistered>(ws, 'agent:registered')
     if (opts.memUsedMB !== undefined) report(ws, { memUsedMB: opts.memUsedMB })
@@ -283,6 +286,29 @@ describe('the relay leases a device to an automation client', () => {
     const runner = await open()
     lease(runner, 'L1')
     expect(await refused(runner, 'L1')).toMatchObject({ reason: 'all-held' })
+  })
+
+  // #152: a USB phone a session was shut down on reads as off, which is what a lease boots — and resets.
+  // Mutation: drop the `kind !== 'physical'` filter — this lease boots the phone, with the run's reset.
+  it('never takes a USB phone, even one the relay reads as off', async () => {
+    await start()
+    const mac = await agent('mac-1', ['usb:PHONE01'], { platform: 'android', booted: ['usb:PHONE01'], physical: ['usb:PHONE01'] })
+    const phone = mac.session.get('usb:PHONE01')!
+    const person = await open()
+    person.send(JSON.stringify({ type: 'session:start', sessionId: phone }))
+    await waitForType<SessionJoined>(person, 'session:joined')
+    person.send(JSON.stringify({ type: 'device:shutdown', sessionId: phone, requestId: 'off', payload: { deviceId: 'usb:PHONE01' } }))
+    await waitForType<DeviceShutdown>(mac.ws, 'device:shutdown')
+    mac.ws.send(JSON.stringify({ type: 'device:shutdown-done', sessionId: phone, requestId: 'off', payload: { deviceId: 'usb:PHONE01' } }))
+    person.send(JSON.stringify({ type: 'session:leave', sessionId: phone }))
+    person.send(JSON.stringify({ type: 'agents:list' }))
+    const listed = await waitForType<AgentsListed>(person, 'agents:listed')
+    expect(JSON.stringify(listed)).toContain('"status":"shutdown"')
+
+    const runner = await open()
+    lease(runner, 'L1', { platform: 'android' })
+    // Mutation: say only that there is no android device — the person looking at the phone in the list is not told why.
+    expect(await refused(runner, 'L1')).toMatchObject({ reason: 'no-device', retryable: false, message: expect.stringMatching(/USB-connected phone .* by device id/) })
   })
 
   it('never takes a device another client holds', async () => {
