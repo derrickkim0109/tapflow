@@ -1,7 +1,7 @@
 ---
 component: Dialog
 source: components/ui/dialog.tsx
-cva: none
+cva: dialogVariants
 own: actions
 ---
 
@@ -10,8 +10,8 @@ own: actions
 > Shared rules (state names, focus ring, disabled, tokens) live in [DESIGN.md](../../DESIGN.md).
 > This file holds only what is specific to Dialog.
 
-`components/ui/dialog.tsx` wraps Radix Dialog and has no `cva`. `actions` below is how the call site lays out
-its buttons, not a prop. A confirmation that asks "are you sure?" is `AlertDialog`, a separate component.
+`components/ui/dialog.tsx` wraps Radix Dialog. Its one prop axis is `size`, the panel's width (`dialogVariants`).
+`actions` below is how the call site lays out its buttons, not a prop. A confirmation that asks "are you sure?" is `AlertDialog`, a separate component.
 
 ## Anatomy
 
@@ -39,10 +39,22 @@ its buttons, not a prop. A confirmation that asks "are you sure?" is `AlertDialo
   Its focus ring uses `focus:`, so it shows on a click too. Last in the tab order, after the actions.
 
 **Below 640px** the corners are square and the header is centered, and on a phone the panel fills the width
-(`w-full` up to 512px, with no side margin). The dashboard is drawn
+(`w-full` up to its `size`, with no side margin). The dashboard is drawn
 at desktop width, where the header is left-aligned and the corners are 8px.
 
 ## Properties
+
+### `size`
+
+| Value | Width | Call sites | For |
+|-------|------:|-----------:|-----|
+| `sm` | 384px (`max-w-sm`) | 1 | A short form of one to three fields with no description: Add App |
+| `md` | 448px (`max-w-md`) | 5 | A form, a notice, or a result to copy: Invite member, Password reset link, Create token, Upload build, Streaming in Standard mode |
+| `lg` | 512px (`max-w-lg`) | 4 | The default. An edit form with a description or hints under its fields: Edit app, Split, Rename device, Edit build. AlertDialog is always this width |
+
+Three sizes rather than a width per dialog (#1084 review). Pick by what the body holds, not by what looks right
+for one dialog: a new dialog takes the size of the row above whose "For" it matches, and a fourth size is a
+change to this table first. The deeplink bar is outside the scale: it is a command bar, not a panel.
 
 ### `actions`
 
@@ -72,9 +84,7 @@ specs.
 
 | Where | Override | Why |
 |-------|----------|-----|
-| Invite member, Password reset link, Create token, Upload build | `sm:max-w-md` (448px) | Base width is `max-w-lg` (512px) |
-| Add App | `sm:max-w-sm` (384px) | Three short fields |
-| Streaming in Standard mode | `sm:max-w-[440px]`; description split into two paragraphs 12px apart, with 4px more above it (`pt-1`) | A notice, not a form |
+| Streaming in Standard mode | Description split into two paragraphs 12px apart, with 4px more above it (`pt-1`) | A notice, not a form |
 | Open deeplink | 500px × 52px bar, `rounded-[18px]`, 10px padding, Close hidden (`[&>button]:hidden`), title `sr-only` | A command bar (⌘K), not a dialog-shaped panel |
 
 Inside the deeplink bar: a borderless, unfilled field (16px search icon in `--muted-foreground`, 8px gap,
@@ -98,7 +108,7 @@ the panel.
 
 ## Dialog vs AlertDialog
 
-They share the panel, overlay, width and motion. What differs:
+They share the panel, overlay and motion, and AlertDialog has Dialog's `lg` width. What differs:
 
 | | Dialog | AlertDialog |
 |---|---|---|
