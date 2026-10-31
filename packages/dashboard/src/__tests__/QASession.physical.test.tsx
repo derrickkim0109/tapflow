@@ -20,7 +20,11 @@ const { BUILD } = vi.hoisted(() => ({
 }))
 vi.mock('@/hooks/useBuildLoader', () => ({ useBuildLoader: () => ({ build: BUILD }) }))
 vi.mock('@/components/SessionPanel', () => ({ SessionPanel: () => <div /> }))
-vi.mock('@/components/DeviceViewer', () => ({ DeviceViewer: () => <div /> }))
+// Records what the page hands the viewer: the device's kind and the reset it boots with.
+const { viewerProps } = vi.hoisted(() => ({ viewerProps: [] as Array<{ kind?: string; resetMode?: string }> }))
+vi.mock('@/components/DeviceViewer', () => ({
+  DeviceViewer: (props: { kind?: string; resetMode?: string }) => { viewerProps.push({ kind: props.kind, resetMode: props.resetMode }); return <div /> },
+}))
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
 const { QASession } = await import('../pages/QASession')
@@ -35,7 +39,8 @@ const AGENTS: SessionInfo[] = [{
   ],
 }]
 
-async function openDeviceList() {
+async function openDeviceList(agents: SessionInfo[] = AGENTS) {
+  viewerProps.length = 0
   const user = userEvent.setup()
   render(withQuery(
     <MemoryRouter initialEntries={['/qa?id=7']}>
@@ -43,9 +48,13 @@ async function openDeviceList() {
     </MemoryRouter>,
   ))
   await vi.waitFor(() => expect(deliver).not.toBeNull())
-  await act(async () => { deliver!({ type: 'agents:listed', sessions: AGENTS }) })
+  await act(async () => { deliver!({ type: 'agents:listed', sessions: agents }) })
   return user
 }
+
+/** The fixture's Mac, changed as given. */
+const mac = (over: Partial<SessionInfo>): SessionInfo[] => [{ ...AGENTS[0]!, ...over }]
+const PHONE_ONLY = mac({ capabilities: ['full-reset'], devices: AGENTS[0]!.devices.filter((d) => d.kind === 'physical') })
 
 describe('QASession — a USB-connected device (#152)', () => {
   // A tester picks a real phone for what a simulator cannot do, so the Mac card says one is there before they open it.
@@ -74,5 +83,70 @@ describe('QASession — a USB-connected device (#152)', () => {
     expect(phone.textContent).toContain('Connected')
     expect(phone.textContent).not.toContain('Booted')
     expect(screen.getByRole('button', { name: /iPhone 17/ }).textContent).toContain('Booted')
+  })
+
+  // A relay from before the phone exemption lists every device it has not brought up, phones included.
+  // Mutation: drop `!isPhysical` from `needsMemory` — the phone is greyed out as "Not enough memory to start".
+  it('never refuses a plugged-in device for memory, even when the relay lists it', async () => {
+    const user = await openDeviceList(mac({ admission: { booting: false, overloaded: false, memoryRefuses: ['00008140-0000000000000001', 'sim-b'] } }))
+    await user.click(await screen.findByText('studio-mac'))
+    const phone = await screen.findByRole('button', { name: /Test iPhone/ })
+    expect(phone).toBeEnabled()
+    expect(phone.textContent).toContain('Connected')
+    // The simulator it names is still refused: the exemption is the phone's alone.
+    expect(screen.getByRole('button', { name: /iPhone SE/ })).toBeDisabled()
+  })
+
+  // The relay's `overloaded` says the Mac's simulators would be refused; its phone would not be. Mutations: disable the
+  // card whatever is attached (the phone cannot be reached), or let the card open without greying out the simulators
+  // (they look available and the relay refuses each one).
+  it('opens an overloaded Mac for its plugged-in device and greys out only its simulators', async () => {
+    const user = await openDeviceList(mac({ admission: { booting: false, overloaded: true, memoryRefuses: [] } }))
+    const card = await screen.findByRole('button', { name: /studio-mac/ })
+    expect(card).toBeEnabled()
+    await user.click(card)
+    const phone = await screen.findByRole('button', { name: /Test iPhone/ })
+    expect(phone).toBeEnabled()
+    for (const name of [/iPhone 17/, /iPhone SE/]) {
+      const sim = screen.getByRole('button', { name })
+      expect(sim).toBeDisabled()
+      expect(sim.textContent).toContain('This Mac is overloaded')
+    }
+  })
+  it('keeps an overloaded Mac with no plugged-in device closed', async () => {
+    await openDeviceList(mac({ admission: { booting: false, overloaded: true, memoryRefuses: [] }, devices: AGENTS[0]!.devices.filter((d) => d.kind !== 'physical') }))
+    expect(await screen.findByRole('button', { name: /studio-mac/ })).toBeDisabled()
+  })
+
+  // Mutation: drop the `kind` prop from the page's `DeviceViewer` — the viewer offers a phone every simulator control.
+  it('tells the viewer it is driving a plugged-in device', async () => {
+    const user = await openDeviceList()
+    await user.click(await screen.findByText('studio-mac'))
+    await user.click(await screen.findByRole('button', { name: /Test iPhone/ }))
+    expect(viewerProps.at(-1)).toMatchObject({ kind: 'physical' })
+  })
+
+  // Nothing on a Mac of phones can be erased. Mutation: drop the `filteredDevices.some(...)` clause.
+  it('offers no Full reset on a Mac with only plugged-in devices', async () => {
+    const user = await openDeviceList(PHONE_ONLY)
+    await user.click(await screen.findByText('studio-mac'))
+    await screen.findByRole('button', { name: /Test iPhone/ })
+    expect(screen.queryByRole('switch')).toBeNull()
+  })
+  it('offers Full reset on a Mac that also has a simulator', async () => {
+    const user = await openDeviceList(mac({ capabilities: ['full-reset'] }))
+    await user.click(await screen.findByText('studio-mac'))
+    expect(await screen.findByRole('switch')).toBeTruthy()
+  })
+
+  // The switch is armed for the next pick, and the next pick is a phone. Mutation: call `consumeResetMode()` with
+  // no argument — the phone boots `full-erase`, which its agent refuses.
+  it('boots a plugged-in device without erasing it even with Full reset on', async () => {
+    const user = await openDeviceList(mac({ capabilities: ['full-reset'] }))
+    await user.click(await screen.findByText('studio-mac'))
+    await user.click(await screen.findByRole('switch'))
+    expect(screen.getByRole('switch')).toBeChecked()
+    await user.click(screen.getByRole('button', { name: /Test iPhone/ }))
+    expect(viewerProps.at(-1)).toMatchObject({ kind: 'physical', resetMode: 'app-only' })
   })
 })

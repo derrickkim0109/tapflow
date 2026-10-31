@@ -77,7 +77,7 @@ export function QASession() {
 
   const os = build?.platform ?? 'ios';
   const {
-    sessions, activeFormFactor, selectedAgent, setSelectedAgent,
+    sessions, activeFormFactor, activeKind, selectedAgent, setSelectedAgent,
     activeSessionId, deviceId, booting, status,
     connected, agentGroups,
     startDevice, resetDevice, handleBack, handleBackToMacs, handleSessionEnded,
@@ -85,7 +85,7 @@ export function QASession() {
 
   const selectedSession = agentGroups.find((s) => s.agentName === selectedAgent);
   const {
-    osVersions, osVersion, setOsVersion,
+    filteredDevices, osVersions, osVersion, setOsVersion,
     deviceSearch, setDeviceSearch, versionedDevices,
     resetMode, setResetMode, appliedResetMode, consumeResetMode, fullResetSupported,
   } = useDeviceSelector(selectedSession, os);
@@ -107,7 +107,7 @@ export function QASession() {
   // Consumed on click, not on success — a failed boot does not re-arm it. Asking again means
   // turning it on again, which keeps an irreversible action tied to an explicit act.
   const handleStartDevice = useCallback((d: DeviceSummary) => {
-    consumeResetMode();
+    consumeResetMode(d.kind !== 'physical');
     startDevice(d);
   }, [consumeResetMode, startDevice]);
 
@@ -190,6 +190,7 @@ export function QASession() {
                 deviceId={deviceId}
                 formFactor={selectedDevice?.formFactor ?? activeFormFactor}
                 platform={os}
+                kind={activeKind}
                 buildId={build?.id}
                 resetMode={appliedResetMode}
                 onRecordingUploaded={handleRecordingUploaded}
@@ -232,7 +233,10 @@ export function QASession() {
                     owes the user a reason, and the only channel here is the tooltip — which does
                     not reach touch at all. Showing nothing beats showing a switch that erases
                     nothing and cannot say why. */}
-                {fullResetSupported && (
+                {/* A phone on USB is never erased, so a Mac offering only phones has nothing for this to act on.
+                    Read from every device of this platform rather than the filtered list, so a search does not make
+                    an armed switch vanish. */}
+                {fullResetSupported && filteredDevices.some((d) => d.kind !== 'physical') && (
                   <TooltipProvider>
                     <Tooltip>
                       {/* The whole control is the trigger, not the label alone: a label cannot take
@@ -279,15 +283,19 @@ export function QASession() {
                     // On a Mac short of memory the relay lets a person rejoin only a device it brought up itself; the
                     // listing names the rest. Not `!isBooted`: a simulator running before its agent registered reads
                     // booted and is still refused.
-                    const needsMemory = selectedSession?.admission.memoryRefuses.includes(d.id) ?? false
                     // **Says who is driving an AI-held device, and offers no way in.** Watching an AI session
                     // is for the person who started it, through the link their coding agent hands them; the
                     // device list only explains why the device is taken.
                     const isPhysical = d.kind === 'physical'
+                    // Never a phone, whatever the relay lists: it boots nothing on the Mac, and a relay from before
+                    // that exemption still names every device it has not brought up.
+                    const needsMemory = !isPhysical && (selectedSession?.admission.memoryRefuses.includes(d.id) ?? false)
+                    // A Mac over its load opens for its phones (see the Mac card); everything else on it is refused.
+                    const macOverloaded = !isPhysical && (selectedSession?.admission.overloaded ?? false)
                     // A phone on the desk is connected rather than booted: nothing starts it, and it stays on when the session ends.
                     const statusLabel = isBusy
                       ? (d.holder ? `${holderKindLabel(d.holder.kind)} is driving it` : 'In use')
-                      : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
+                      : macOverloaded ? 'This Mac is overloaded' : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
                     const statusDot = isBusy
                       ? 'bg-amber-400'
                       : isBooted
@@ -296,7 +304,7 @@ export function QASession() {
                     return (
                       <button
                         key={d.id}
-                        disabled={isBusy || needsMemory || booting || !connected}
+                        disabled={isBusy || needsMemory || macOverloaded || booting || !connected}
                         onClick={() => handleStartDevice(d)}
                         className={cn(
                           'flex flex-col gap-3 rounded-lg border p-3 text-left transition-colors min-h-[100px]',
@@ -349,7 +357,9 @@ export function QASession() {
                     // pauses its CPU check while a device is booting there — a threshold recomputed here would block a
                     // Mac the relay lets in.
                     const health = getResourceHealth(res, isStale)
-                    const isOverloaded = s.admission.overloaded
+                    // `overloaded` is about the Mac's simulators and emulators. Its USB phones are never held to the
+                    // Mac's load, so a Mac with one still opens, and the list greys out only what would be refused.
+                    const isOverloaded = s.admission.overloaded && usbCount === 0
                     return (
                       <TooltipProvider key={s.agentName}>
                         <Tooltip>

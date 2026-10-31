@@ -27,12 +27,16 @@ export function useDeviceSelector(
 
   /** Full reset is a one-shot intent — "erase the next device I pick" — not a setting that stays
    *  on. Leaving a session is a conditional re-render, not an unmount, so without this the toggle
-   *  survives back-to-the-list and silently erases the *next* device too (#439). */
-  const consumeResetMode = useCallback(() => {
+   *  survives back-to-the-list and silently erases the *next* device too (#439).
+   *
+   *  `erasable` is false for a phone on USB: the agent will not erase one, so it boots as `app-only`. The
+   *  toggle is disarmed all the same — left armed, it would erase the next simulator picked, long after
+   *  the click that armed it. */
+  const consumeResetMode = useCallback((erasable = true) => {
     // Applying a mode the agent does not honour would disarm the toggle having erased nothing,
     // which reads as "done"; the UI hides the switch for the same reason, and this keeps the two
     // from drifting apart.
-    setAppliedResetMode(fullResetSupported ? resetMode : 'app-only')
+    setAppliedResetMode(fullResetSupported && erasable ? resetMode : 'app-only')
     setResetMode('app-only')
   }, [resetMode, fullResetSupported])
 
