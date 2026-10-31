@@ -49,8 +49,8 @@ at desktop width, where the header is left-aligned and the corners are 8px.
 | Value | Width | Call sites | For |
 |-------|------:|-----------:|-----|
 | `sm` | 384px (`max-w-sm`) | 1 | A short form of one to three fields with no description: Add App |
-| `md` | 448px (`max-w-md`) | 5 | A form, a notice, or a result to copy: Invite member, Password reset link, Create token, Upload build, Streaming in Standard mode |
-| `lg` | 512px (`max-w-lg`) | 4 | The default. An edit form with a description or hints under its fields: Edit app, Split, Rename device, Edit build. AlertDialog is always this width |
+| `md` | 448px (`max-w-md`) | 5 | A new item's form, a notice, or a result to copy, with or without a description: Invite member, Password reset link, Create token, Upload build, Streaming in Standard mode |
+| `lg` | 512px (`max-w-lg`) | 4 | The default. A form that edits an existing item, with a description or hints under its fields: Edit app, Split, Rename device, Edit build. AlertDialog is always this width |
 
 Three sizes rather than a width per dialog (#1084 review). Pick by what the body holds, not by what looks right
 for one dialog: a new dialog takes the size of the row above whose "For" it matches, and a fourth size is a
@@ -122,4 +122,5 @@ They share the panel, overlay and motion, and AlertDialog has Dialog's `lg` widt
 ## Figma
 
 Component set **Dialog** (`85:454`) in the `Design System` page — `footer` × 2. As above, that axis does not
-match the four `actions` layouts in code; this is one of the items for the Figma sync.
+match the four `actions` layouts in code; this is one of the items for the Figma sync. It has no `size` axis
+either; adding sm / md / lg (384 / 448 / 512) is another.
