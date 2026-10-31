@@ -82,7 +82,7 @@ curl -X POST https://your-relay/api/v1/builds \
 `label`에는 브랜치명, 티켓 번호 등 맥락을 담을 수 있습니다.
 
 ::: warning iOS 빌드
-시뮬레이터 빌드는 `.app.zip` 또는 `.tar.gz`/`.tgz`를 올립니다. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드해 `.app` 폴더를 zip으로 압축하고, `.tar.gz`/`.tgz`는 클라우드 시뮬레이터 빌드가 만드는 아카이브입니다. 디바이스 빌드는 `.ipa`로 올리며(`iphoneos` arm64 슬라이스 필요), 에이전트 Mac에 USB로 연결된 iPhone에만 설치됩니다. App Center에는 "Device build"로 표시됩니다.
+시뮬레이터 빌드는 `.app.zip` 또는 `.tar.gz`/`.tgz`를 올립니다. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드해 `.app` 폴더를 zip으로 압축하고, `.tar.gz`/`.tgz`는 클라우드 시뮬레이터 빌드가 만드는 아카이브입니다. 기기 빌드는 `.ipa`로 올리며(`iphoneos` arm64 슬라이스 필요), 에이전트 Mac에 USB로 연결된 iPhone에만 설치됩니다. App Center에는 "Device build"로 표시됩니다.
 :::
 
 ## 3. 빌드 메타데이터 첨부 (선택)
