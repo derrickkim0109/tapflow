@@ -52,8 +52,8 @@ export interface DeviceReport {
    *  does not know rather than refusing the register, so a newer agent's new form factor reaches an
    *  older viewer as absent — which every consumer reads as "draw it as a phone". */
   formFactor?: FormFactor
-  /** Absent from an agent that predates it, which only ever offered simulators and emulators — so a viewer reads
-   *  absent as "not physical". A relay drops a kind it does not know, as it does a form factor. */
+  /** Absent from an agent that predates it, which only ever offered simulators and emulators — so absent is meant
+   *  to read as "not physical". A relay drops a kind it does not know, as it does a form factor. */
   kind?: DeviceKind
   /** The service tier the device boots with now — what its agent last wrote for it. `'unsupported'` for a
    *  device whose runtime cannot take one (iOS before 18.5, every Android device). Absent from an agent that

@@ -238,10 +238,13 @@ describe('SessionManager.refreshDevice', () => {
   // `deviceFields` is what a register writes; `refreshDevice` writes a chosen part of it. A field added to the first
   // must be a decision for the second, not something it misses in silence.
   it('writes exactly the fields it declares', () => {
-    const before = SessionManager.deviceFields({ id: 'd', name: 'a', platform: 'ios', status: 'booted', osVersion: '1', formFactor: 'phone', serviceTier: { name: 'lean', keep: [] } })
-    const report: DeviceReport = { id: 'd', name: 'b', platform: 'android', status: 'shutdown', osVersion: '2', formFactor: 'tablet', serviceTier: 'unsupported' }
+    // Every field differs between the two reports, or a field the refresh wrote would go unseen — `kind` did, the
+    // first time a field was added after this guard.
+    const first: DeviceReport = { id: 'd', name: 'a', platform: 'ios', status: 'booted', osVersion: '1', formFactor: 'phone', kind: 'simulator', serviceTier: { name: 'lean', keep: [] } }
+    const before = SessionManager.deviceFields(first)
+    const report: DeviceReport = { id: 'd', name: 'b', platform: 'android', status: 'shutdown', osVersion: '2', formFactor: 'tablet', kind: 'physical', serviceTier: 'unsupported' }
     const manager = new SessionManager()
-    const [id] = manager.create({ readyState: 1 } as unknown as WebSocket, [{ id: 'd', name: 'a', platform: 'ios', status: 'booted', osVersion: '1', formFactor: 'phone', serviceTier: { name: 'lean', keep: [] } }])
+    const [id] = manager.create({ readyState: 1 } as unknown as WebSocket, [first])
     manager.refreshDevice(id!, report)
     const after = manager.get(id!)!
     const changed = (Object.keys(before) as Array<keyof typeof before>).filter((k) => JSON.stringify(after[k]) !== JSON.stringify(before[k]))

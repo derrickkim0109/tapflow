@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A device says whether it is a simulator, an emulator or a physical device.** Agents may report an optional `kind` on each device, and the relay passes it on to the dashboard and clients. Nothing reports a physical device yet; this is groundwork for USB-connected phones (#152).
+- **Agents can say whether a device is a simulator, an emulator or a physical device.** A device may carry an optional `kind`, which the relay passes on to the dashboard and to clients such as `list_devices`. The bundled agents do not report it yet; this is groundwork for USB-connected phones (#152).
 
 ### Changed
 

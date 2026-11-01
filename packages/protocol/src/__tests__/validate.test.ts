@@ -137,8 +137,8 @@ describe('an agent older than a field still registers', () => {
     expect(fail(raw).reason).toBe('bad-shape')
   })
 
-  // `kind` tells a simulator or emulator from a USB-connected device (#152): the viewer offers different
-  // controls for each. Same rule as `formFactor` below — a kind this relay does not know costs the field,
+  // `kind` tells a simulator or emulator from a USB-connected device (#152), so that a viewer can offer
+  // different controls for each. Same rule as `formFactor` below — a kind this relay does not know costs the field,
   // not the registration.
   describe('a device kind', () => {
     const register = (kind: unknown) =>
@@ -164,8 +164,9 @@ describe('an agent older than a field still registers', () => {
       expect(fail(register(1)).reason).toBe('bad-shape')
     })
 
-    // Mutation: `kind` on the register's device object only. A refresh would then drop it, and a phone
-    // listed at registration would read as a simulator after the first `agent:devices`.
+    // A device the relay first hears of in an `agent:devices` — a phone plugged in after the agent
+    // registered — gets its session from this list, so the list must keep `kind` or the phone reads as a
+    // simulator. Mutation: drop `kind` from the shared device schema.
     it('keeps it on a device list refresh too', () => {
       const r = ok({ type: 'agent:devices', devices: [{ id: 'd', name: 'iPhone', platform: 'ios', status: 'booted', kind: 'physical' }] })
       expect(device(r).kind).toBe('physical')

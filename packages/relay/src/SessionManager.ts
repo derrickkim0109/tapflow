@@ -63,7 +63,8 @@ export interface Session {
   deviceOsVersion?: string
   /** From the agent's register, like `deviceOsVersion`; the viewer reads it off `agents:listed`. */
   deviceFormFactor?: FormFactor
-  /** From the agent's register, like `deviceFormFactor`. */
+  /** From the report that created the session or rebound it. Unlike `deviceFormFactor`, a later list does not
+   *  change it: a device id is a simulator UDID, an AVD name or a hardware serial, so its kind is fixed. */
   deviceKind?: DeviceKind
   chromeData?: ChromePayload
   /** Cached like `chromeData`, and replayed to a re-joining viewer for the same reason. */
@@ -245,7 +246,8 @@ export class SessionManager {
    * What a later list (`agent:devices`) may change about a device the relay already has a session for. Narrower than
    * a register on purpose: `deviceStatus` and `deviceServiceTier` are tracked from `device:ready` and shutdowns and
    * read by the lease, so a list read in between must not overwrite them. A version the list no longer carries is
-   * kept — an Android emulator that was shut down outside tapflow reports none, and it has not changed.
+   * kept — an Android emulator that was shut down outside tapflow reports none, and it has not changed. `deviceKind`
+   * is left alone too: it is fixed for a device id, so a list that disagreed would be the one that is wrong.
    */
   refreshDevice(sessionId: string, device: DeviceReport): void {
     const session = this.sessions.get(sessionId)

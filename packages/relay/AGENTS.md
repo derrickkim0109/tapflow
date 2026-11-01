@@ -232,7 +232,8 @@ announced `'device-updates'` on `agent:registered`. `handleAgentDevices` diffs i
   otherwise come out with no agent name, no capabilities, and no way for the next restart to rebind it.
 - **A listed device is refreshed by `refreshDevice`, not `agentFields`.** Name, form factor, and a version the list
   still carries. `deviceStatus` and `deviceServiceTier` come from `device:ready` and shutdowns and the lease reads
-  them, so a list read in between must not move them. `REFRESHED_FIELDS` is held against `deviceFields` by a test.
+  them, so a list read in between must not move them. `deviceKind` is fixed for a device id and taken only when the
+  session is created or rebound. `REFRESHED_FIELDS` is held against `deviceFields` by a test.
 - **A device that left is removed only if nobody holds it.** One in use is marked `deviceGone`, left out of the
   listing and the lease, and removed by the heartbeat (`sweepGoneDevices`) once `goneAndVacant`: an idle shutdown
   sends `device:shutdown` and keeps the session, so no single place sees a session stop being held. Removal goes

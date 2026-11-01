@@ -507,8 +507,8 @@ describe('SessionManager', () => {
       expect(sm.list('asker', () => true, IDLE_MAC).flatMap((g) => g.devices)[0].formFactor).toBe('phone')
     })
 
-    // `kind` takes the same road as `formFactor`. Mutations: leave it out of `agentFields` (both
-    // assertions fail), or out of `list()` (the list assertions fail).
+    // `kind` takes the same road as `formFactor` on a create and a rebind. Mutations: leave it out of
+    // `deviceFields` (all three assertions fail), or out of `list()` (the two list assertions fail).
     it('carries a device\'s kind to the list, and takes the new one on rebind', () => {
       const sm = new SessionManager()
       const [id] = sm.create(mockSocket(), [{ ...DEV, kind: 'physical' }])
@@ -526,6 +526,14 @@ describe('SessionManager', () => {
       const [id] = sm.create(mockSocket(), [{ ...DEV, formFactor: 'tablet' }])
       sm.rebind(id!, mockSocket(), DEV, AGENT)
       expect(sm.get(id!)?.deviceFormFactor).toBeUndefined()
+    })
+
+    // Same rule for `kind`: an older agent re-registering a device must not leave a stale `physical` on it.
+    it('clears the kind when a rebind reports none', () => {
+      const sm = new SessionManager()
+      const [id] = sm.create(mockSocket(), [{ ...DEV, kind: 'physical' }])
+      sm.rebind(id!, mockSocket(), DEV, AGENT)
+      expect(sm.get(id!)?.deviceKind).toBeUndefined()
     })
 
     it('moves the session off the old socket entirely', () => {
