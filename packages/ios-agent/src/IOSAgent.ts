@@ -126,7 +126,7 @@ import {
 import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer.js'
 import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
 import { DevicectlWrapper, AppIdentityMismatchError } from './DevicectlWrapper.js'
-import { DeviceCaptureStreamer, CameraAccessDeniedError } from './DeviceCaptureStreamer.js'
+import { DeviceCaptureStreamer, PermanentCaptureError } from './DeviceCaptureStreamer.js'
 import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
 import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio/audiotap-helper'
@@ -316,6 +316,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   /** Re-reads in a row whose devicectl failed. After `REREAD_FAILURES_BEFORE_EMPTY` of them the phones are no longer
    *  offered: a phone unplugged while CoreDevice keeps failing must not stay listed forever. */
   private rereadFailures = 0
+  /** How many USB-connected devices the last list returned. With one, the capture helper may take the only phone it
+   *  sees even when its name reads differently there; with two, that phone could be the other one. */
+  private physicalListed = 0
   private readonly network: SimulatorNetwork
   private readonly fps: number
   private readonly intervalMs: number | undefined
@@ -458,7 +461,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.devicectl = options.devicectl ?? new DevicectlWrapper(process.env.VITEST ? () => Promise.resolve('{}') : undefined)
     this.physicalCaptureFactory = options.physicalCaptureFactory ?? (process.env.VITEST
       ? physicalCaptureUnavailable
-      : (udid, fps, codec, maxSize) => new DeviceCaptureStreamer(udid, fps, codec, maxSize, this.physicalNames.get(udid) ?? null))
+      : (udid, fps, codec, maxSize) => new DeviceCaptureStreamer(udid, fps, codec, maxSize, this.physicalNames.get(udid) ?? null, undefined, this.physicalListed === 1))
     // **Never the real filter under vitest.** Layer 1 is a system extension installed on the
     // developer's Mac, and `arm()` runs on every boot — so a suite that booted a mock device was
     // launching the notarized container app and rewriting the host's live filter configuration, once
@@ -553,6 +556,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const physical = listed ?? (this.rereadFailures >= REREAD_FAILURES_BEFORE_EMPTY ? [] : this.reportedPhones)
     if (use !== 'lookup') this.reportedPhones = physical
     for (const d of physical) { this.physicalDevices.add(d.id); this.physicalNames.set(d.id, d.name) }
+    this.physicalListed = physical.length
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
   }
 
@@ -1068,6 +1072,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const pump = async () => {
       let delivered = false
       let permanent = false
+      let failure: string | null = null
       try {
         while (true) {
           const { value, done } = await reader.read()
@@ -1085,13 +1090,27 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         }
       } catch (e) {
         // A cancelled reader ends with `done`, so what lands here is the capture failing: camera denied, no device,
-        // a helper that never reported its status.
-        logger.warn(`screen stream for ${state.deviceId} failed: ${e instanceof Error ? e.message : String(e)}`)
-        permanent = e instanceof CameraAccessDeniedError
+        // two phones with one name, a helper that never reported its status.
+        failure = e instanceof Error ? e.message : String(e)
+        logger.warn(`screen stream for ${state.deviceId} failed: ${failure}`)
+        permanent = e instanceof PermanentCaptureError
       }
       if (metricsTimer) clearInterval(metricsTimer)
-      if (!permanent && state.streamReader === reader && streamWs.readyState === WebSocket.OPEN) {
+      const current = state.streamReader === reader && streamWs.readyState === WebSocket.OPEN
+      // **A phone's capture failure is told to the session**, not only logged: the helper runs on the agent's Mac, so
+      // the reason (Camera denied, the phone locked or unplugged) is otherwise somewhere the tester is not, and all
+      // they see is a screen that never comes. Through `device:boot-error` without a correlator — Android's report of
+      // a dead stream, and the field the dashboard shows. Once per run of failures: when it will not be retried, or
+      // on the second failure in a row without a frame (the first is retried at once and usually recovers).
+      const report = (frameless: number): void => {
+        if (!physical || !current || !failure || this._stopping) return
+        if (!permanent && frameless !== 2) return
+        this.sendMsg({ type: 'device:boot-error', sessionId: state.sessionId, message: physicalCaptureFailure(failure) })
+      }
+      if (permanent) report(0)
+      if (!permanent && current) {
         const next = streamRestartPlan(failures, delivered)
+        report(next.failures)
         if (next.failures === 2) {
           logger.warn(`screen stream for ${state.deviceId} keeps ending before its first frame — backing off restarts`)
         }
@@ -3409,6 +3428,11 @@ function runExtractor(cmd: string, args: string[]): Promise<{ error?: Error; sta
     child.once('error', (error) => resolve({ error, status: null, stderr }))
     child.once('close', (status) => resolve({ status, stderr }))
   })
+}
+
+/** A phone's capture failure as the dashboard shows it: the cause first (it shows the start of it), without the log's prefix. */
+export function physicalCaptureFailure(message: string): string {
+  return `Screen capture: ${message.replace(/^\[DeviceCaptureStreamer\]\s*(?:[^\s:]+:\s*)?/, '')}`
 }
 
 /**
