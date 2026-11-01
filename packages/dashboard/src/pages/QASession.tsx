@@ -585,8 +585,9 @@ function QASessionPage() {
                     const health = getResourceHealth(res, isStale)
                     // `overloaded` is about the Mac's simulators and emulators. Its USB phones are never held to the
                     // Mac's load, so a Mac with one still opens, and the list greys out only what would be refused —
-                    // but only for a phone someone could pick: a hidden or busy one would open a card with nothing in it.
-                    const pickablePhones = s.devices.filter((d) => d.platform === os && d.kind === 'physical' && !d.hidden && !d.busy).length
+                    // but only for a phone someone could pick: a busy one, or a hidden one an Admin is not showing, would
+                    // open a card with nothing in it.
+                    const pickablePhones = s.devices.filter((d) => d.platform === os && d.kind === 'physical' && (!d.hidden || showHidden) && !d.busy).length
                     const isOverloaded = s.admission.overloaded && pickablePhones === 0
                     return (
                       <TooltipProvider key={s.agentName}>

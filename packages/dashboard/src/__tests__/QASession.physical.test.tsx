@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { render, screen, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import { BreadcrumbProvider } from '@/hooks/useBreadcrumb'
+import { BreadcrumbProvider, useBreadcrumb } from '@/hooks/useBreadcrumb'
 import type { BrowserInbound, SessionInfo } from '@/lib/types'
 import { withQuery } from './withQuery'
 
@@ -26,6 +26,11 @@ vi.mock('@/components/DeviceViewer', () => ({
   DeviceViewer: (props: { kind?: string; resetMode?: string }) => { viewerProps.push({ kind: props.kind, resetMode: props.resetMode }); return <div /> },
 }))
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
+// Signed out unless a test signs an Admin in: only an Admin is offered hidden devices.
+const { auth } = vi.hoisted(() => ({ auth: { role: undefined as string | undefined } }))
+vi.mock('@/hooks/useAuth', () => ({ useAuth: () => ({ user: auth.role ? { role: auth.role } : null, loading: false }) }))
+/** The page's breadcrumb, which the layout renders in the app: its build entry is the way back to the Macs. */
+function Crumbs() { return <>{useBreadcrumb().node}</> }
 
 const { QASession } = await import('../pages/QASession')
 
@@ -39,12 +44,12 @@ const AGENTS: SessionInfo[] = [{
   ],
 }]
 
-async function openDeviceList(agents: SessionInfo[] = AGENTS) {
+async function openDeviceList(agents: SessionInfo[] = AGENTS, { crumbs = false } = {}) {
   viewerProps.length = 0
   const user = userEvent.setup()
   render(withQuery(
     <MemoryRouter initialEntries={['/qa?id=7']}>
-      <BreadcrumbProvider><QASession /></BreadcrumbProvider>
+      <BreadcrumbProvider>{crumbs && <Crumbs />}<QASession /></BreadcrumbProvider>
     </MemoryRouter>,
   ))
   await vi.waitFor(() => expect(deliver).not.toBeNull())
@@ -121,6 +126,26 @@ describe('QASession — a USB-connected device (#152)', () => {
     const devices = AGENTS[0]!.devices.map((d) => d.kind === 'physical' ? { ...d, ...patch } : d)
     await openDeviceList(mac({ admission: { booting: false, overloaded: true, memoryRefuses: [] }, devices }))
     expect(await screen.findByRole('button', { name: /studio-mac/ })).toBeDisabled()
+  })
+  // An Admin showing hidden devices sees the hidden phone in the list, so the card opens for it. Mutation: count a
+  // hidden phone as unpickable whatever the switch says — the Admin cannot reach a phone the list would show them.
+  it('opens an overloaded Mac for its hidden plugged-in device while an Admin shows hidden devices', async () => {
+    auth.role = 'Admin'
+    try {
+      const devices = AGENTS[0]!.devices.map((d) => d.kind === 'physical' ? { ...d, hidden: true as const } : d)
+      const other: SessionInfo = {
+        ...AGENTS[0]!, agentName: 'build-mac',
+        devices: [{ id: 'sim-h', name: 'iPhone 16', platform: 'ios', status: 'shutdown', osVersion: 'iOS 26.3', kind: 'simulator', sessionId: 'sess-h', busy: false, hidden: true }],
+      }
+      const user = await openDeviceList([{ ...AGENTS[0]!, admission: { booting: false, overloaded: true, memoryRefuses: [] }, devices }, other], { crumbs: true })
+      expect(await screen.findByRole('button', { name: /studio-mac/ })).toBeDisabled()
+      await user.click(screen.getByRole('button', { name: /build-mac/ }))
+      await user.click(await screen.findByRole('switch'))
+      await user.click(screen.getByRole('button', { name: '1.0 · build 1' }))
+      expect(await screen.findByRole('button', { name: /studio-mac/ })).toBeEnabled()
+    } finally {
+      auth.role = undefined
+    }
   })
   it('keeps an overloaded Mac with no plugged-in device closed', async () => {
     await openDeviceList(mac({ admission: { booting: false, overloaded: true, memoryRefuses: [] }, devices: AGENTS[0]!.devices.filter((d) => d.kind !== 'physical') }))
