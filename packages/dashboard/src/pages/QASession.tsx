@@ -112,7 +112,7 @@ function QASessionPage() {
 
   const os = build?.platform ?? 'ios';
   const {
-    sessions, activeFormFactor, selectedAgent, setSelectedAgent,
+    sessions, activeFormFactor, activeKind, selectedAgent, setSelectedAgent,
     activeSessionId, deviceId, booting, status,
     connected, agentGroups,
     startDevice, resetDevice, handleBack, handleBackToMacs, handleSessionEnded,
@@ -122,7 +122,7 @@ function QASessionPage() {
   const selectedSession = agentGroups.find((s) => s.agentName === selectedAgent);
   const isAdmin = useAuth().user?.role === 'Admin';
   const {
-    osVersions, osVersion, setOsVersion,
+    filteredDevices, osVersions, osVersion, setOsVersion,
     deviceSearch, setDeviceSearch, versionedDevices, deviceGroups, hiddenCount, showHidden, setShowHidden,
     resetMode, setResetMode, appliedResetMode, consumeResetMode, fullResetSupported,
   } = useDeviceSelector(selectedSession, os, isAdmin);
@@ -157,7 +157,7 @@ function QASessionPage() {
   // `replace`, so Back in the browser leaves the page rather than stepping through the devices tried.
   const beginDevice = useCallback((d: DeviceSummary, resume: boolean) => {
     // A reset is for a fresh start. A resume keeps what is there — that is what the tester came back for.
-    if (!resume) consumeResetMode();
+    if (!resume) consumeResetMode(d.kind !== 'physical');
     startDevice(d, { resume });
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
@@ -355,6 +355,7 @@ function QASessionPage() {
                 deviceId={deviceId}
                 formFactor={selectedDevice?.formFactor ?? activeFormFactor}
                 platform={os}
+                kind={activeKind}
                 buildId={build?.id}
                 resume={resumed}
                 resetMode={resumed ? 'app-only' : appliedResetMode}
@@ -408,7 +409,10 @@ function QASessionPage() {
                     owes the user a reason, and the only channel here is the tooltip — which does
                     not reach touch at all. Showing nothing beats showing a switch that erases
                     nothing and cannot say why. */}
-                {fullResetSupported && (
+                {/* A phone on USB is never erased, so a Mac offering only phones has nothing for this to act on.
+                    Read from every device of this platform rather than the filtered list, so a search does not make
+                    an armed switch vanish. */}
+                {fullResetSupported && filteredDevices.some((d) => d.kind !== 'physical') && (
                   <TooltipProvider>
                     <Tooltip>
                       {/* The whole control is the trigger, not the label alone: a label cannot take
@@ -461,10 +465,6 @@ function QASessionPage() {
                     ...group.devices.map((d: DeviceSummary) => {
                     const isBooted = d.status === 'booted'
                     const isBusy = d.busy
-                    // On a Mac short of memory the relay lets a person rejoin only a device it brought up itself; the
-                    // listing names the rest. Not `!isBooted`: a simulator running before its agent registered reads
-                    // booted and is still refused.
-                    const needsMemory = selectedSession?.admission.memoryRefuses.includes(d.id) ?? false
                     // **Says who is driving an AI-held device, and offers no way in.** Watching an AI session
                     // is for the person who started it, through the link their coding agent hands them; the
                     // device list only explains why the device is taken.
@@ -472,18 +472,26 @@ function QASessionPage() {
                     const yours = d.waiting?.yours === true
                     const othersWait = d.waiting && !yours ? d.waiting : null
                     const isPhysical = d.kind === 'physical'
+                    // On a Mac short of memory the relay lets a person rejoin only a device it brought up itself; the
+                    // listing names the rest. Not `!isBooted`: a simulator running before its agent registered reads
+                    // booted and is still refused.
+                    // Never a phone, whatever the relay lists: it boots nothing on the Mac, and a relay from before
+                    // that exemption still names every device it has not brought up.
+                    const needsMemory = !isPhysical && (selectedSession?.admission.memoryRefuses.includes(d.id) ?? false)
+                    // A Mac over its load opens for its phones (see the Mac card); everything else on it is refused.
+                    const macOverloaded = !isPhysical && (selectedSession?.admission.overloaded ?? false)
                     // A phone on the desk is connected rather than booted: nothing starts it, and it stays on when the session ends.
                     const statusLabel = isBusy
                       ? (d.holder ? `${holderKindLabel(d.holder.kind)} is driving it` : 'In use')
                       : yours ? 'Your session is waiting for you'
                       : othersWait ? `Waiting for ${othersWait.name} to return${othersWait.remainingMs !== undefined ? ` · about ${minutesLeft(othersWait.remainingMs)} min` : ''}`
-                      : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
+                      : macOverloaded ? 'This Mac is overloaded' : needsMemory ? 'Not enough memory to start' : isPhysical ? 'Connected' : isBooted ? 'Booted' : 'Available'
                     const statusDot = isBusy || d.waiting
                       ? 'bg-amber-400'
                       : isBooted
                         ? 'bg-emerald-400'
                         : 'bg-muted-foreground/40'
-                    const cardDisabled = isBusy || needsMemory || booting || !connected
+                    const cardDisabled = isBusy || needsMemory || macOverloaded || booting || !connected
                     const card = (
                       <button
                         disabled={cardDisabled}
@@ -575,7 +583,9 @@ function QASessionPage() {
                     // pauses its CPU check while a device is booting there — a threshold recomputed here would block a
                     // Mac the relay lets in.
                     const health = getResourceHealth(res, isStale)
-                    const isOverloaded = s.admission.overloaded
+                    // `overloaded` is about the Mac's simulators and emulators. Its USB phones are never held to the
+                    // Mac's load, so a Mac with one still opens, and the list greys out only what would be refused.
+                    const isOverloaded = s.admission.overloaded && usbCount === 0
                     return (
                       <TooltipProvider key={s.agentName}>
                         <Tooltip>

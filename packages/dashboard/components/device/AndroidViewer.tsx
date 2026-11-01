@@ -55,6 +55,9 @@ interface AndroidViewerProps {
   clipboardSupported: boolean;
   networkHandlerRef: MutableRefObject<NetworkMessageHandler | undefined>;
   networkSupported: boolean;
+  /** A phone on USB rather than a simulator or emulator. The controls only those can serve — rotate, deeplink,
+   *  posture — are left out, and so are their shortcuts. */
+  physical?: boolean;
   onRecordingUploaded?: () => void;
   /** Restart control (#628). Owned by `DeviceViewer`, which sequences the shutdown and the boot. */
   rebootPending: boolean;
@@ -81,7 +84,7 @@ export function AndroidViewer({
   sessionId, buildId, send, openUrl, launchApp, connected, joined,
   deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
   launching, androidButtons,
-  binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, onRecordingUploaded,
+  binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, physical = false, onRecordingUploaded,
   rebootPending, onReboot, restartButtonRef,
   screenWidth, screenHeight, cornerRadius, postures, streamRotation = 0, bodyRotation,
   perfHookRef,
@@ -351,11 +354,11 @@ export function AndroidViewer({
       if (e.metaKey) {
         const el = document.activeElement
         if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) {
-          if (!e.shiftKey && e.code === 'KeyK') { e.preventDefault(); setDeepLinkOpen(true); return }
+          if (!physical && !e.shiftKey && e.code === 'KeyK') { e.preventDefault(); setDeepLinkOpen(true); return }
           if (!e.shiftKey && e.code === 'KeyS') { e.preventDefault(); handleScreenshot(); return }
           if (e.shiftKey && e.code === 'KeyY') { e.preventDefault(); handleRecordToggle(); return }
           // A held chord repeats, and each repeat would be another turn.
-          if (e.shiftKey && e.code === 'KeyO') { e.preventDefault(); if (!e.repeat) handleRotate(); return }
+          if (!physical && e.shiftKey && e.code === 'KeyO') { e.preventDefault(); if (!e.repeat) handleRotate(); return }
         }
       }
       if (!keyboardActive) return
@@ -384,7 +387,7 @@ export function AndroidViewer({
       window.removeEventListener('keyup', onKeyUp)
       window.removeEventListener('blur', onBlur)
     }
-  }, [keyboardActive, clipboardSupported, send, sessionId, handleScreenshot, handleRecordToggle, handleRotate])
+  }, [keyboardActive, clipboardSupported, physical, send, sessionId, handleScreenshot, handleRecordToggle, handleRotate])
 
   useEffect(() => {
     if (!keyboardActive) return
@@ -629,12 +632,12 @@ export function AndroidViewer({
 
       <SimulatorToolbar
         joined={joined}
-        onDeepLink={() => setDeepLinkOpen(true)}
+        onDeepLink={physical ? undefined : () => setDeepLinkOpen(true)}
         onScreenshot={handleScreenshot}
         onRecordToggle={handleRecordToggle}
         recordState={recordState}
-        onRotate={handleRotate}
-        posture={postures && postures.postures.length > 1 ? { postures: postures.postures, currentId: postures.currentId, pending: posturePending, onSelect: handlePosture } : undefined}
+        onRotate={physical ? undefined : handleRotate}
+        posture={!physical && postures && postures.postures.length > 1 ? { postures: postures.postures, currentId: postures.currentId, pending: posturePending, onSelect: handlePosture } : undefined}
         navigationSlot={navigationSlot}
         deviceSlot={deviceSlot}
         launchSlot={launchSlot}

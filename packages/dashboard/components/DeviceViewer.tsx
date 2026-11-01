@@ -3,7 +3,7 @@
 import { skeletonSize } from '@/lib/deviceSkeleton';
 import { framelessChrome } from '@/lib/framelessChrome';
 
-import type { BootRefusalReason, BrowserToRelay, FormFactor, SessionTerminatedReason } from '@tapflowio/protocol'
+import type { BootRefusalReason, BrowserToRelay, DeviceKind, FormFactor, SessionTerminatedReason } from '@tapflowio/protocol'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useRelay } from '@/hooks/useRelay';
 import { usePerfMode } from '@/hooks/usePerfMode';
@@ -32,6 +32,9 @@ interface Props {
   formFactor?: FormFactor;
   /** The platform being tested, known before the chrome is — the skeleton turns a tablet by it. */
   platform?: string;
+  /** From the device list. A `physical` device (a phone on USB, iOS or Android) gets no control only a
+   *  simulator or emulator can serve: the agent refuses those on a phone, so offering them is a button that fails. */
+  kind?: DeviceKind;
   buildId?: number;
   resetMode?: 'app-only' | 'full-erase';
   /** This mount is the tester coming back to their own session (#1087): keep the installed app from the first install
@@ -47,7 +50,7 @@ interface Props {
   onSessionEnded?: (reason: SessionTerminatedReason | 'busy-elsewhere' | 'mac-overloaded') => void;
 }
 
-export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios', buildId, resetMode, resume = false, onRecordingUploaded, onSessionEnded }: Props) {
+export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios', kind, buildId, resetMode, resume = false, onRecordingUploaded, onSessionEnded }: Props) {
   const sendRef = useRef<(msg: BrowserToRelay) => void>(() => {});
   // One reset per mount; see the boot handler below.
   const resetSentRef = useRef(false);
@@ -485,6 +488,8 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       if (msg.type === 'app:install-done') {
         setInstalled(true);
         keepInstalledRef.current = true;
+        // Still done — an app is there to launch — but not the build that was picked, and nothing else on screen says so.
+        if (msg.warning) toast.warning('A different build is on this device', { description: msg.warning });
       } else setInstallError(msg.message);
     }
     if (msg.type === 'app:launch-done' || msg.type === 'app:launch-error') {
@@ -724,15 +729,18 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
   }, [bootError, agentAway]);
 
 
+  const physical = kind === 'physical';
   const commonProps = {
     sessionId, buildId, send, openUrl, launchApp, connected, joined,
     deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
     launching,
     binaryFrameHandlerRef,
     clipboardHandlerRef,
-    clipboardSupported: agentCapabilities.includes('clipboard'),
+    // The agent advertises its capabilities once for all its devices, and a phone has neither of these.
+    clipboardSupported: !physical && agentCapabilities.includes('clipboard'),
     networkHandlerRef,
-    networkSupported: agentCapabilities.includes('network-control'),
+    networkSupported: !physical && agentCapabilities.includes('network-control'),
+    physical,
     onRecordingUploaded,
     swKeyboardVisible, swKeyboardPending, onKbdToggle,
     rebootPending, onReboot: reboot,

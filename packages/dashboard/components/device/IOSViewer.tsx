@@ -67,6 +67,9 @@ interface IOSViewerProps {
   clipboardSupported: boolean;
   networkHandlerRef: MutableRefObject<NetworkMessageHandler | undefined>;
   networkSupported: boolean;
+  /** A phone on USB rather than a simulator or emulator. The controls only those can serve — rotate, deeplink,
+   *  posture, the software keyboard — are left out, and so are their shortcuts. */
+  physical?: boolean;
   onRecordingUploaded?: () => void;
   swKeyboardVisible: boolean;
   swKeyboardPending: boolean;
@@ -88,7 +91,7 @@ export function IOSViewer({
   sessionId, buildId, send, openUrl, launchApp, connected, joined,
   deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
   launching, chrome, formFactor,
-  binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, onRecordingUploaded,
+  binaryFrameHandlerRef, clipboardHandlerRef, clipboardSupported, networkHandlerRef, networkSupported, physical = false, onRecordingUploaded,
   swKeyboardVisible, swKeyboardPending, onKbdToggle,
   rebootPending, onReboot, restartButtonRef,
   perfHookRef, onStreamSize, postures,
@@ -394,13 +397,13 @@ export function IOSViewer({
       if (e.metaKey) {
         const el = document.activeElement
         if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) {
-          if (!e.shiftKey && e.code === 'KeyK') { e.preventDefault(); setDeepLinkOpen(true); return }
+          if (!physical && !e.shiftKey && e.code === 'KeyK') { e.preventDefault(); setDeepLinkOpen(true); return }
           if (!e.shiftKey && e.code === 'KeyS') { e.preventDefault(); handleScreenshot(); return }
           if (e.shiftKey && e.code === 'KeyY') { e.preventDefault(); handleRecordToggle(); return }
           // A held chord repeats, and each repeat would be another turn.
-          if (e.shiftKey && e.code === 'KeyO') { e.preventDefault(); if (!e.repeat) handleRotate(); return }
+          if (!physical && e.shiftKey && e.code === 'KeyO') { e.preventDefault(); if (!e.repeat) handleRotate(); return }
           if (e.shiftKey && e.code === 'KeyU') { e.preventDefault(); send({ type: 'input:button', sessionId, requestId: newRequestId(), payload: { name: 'home' } }); return }
-          if (e.shiftKey && e.code === 'KeyK') { e.preventDefault(); if (!swKeyboardPending) onKbdToggle(); return }
+          if (!physical && e.shiftKey && e.code === 'KeyK') { e.preventDefault(); if (!swKeyboardPending) onKbdToggle(); return }
         }
       }
       if (!keyboardActive) return
@@ -421,7 +424,7 @@ export function IOSViewer({
     const onBlur = () => { if (isOptionHeld.current) endPinch() }
     window.addEventListener('keydown', onKeyDown); window.addEventListener('keyup', onKeyUp); window.addEventListener('blur', onBlur)
     return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp); window.removeEventListener('blur', onBlur) }
-  }, [keyboardActive, clipboardSupported, send, sessionId, handleScreenshot, handleRecordToggle, handleRotate, onKbdToggle, swKeyboardPending])
+  }, [keyboardActive, clipboardSupported, physical, send, sessionId, handleScreenshot, handleRecordToggle, handleRotate, onKbdToggle, swKeyboardPending])
 
   useEffect(() => {
     if (!keyboardActive) return
@@ -707,14 +710,14 @@ export function IOSViewer({
 
       <SimulatorToolbar
         joined={joined}
-        onDeepLink={() => setDeepLinkOpen(true)}
+        onDeepLink={physical ? undefined : () => setDeepLinkOpen(true)}
         onScreenshot={handleScreenshot}
         onRecordToggle={handleRecordToggle}
         recordState={recordState}
-        onRotate={handleRotate}
-        posture={postures && postures.postures.length > 1 ? { postures: postures.postures, currentId: postures.currentId, pending: posture.pending, onSelect: posture.select } : undefined}
+        onRotate={physical ? undefined : handleRotate}
+        posture={!physical && postures && postures.postures.length > 1 ? { postures: postures.postures, currentId: postures.currentId, pending: posture.pending, onSelect: posture.select } : undefined}
         navigationSlot={navigationSlot}
-        deviceSlot={deviceSlot}
+        deviceSlot={physical ? undefined : deviceSlot}
         launchSlot={launchSlot}
         network={networkSupported ? { position: network.position, steerable: network.steerable, reason: network.reason, pending: network.pending, onToggle: network.toggle } : undefined}
         reboot={{ pending: rebootPending, onReboot, buttonRef: restartButtonRef }}
