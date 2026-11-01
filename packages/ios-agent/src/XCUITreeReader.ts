@@ -263,8 +263,9 @@ export class XCUITreeReader {
   // Devices whose last runner start failed, with why — the reason a write is refused until a new start is tried.
   private readonly failed = new Map<string, string>()
   private stamp?: Promise<string>
-  // The last failed device build, for `DEVICE_REBUILD_BACKOFF_MS`: what it was for (phone, team, prefix), when, and why.
-  private deviceBuildFailure: { key: string; at: number; message: string } | null = null
+  // Failed device builds, for `DEVICE_REBUILD_BACKOFF_MS`: by what each was for (phone, team, prefix), when, and why.
+  // One per key, so a second phone's failure does not reopen the first one's backoff; a build that succeeds clears its.
+  private readonly deviceBuildFailures = new Map<string, { at: number; message: string }>()
   // A launch compares the generation it began with before it spawns, because `test-without-building` boots a
   // shut-down simulator and would power a device back up right after someone shut it down. A device's count is
   // never deleted: a count that restarted at 0 would match a launch that began before it was cleared. `epoch` is
@@ -309,8 +310,8 @@ export class XCUITreeReader {
     // another xcodebuild with -allowProvisioningUpdates. The same failure is answered until the backoff is over, or
     // until what the build is for (phone, team, prefix) changes.
     const failureKey = platform === 'physical' ? `${udid}|${team}|${this.bundlePrefix() ?? ''}` : ''
-    const recent = this.deviceBuildFailure
-    if (recent && recent.key === failureKey && Date.now() - recent.at < DEVICE_REBUILD_BACKOFF_MS) {
+    const recent = platform === 'physical' ? this.deviceBuildFailures.get(failureKey) : undefined
+    if (recent && Date.now() - recent.at < DEVICE_REBUILD_BACKOFF_MS) {
       throw new PlatformError(`${recent.message} (not built again for ${DEVICE_REBUILD_BACKOFF_MS / 1000} s after a failed build)`)
     }
     // Once per process: a stamp that changed while runners serve (a source edited under a running agent) must not
@@ -354,11 +355,13 @@ export class XCUITreeReader {
         ? `check that team ${team} can sign for the device and that it is unlocked and trusts this Mac`
         : 'ensure Xcode and an iOS simulator runtime are installed (xcode-select -p)'
       const message = `failed to build the UI-tree runner — ${hint}: ${(e as Error).message.slice(0, 300)}`
-      if (platform === 'physical') this.deviceBuildFailure = { key: failureKey, at: Date.now(), message }
+      // Only for a build this phone ran: one it joined was another phone's, and that phone's backoff holds it.
+      if (platform === 'physical' && !joined) this.deviceBuildFailures.set(failureKey, { at: Date.now(), message })
       throw new PlatformError(message)
     } finally {
       if (this.building.get(platform) === building) this.building.delete(platform)
     }
+    if (platform === 'physical') this.deviceBuildFailures.delete(failureKey)
     if (joined && platform === 'physical') await this.ensureBuilt(udid)
   }
 

@@ -75,7 +75,7 @@ const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
  *
  * On a phone, `channel-unavailable` means the runner's last start failed, for the reason the message gives — not that
  * the session's channel is gone: each input tries to start the runner again, so a retry helps once that cause is
- * fixed (the phone unlocked), and reconnecting does not. The reason is still `channel-unavailable` rather than
+ * fixed (the phone unlocked; a failed build is retried after 60 s), and reconnecting does not. The reason is still `channel-unavailable` rather than
  * `channel-starting` because the dashboard shows nothing for the latter, and the tester would never see why.
  */
 const PHYSICAL_REFUSALS = {
@@ -2253,7 +2253,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private physicalInputMessage(state: DeviceState): string {
     const failure = state.touchHelper instanceof XCUITestInput ? state.touchHelper.runnerFailure() : null
     return failure
-      ? `The UI-test runner on this USB-connected device did not start: ${failure}. Each input tries to start it again, so retry once that is fixed; reconnecting does not help`
+      ? `The UI-test runner on this USB-connected device did not start: ${failure}. Each input tries to start it again, so retry once that is fixed (a failed build is retried after 60 s); reconnecting does not help`
       : PHYSICAL_REFUSALS.input
   }
 

@@ -193,7 +193,7 @@ chmod 600 .tapflow/data/.env
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `TAPFLOW_IOS_TEAM_ID` | *(비어있음)* | tapflow가 아이폰에 설치하는 XCUITest 러너를 서명할 Apple 개발자 팀 ID. 아이폰에 입력을 보내려면 필요합니다. 없으면 화면은 미러링되지만 입력은 거절됩니다. |
+| `TAPFLOW_IOS_TEAM_ID` | *(비어있음)* | tapflow가 iPhone에 설치하는 XCUITest 러너를 서명할 Apple 개발자 팀 ID. iPhone에 입력을 보내려면 필요합니다. 없으면 화면은 미러링되지만 입력은 거절됩니다. |
 | `TAPFLOW_IOS_BUNDLE_PREFIX` | `dev.tapflow` | 러너 App ID의 번들 ID 접두사. `dev.tapflow.treerunner.*`를 등록할 수 없는 팀이 지정합니다. |
 
 ## Lean mode (에이전트)
