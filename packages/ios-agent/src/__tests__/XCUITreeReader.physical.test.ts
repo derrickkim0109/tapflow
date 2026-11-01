@@ -109,6 +109,10 @@ describe('XCUITreeReader on a physical device', () => {
     expect(s.native.spawn.mock.calls[0]).toHaveLength(2)
     expect(s.native.tunnelAddress).not.toHaveBeenCalled()
     expect(calls.every((c) => c.url.startsWith(`http://localhost:${PORT}/`))).toBe(true)
+    // The simulator runner answers /health and /tree only to the token too (any local process can reach its port).
+    // Mutation: drop the header from either request — that runner then answers 401 and nothing is read.
+    expect(calls.map((c) => c.url.split('?')[0]!.replace(/^http:\/\/localhost:\d+/, ''))).toEqual(expect.arrayContaining(['/health', '/tree']))
+    expect(calls.every((c) => headerOf(c) === s.tokens[0])).toBe(true)
     s.reader.stop()
     expect(s.native.terminateRunner).toHaveBeenCalledWith('udid-S')
   })
@@ -120,6 +124,38 @@ describe('XCUITreeReader on a physical device', () => {
     await expect(s.reader.read('udid-P', 'com.app')).rejects.toThrow(/TAPFLOW_IOS_TEAM_ID/)
     expect(s.native.build).not.toHaveBeenCalled()
     expect(s.native.spawn).not.toHaveBeenCalled()
+  })
+
+  // Mutations: drop the backoff (every write to a phone whose build failed runs xcodebuild again), or key it without the
+  // team (a corrected team would wait out a failure it did not cause).
+  it('does not build for a phone again right after its build failed, until the backoff is over or the team changes', async () => {
+    let now = 1_000_000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const s = setup({ team: 'TEAM123' })
+      tokens = s.tokens
+      s.native.build.mockRejectedValueOnce(new Error('xcodebuild: error: The device is locked.'))
+      await expect(s.reader.read('udid-P', 'com.app')).rejects.toThrow(/device is locked/)
+      now += 30_000
+      await expect(s.reader.read('udid-P', 'com.app')).rejects.toThrow(/not built again for 60 s/)
+      expect(s.native.build).toHaveBeenCalledTimes(1)
+      now += 30_000
+      await s.reader.read('udid-P', 'com.app')
+      expect(s.native.build).toHaveBeenCalledTimes(2)
+      s.reader.stop()
+
+      const opts = { team: 'TEAM123' }
+      const t = setup(opts)
+      tokens = t.tokens
+      t.native.build.mockRejectedValueOnce(new Error('signing failed'))
+      await expect(t.reader.read('udid-P', 'com.app')).rejects.toThrow(/signing failed/)
+      opts.team = 'TEAM456'
+      await t.reader.read('udid-P', 'com.app')
+      expect(t.native.build).toHaveBeenCalledTimes(2)
+      t.reader.stop()
+    } finally {
+      clock.mockRestore()
+    }
   })
 
   // Mutation: compare the built stamp against the bare source stamp. A build signed by another team would then be

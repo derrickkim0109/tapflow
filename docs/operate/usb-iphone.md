@@ -29,7 +29,7 @@ tapflow agent start
 
 | Variable | Description |
 |---|---|
-| `TAPFLOW_IOS_TEAM_ID` | The Apple developer team ID (10 characters) that signs the runner. Without it the screen still mirrors, but input is refused and the dashboard says to set this variable. The value in parentheses after a signing certificate in `security find-identity -v -p codesigning` is the team ID. |
+| `TAPFLOW_IOS_TEAM_ID` | The Apple developer team ID (10 characters) that signs the runner. Without it the screen still mirrors, but input is refused and the dashboard says to set this variable. To find it, open **Membership details** at developer.apple.com/account, or read the `OU=` value of your signing certificate: `security find-certificate -c "Apple Development" -p \| openssl x509 -noout -subject`. The value in parentheses after an Apple Development certificate in `security find-identity` is not the team ID. |
 | `TAPFLOW_IOS_BUNDLE_PREFIX` | Bundle ID prefix for the runner. Defaults to `dev.tapflow`. An App ID is unique across every Apple team, so if another team has registered `dev.tapflow.treerunner.*`, set a prefix your team uses, such as `com.example.tapflow`. |
 
 Xcode on the Mac must be signed in to an account in that team (**Xcode › Settings › Accounts**).

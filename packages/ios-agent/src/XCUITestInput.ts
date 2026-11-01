@@ -239,7 +239,8 @@ export class XCUITestInput implements InputChannel {
   // One at a time and in order: a tap that focuses a field must land before the text typed into it. `answered`: the
   // write's ack waits for the runner (`takeLastWrite`) — a key, text or button, which the runner can refuse. A tap or
   // drag is acked at once, as on a simulator: the runner plays it out before it answers, which can outlast a client's
-  // ack deadline, and it refuses nothing a retry would fix.
+  // ack deadline. The cost: a tap sent to a runner that has just died (ready a moment ago, its process gone) is acked
+  // as delivered though it never landed — the failure is only logged, and the next write restarts the runner.
   private send(path: string, body?: string, answered = false): void {
     // A write queued before stop() must not reach (or restart) the runner after it.
     const write = this.queue.then(() => (this.stopped ? undefined : this.deps.runner.request(path, body)))

@@ -27,11 +27,14 @@ const READY_DEADLINE_MS = 90_000
 const READY_LINE = /TAPFLOW_TREE_READY port=(\d+)/
 const TEAM_ENV = 'TAPFLOW_IOS_TEAM_ID'
 const BUNDLE_PREFIX_ENV = 'TAPFLOW_IOS_BUNDLE_PREFIX'
+// How long a failed device build is not tried again for the same phone, team and prefix. Every write to a phone whose
+// runner is down asks for a start, and a device build runs xcodebuild with -allowProvisioningUpdates for up to 300 s.
+export const DEVICE_REBUILD_BACKOFF_MS = 60_000
 
 /** Where a runner runs. A simulator shares the Mac's loopback; a physical device is reached over its CoreDevice tunnel. */
 export type RunnerPlatform = 'simulator' | 'physical'
 
-/** The header every request but a simulator's /health and /tree must carry (see TreeServer.swift). */
+/** The header every request to a runner carries, a simulator's /health and /tree included (see TreeServer.swift). */
 export const TOKEN_HEADER = 'X-Tapflow-Token'
 
 interface RunnerHandle {
@@ -260,6 +263,8 @@ export class XCUITreeReader {
   // Devices whose last runner start failed, with why — the reason a write is refused until a new start is tried.
   private readonly failed = new Map<string, string>()
   private stamp?: Promise<string>
+  // The last failed device build, for `DEVICE_REBUILD_BACKOFF_MS`: what it was for (phone, team, prefix), when, and why.
+  private deviceBuildFailure: { key: string; at: number; message: string } | null = null
   // A launch compares the generation it began with before it spawns, because `test-without-building` boots a
   // shut-down simulator and would power a device back up right after someone shut it down. A device's count is
   // never deleted: a count that restarted at 0 would match a launch that began before it was cleared. `epoch` is
@@ -297,8 +302,16 @@ export class XCUITreeReader {
     const team = platform === 'physical' ? this.team() : undefined
     if (platform === 'physical' && !team) {
       throw new PlatformError(
-        `a physical iPhone needs the UI-test runner signed by your Apple development team — set ${TEAM_ENV} to its team ID (security find-identity -v -p codesigning lists the identities you have)`,
+        `a physical iPhone needs the UI-test runner signed by your Apple development team — set ${TEAM_ENV} to its team ID (Membership details at developer.apple.com/account, or the OU= of \`security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject\`)`,
       )
+    }
+    // A device build that just failed is not run again for every write that finds the runner down: each would be
+    // another xcodebuild with -allowProvisioningUpdates. The same failure is answered until the backoff is over, or
+    // until what the build is for (phone, team, prefix) changes.
+    const failureKey = platform === 'physical' ? `${udid}|${team}|${this.bundlePrefix() ?? ''}` : ''
+    const recent = this.deviceBuildFailure
+    if (recent && recent.key === failureKey && Date.now() - recent.at < DEVICE_REBUILD_BACKOFF_MS) {
+      throw new PlatformError(`${recent.message} (not built again for ${DEVICE_REBUILD_BACKOFF_MS / 1000} s after a failed build)`)
     }
     // Once per process: a stamp that changed while runners serve (a source edited under a running agent) must not
     // rebuild the products they are executing.
@@ -340,7 +353,9 @@ export class XCUITreeReader {
       const hint = platform === 'physical'
         ? `check that team ${team} can sign for the device and that it is unlocked and trusts this Mac`
         : 'ensure Xcode and an iOS simulator runtime are installed (xcode-select -p)'
-      throw new PlatformError(`failed to build the UI-tree runner — ${hint}: ${(e as Error).message.slice(0, 300)}`)
+      const message = `failed to build the UI-tree runner — ${hint}: ${(e as Error).message.slice(0, 300)}`
+      if (platform === 'physical') this.deviceBuildFailure = { key: failureKey, at: Date.now(), message }
+      throw new PlatformError(message)
     } finally {
       if (this.building.get(platform) === building) this.building.delete(platform)
     }
