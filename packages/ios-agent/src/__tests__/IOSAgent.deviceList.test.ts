@@ -10,6 +10,7 @@ import { waitForOpen, waitForType } from '@tapflowio/test-utils'
 import { IOSAgent } from '../IOSAgent'
 import type { SimctlWrapper } from '../SimctlWrapper'
 import type { GuestHelperNative } from '../GuestHelper'
+import type { DevicectlWrapper } from '../DevicectlWrapper'
 
 // #1085. The agent re-reads its simulators and sends the list when it changed, so one added on the Mac reaches the
 // dashboard without an agent restart. Against a real relay: the relay's answer is what gives the agent a state for
@@ -19,6 +20,27 @@ const IPHONE: Device = { id: 'dev-1', name: 'iPhone 15', platform: 'ios', status
 const IPAD: Device = { id: 'dev-2', name: 'iPad Air', platform: 'ios', status: 'shutdown', osVersion: 'iOS 18.3', typeId: 'type-ipad' }
 const DUO_1: Device = { id: 'duo-1', name: 'iPhone Duo', platform: 'ios', status: 'shutdown', osVersion: 'iOS 27.1', typeId: 'type-duo' }
 const DUO_2: Device = { ...DUO_1, id: 'duo-2', name: 'iPhone Duo 2' }
+const PHONE: Device = {
+  id: '00008110-000A1B2C3D4E5F60', name: 'Test iPhone', platform: 'ios', status: 'booted',
+  osVersion: 'iOS 26.1', formFactor: 'phone', kind: 'physical',
+}
+
+/** USB-connected devices as devicectl lists them; `fail` makes the next lists fail the way a hung CoreDevice does. */
+function devicectlListing(initial: Device[]) {
+  let devices = initial
+  let failing = false
+  const listPhysicalDevices = vi.fn(async (_timeoutMs?: number, options: { rejectOnFailure?: boolean } = {}) => {
+    if (!failing) return devices
+    if (options.rejectOnFailure) throw new Error('devicectl timed out')
+    return []
+  })
+  return {
+    dc: { listPhysicalDevices } as unknown as DevicectlWrapper,
+    listPhysicalDevices,
+    set: (next: Device[]) => { devices = next },
+    fail: (on: boolean) => { failing = on },
+  }
+}
 
 function simctlListing(initial: Device[]) {
   let devices = initial
@@ -68,8 +90,8 @@ describe('IOSAgent device list re-read (#1085)', () => {
   }
   const states = () => [...(agent as unknown as { deviceStates: Map<string, { deviceId: string }> }).deviceStates.values()].map((s) => s.deviceId).sort()
 
-  async function connect(simctl: SimctlWrapper, deviceFilter?: string) {
-    agent = new IOSAgent({ deviceRereadMs: 40, guestHelperNative: guestReady, ...(deviceFilter ? { deviceFilter } : {}) }, simctl)
+  async function connect(simctl: SimctlWrapper, deviceFilter?: string, devicectl?: DevicectlWrapper) {
+    agent = new IOSAgent({ deviceRereadMs: 40, guestHelperNative: guestReady, ...(deviceFilter ? { deviceFilter } : {}), ...(devicectl ? { devicectl } : {}) }, simctl)
     await agent.connect(`ws://localhost:${port}`)
   }
 
@@ -120,5 +142,65 @@ describe('IOSAgent device list re-read (#1085)', () => {
     const reads = (sw.listDevices as ReturnType<typeof vi.fn>).mock.calls.length
     await new Promise((r) => setTimeout(r, 200))
     expect((sw.listDevices as ReturnType<typeof vi.fn>).mock.calls.length).toBe(reads)
+  })
+
+  // #152: a USB-connected iPhone is in the register's list, so it has to be in every re-read's too, or the relay drops
+  // it two reads after it was offered.
+  describe('USB-connected devices', () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+    // Mutation: re-read `simctl.listDevices` alone (as the re-read did before phones) — the phone is gone from the relay
+    // after two reads.
+    it('keeps a phone listed across re-reads', async () => {
+      const { sw } = simctlListing([IPHONE])
+      const { dc, listPhysicalDevices } = devicectlListing([PHONE])
+      await connect(sw, undefined, dc)
+      await vi.waitFor(() => expect(listPhysicalDevices.mock.calls.length).toBeGreaterThanOrEqual(4), { timeout: 2000 })
+      expect((await listed()).find((d) => d.id === PHONE.id)).toMatchObject({ kind: 'physical', name: 'Test iPhone' })
+      expect(states()).toContain(PHONE.id)
+    })
+
+    // Mutation: drop the timeout from the re-read's devicectl call — a hung CoreDevice holds the re-read up for 15 s.
+    it('bounds devicectl in a re-read to the boot\'s 3 s', async () => {
+      const { sw } = simctlListing([IPHONE])
+      const { dc, listPhysicalDevices } = devicectlListing([PHONE])
+      await connect(sw, undefined, dc)
+      await vi.waitFor(() => expect(listPhysicalDevices.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2000 })
+      expect(listPhysicalDevices.mock.calls.at(-1)).toEqual([3_000, { rejectOnFailure: true }])
+    })
+
+    it('lists a phone plugged in after the agent started, as physical', async () => {
+      const { sw } = simctlListing([IPHONE])
+      const { dc, set } = devicectlListing([])
+      await connect(sw, undefined, dc)
+      set([PHONE])
+      await vi.waitFor(async () => expect((await listed()).find((d) => d.id === PHONE.id)).toMatchObject({ kind: 'physical' }), { timeout: 2000 })
+      await vi.waitFor(() => expect(states()).toEqual(['dev-1', PHONE.id].sort()))
+    })
+
+    it('drops a phone that was unplugged, and its state with it', async () => {
+      const { sw } = simctlListing([IPHONE])
+      const { dc, set } = devicectlListing([PHONE])
+      await connect(sw, undefined, dc)
+      set([])
+      await vi.waitFor(async () => expect((await listed()).map((d) => d.id)).toEqual(['dev-1']), { timeout: 2000 })
+      await vi.waitFor(() => expect(states()).toEqual(['dev-1']))
+    })
+
+    // Mutation: let a failed devicectl answer as an empty list — the phone is dropped after two failed reads, though
+    // it never left.
+    it('keeps a phone while devicectl fails, and the simulators still update', async () => {
+      const { sw, set: setSims } = simctlListing([IPHONE])
+      const { dc, listPhysicalDevices, fail } = devicectlListing([PHONE])
+      await connect(sw, undefined, dc)
+      fail(true)
+      setSims([IPHONE, IPAD])
+      await vi.waitFor(async () => expect((await listed()).map((d) => d.id).sort()).toEqual(['dev-1', 'dev-2', PHONE.id].sort()), { timeout: 2000 })
+      const reads = listPhysicalDevices.mock.calls.length
+      await vi.waitFor(() => expect(listPhysicalDevices.mock.calls.length).toBeGreaterThanOrEqual(reads + 3), { timeout: 2000 })
+      await sleep(50)
+      expect((await listed()).map((d) => d.id)).toContain(PHONE.id)
+      expect(states()).toContain(PHONE.id)
+    })
   })
 })

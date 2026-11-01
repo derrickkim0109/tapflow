@@ -59,14 +59,16 @@ export function parsePhysicalDevices(doc: unknown): Device[] {
 export class DevicectlWrapper {
   constructor(private readonly exec: XcrunExec = defaultExec) {}
 
-  /** USB-connected iPhones and iPads (see `parsePhysicalDevices`). **Never rejects**: a Mac whose devicectl is
-   *  missing, failing or slower than `timeoutMs` still has its simulators to offer, and this list is merged into
-   *  theirs. */
-  async listPhysicalDevices(timeoutMs?: number): Promise<Device[]> {
+  /** USB-connected iPhones and iPads (see `parsePhysicalDevices`). **Never rejects** unless `rejectOnFailure` is set:
+   *  a Mac whose devicectl is missing, failing or slower than `timeoutMs` still has its simulators to offer, and this
+   *  list is merged into theirs. The periodic re-read sets it, because to a re-read an empty list means every phone
+   *  was unplugged, and a devicectl that failed this once says nothing of the kind. */
+  async listPhysicalDevices(timeoutMs?: number, options: { rejectOnFailure?: boolean } = {}): Promise<Device[]> {
     const args = ['devicectl', 'list', 'devices', '-j', '-', '-q']
     try {
       return parsePhysicalDevices(JSON.parse(await (timeoutMs === undefined ? this.exec(args) : this.exec(args, timeoutMs))))
     } catch (e) {
+      if (options.rejectOnFailure) throw e
       logger.warn(`physical devices unavailable: ${e instanceof Error ? e.message : String(e)}`)
       return []
     }

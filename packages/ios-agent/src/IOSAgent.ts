@@ -45,7 +45,8 @@ const INPUT_ERROR_MESSAGES: Record<InputErrorReason, string> = {
   'not-session-owner': 'this input was addressed to a session the sender does not hold',
 }
 
-// A devicectl list answers in under a second (see `DevicectlWrapper`); a boot does not wait longer for a stuck one.
+// A devicectl list answers in under a second (see `DevicectlWrapper`); a boot does not wait longer for a stuck one,
+// and neither does the 30 s re-read of the device list (#1085), which a hung CoreDevice must not stall.
 const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
 
 /**
@@ -303,6 +304,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   /** Every USB-connected device any list has returned. Never pruned: a hardware UDID never names a simulator, and a
    *  device unplugged mid-session must still be kept off simctl's paths (a shutdown must not `simctl shutdown` it). */
   private readonly physicalDevices = new Set<string>()
+  /** The USB-connected devices the relay was last told about, by the register or a re-read. A re-read whose devicectl
+   *  fails offers these again rather than none (see `listAllDevices`). */
+  private reportedPhones: Device[] = []
   private readonly network: SimulatorNetwork
   private readonly fps: number
   private readonly intervalMs: number | undefined
@@ -489,7 +493,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.token = options.token
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000
     this.deviceWatcher = new DeviceListWatcher({
-      read: async () => this.offerDevices(await this.simctl.listDevices(RECONNECT_LIST_TIMEOUT_MS), false),
+      // The same list the register carried, USB-connected devices included: a re-read without them would drop a phone
+      // from the relay 30 s after it was offered.
+      read: async () => this.offerDevices(await this.listAllDevices(RECONNECT_LIST_TIMEOUT_MS, BOOT_DEVICECTL_TIMEOUT_MS, 'reread'), false),
       send: (devices) => { if (this.ws) this.sendOn(this.ws, { type: 'agent:devices', devices }) },
       onReadError: (e) => logger.debug(`device list re-read failed, trying again later: ${e instanceof Error ? e.message : String(e)}`),
       intervalMs: options.deviceRereadMs,
@@ -507,10 +513,24 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     return this.connectOnce(relayUrl)
   }
 
-  /** The simulators, marked as such, and the USB-connected devices. A devicectl that fails costs only its own devices;
-   *  `devicectlTimeoutMs` bounds how long a slow one can hold up the simulators (default: devicectl's own 15 s). */
-  private async listAllDevices(listTimeoutMs?: number, devicectlTimeoutMs?: number): Promise<Device[]> {
-    const [simulators, physical] = await Promise.all([this.simctl.listDevices(listTimeoutMs), this.devicectl.listPhysicalDevices(devicectlTimeoutMs)])
+  /**
+   * The simulators, marked as such, and the USB-connected devices. A devicectl that fails costs only its own devices;
+   * `devicectlTimeoutMs` bounds how long a slow one can hold up the simulators (default: devicectl's own 15 s).
+   *
+   * `use` is who the list is for. The register's list (`'register'`) is what the relay is told, and so is a re-read's
+   * (`'reread'`, #1085) — but a re-read whose devicectl failed or timed out keeps the phones the last such list had:
+   * an empty answer would read as every phone unplugged, and two of them in a row would drop a phone a tester is on.
+   */
+  private async listAllDevices(listTimeoutMs?: number, devicectlTimeoutMs?: number, use: 'register' | 'reread' | 'lookup' = 'lookup'): Promise<Device[]> {
+    const phones = use === 'reread'
+      ? this.devicectl.listPhysicalDevices(devicectlTimeoutMs, { rejectOnFailure: true }).catch((e: unknown) => {
+        logger.debug(`devicectl re-read failed, keeping the USB-connected devices it last listed: ${e instanceof Error ? e.message : String(e)}`)
+        return null
+      })
+      : this.devicectl.listPhysicalDevices(devicectlTimeoutMs)
+    const [simulators, listed] = await Promise.all([this.simctl.listDevices(listTimeoutMs), phones])
+    const physical = listed ?? this.reportedPhones
+    if (use !== 'lookup') this.reportedPhones = physical
     for (const d of physical) this.physicalDevices.add(d.id)
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
   }
@@ -544,7 +564,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.network.resume()
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null }
     this.relayUrl = relayUrl
-    const allDevices = await this.listAllDevices(listTimeoutMs)
+    const allDevices = await this.listAllDevices(listTimeoutMs, undefined, 'register')
     this.revertLeftoverLean(allDevices.filter((d) => !this.isPhysical(d.id)))
     // A `disconnect()` during this await or the one above does not cancel the connect. Every caller
     // today exits the process on the next line (the CLI's SIGINT handlers); one that keeps running
