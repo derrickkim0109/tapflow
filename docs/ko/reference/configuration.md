@@ -187,6 +187,15 @@ chmod 600 .tapflow/data/.env
 | `TAPFLOW_AUDIO` | *(켜짐)* | `off`이면 기기 오디오 스트리밍을 끕니다. [오디오](/ko/testing/audio)를 참고하세요. |
 | `TAPFLOW_ALLOW_DISPLAY_SLEEP` | *(비어있음)* | 값을 설정하면 세션 중에도 호스트 디스플레이가 꺼질 수 있습니다. 시스템 절전은 계속 막습니다. [에이전트 설정](/ko/operate/agents#호스트-디스플레이와-절전)을 참고하세요. |
 
+## USB로 연결한 iPhone (에이전트)
+
+위 스트리밍 변수처럼 **에이전트** 프로세스에 설정합니다. USB로 연결한 iPhone에서만 쓰입니다. [USB로 연결한 iPhone](/ko/operate/usb-iphone)을 참고하세요.
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `TAPFLOW_IOS_TEAM_ID` | *(비어있음)* | tapflow가 아이폰에 설치하는 XCUITest 러너를 서명할 Apple 개발자 팀 ID. 아이폰에 입력을 보내려면 필요합니다. 없으면 화면은 미러링되지만 입력은 거절됩니다. |
+| `TAPFLOW_IOS_BUNDLE_PREFIX` | `dev.tapflow` | 러너 App ID의 번들 ID 접두사. `dev.tapflow.treerunner.*`를 등록할 수 없는 팀이 지정합니다. |
+
 ## Lean mode (에이전트)
 
 `agent.lean`을 `true`로 두면, 에이전트는 부팅하는 모든 iOS 시뮬레이터에서 정해진 목록의 백그라운드 서비스를 끄고 Android 에뮬레이터에서는 번들 앱 몇 개를 비활성화합니다(아래 참고). iOS 27에서 재 보면 시뮬레이터 한 대의 메모리가 4분의 1 정도, 약 0.5GB 줄어듭니다. 그만큼 Mac 한 대가 스왑 없이 띄울 수 있는 시뮬레이터가 늘어납니다.

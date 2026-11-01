@@ -183,6 +183,15 @@ These variables are set on the **agent** process (`tapflow agent start` / `tapfl
 | `TAPFLOW_AUDIO` | *(on)* | `off` turns off device audio streaming. See [Audio](/testing/audio). |
 | `TAPFLOW_ALLOW_DISPLAY_SLEEP` | *(empty)* | Any value lets the host display sleep during a session. System sleep is still prevented. See [Agent Setup](/operate/agents#host-display-and-sleep). |
 
+## USB-connected iPhones (agent)
+
+Set on the **agent** process, like the streaming variables above. Only a USB-connected iPhone uses them; see [USB-connected iPhones](/operate/usb-iphone).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TAPFLOW_IOS_TEAM_ID` | *(empty)* | Apple developer team ID that signs the XCUITest runner tapflow installs on the phone. Required for input to a phone: without it the screen mirrors and input is refused. |
+| `TAPFLOW_IOS_BUNDLE_PREFIX` | `dev.tapflow` | Bundle ID prefix of the runner's App IDs, for a team that cannot register `dev.tapflow.treerunner.*`. |
+
 ## Lean mode (agent)
 
 With `agent.lean` set to `true`, the agent turns off a fixed list of background services on every iOS simulator it boots, and a few bundled apps on Android emulators (see below). Measured on iOS 27, a simulator then uses about a quarter less memory, roughly 0.5 GB, so a Mac holds more simulators before it starts swapping.
