@@ -113,6 +113,15 @@ describe('QASession — a USB-connected device (#152)', () => {
       expect(sim.textContent).toContain('This Mac is overloaded')
     }
   })
+  // Mutation: open the card for any phone — one that is hidden or busy opens a card where nothing can be picked.
+  it.each([
+    { name: 'hidden', patch: { hidden: true as const } },
+    { name: 'busy', patch: { busy: true } },
+  ])('keeps an overloaded Mac closed when its only plugged-in device is $name', async ({ patch }) => {
+    const devices = AGENTS[0]!.devices.map((d) => d.kind === 'physical' ? { ...d, ...patch } : d)
+    await openDeviceList(mac({ admission: { booting: false, overloaded: true, memoryRefuses: [] }, devices }))
+    expect(await screen.findByRole('button', { name: /studio-mac/ })).toBeDisabled()
+  })
   it('keeps an overloaded Mac with no plugged-in device closed', async () => {
     await openDeviceList(mac({ admission: { booting: false, overloaded: true, memoryRefuses: [] }, devices: AGENTS[0]!.devices.filter((d) => d.kind !== 'physical') }))
     expect(await screen.findByRole('button', { name: /studio-mac/ })).toBeDisabled()

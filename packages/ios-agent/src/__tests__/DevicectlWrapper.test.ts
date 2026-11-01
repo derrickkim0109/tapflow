@@ -90,6 +90,22 @@ describe('DevicectlWrapper.listPhysicalDevices', () => {
     await expect(new DevicectlWrapper(exec).listPhysicalDevices()).resolves.toEqual([])
   })
 
+  // Every boot and register lists devices, so a Mac without devicectl would warn on each one.
+  // Mutation: drop the `listFailureWarned` check — the second failure warns again.
+  it('warns about a failing devicectl once, not on every list', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const exec = vi.fn().mockRejectedValue(new Error('xcrun: error: unable to find utility "devicectl"'))
+      const wrapper = new DevicectlWrapper(exec)
+      await wrapper.listPhysicalDevices()
+      await wrapper.listPhysicalDevices()
+      await wrapper.listPhysicalDevices()
+      expect(warn.mock.calls.filter((c) => c.some((a) => String(a).includes('physical devices unavailable')))).toHaveLength(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
   // The 30 s re-read must tell "devicectl failed" from "no phones": the second, twice in a row, drops every phone.
   // Mutation: swallow the error under `rejectOnFailure` too.
   it('rejects when asked to, so a re-read can tell a failure from no phones', async () => {

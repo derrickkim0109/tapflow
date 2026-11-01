@@ -299,9 +299,10 @@ export interface SessionInfo {
 export interface MacAdmission {
   /** A cold boot holds this Mac's boot slot (`relay/src/admission/`). Another boot waits or is refused. */
   booting: boolean
-  /** No person's `session:start` on this Mac would be let in now (`agent-resources-exhausted`): CPU is over the
-   *  line, or memory is and the relay has no device up here to rejoin. Never while a USB phone (`kind: 'physical'`)
-   *  is attached: its join is not held to the Mac's load. */
+  /** No person's `session:start` on a simulator or emulator of this Mac would be let in now
+   *  (`agent-resources-exhausted`): CPU is over the line, or memory is and the relay has no device up here to rejoin.
+   *  Judged for simulators and emulators only — it can be set while a USB phone (`kind: 'physical'`) is attached, and
+   *  a phone's join is never refused by it: a phone is not held to the Mac's load. */
   overloaded: boolean
   /** Devices of this agent a person's join would be refused for memory now: memory is over the line and the
    *  relay has not brought these up (`readySent`), so joining would start them. Empty when memory is fine. Per

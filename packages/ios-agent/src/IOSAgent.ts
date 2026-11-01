@@ -67,6 +67,10 @@ const PHYSICAL_REFUSALS = {
 } as const
 type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
 
+// Re-reads run every 30 s, so a phone outlives a failing devicectl by about 90 s — longer than a CoreDevice hiccup,
+// short enough that an unplugged phone does not stay listed while devicectl keeps failing.
+const REREAD_FAILURES_BEFORE_EMPTY = 3
+
 const physicalCaptureUnavailable: PhysicalCaptureFactory = () => {
   throw new PlatformError('Physical iPhone screen capture is not available in this build')
 }
@@ -303,8 +307,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    *  device unplugged mid-session must still be kept off simctl's paths (a shutdown must not `simctl shutdown` it). */
   private readonly physicalDevices = new Set<string>()
   /** The USB-connected devices the relay was last told about, by the register or a re-read. A re-read whose devicectl
-   *  fails offers these again rather than none (see `listAllDevices`). */
+   *  fails offers these again, for a while, rather than none (see `listAllDevices`). */
   private reportedPhones: Device[] = []
+  /** Re-reads in a row whose devicectl failed. After `REREAD_FAILURES_BEFORE_EMPTY` of them the phones are no longer
+   *  offered: a phone unplugged while CoreDevice keeps failing must not stay listed forever. */
+  private rereadFailures = 0
   private readonly network: SimulatorNetwork
   private readonly fps: number
   private readonly intervalMs: number | undefined
@@ -518,8 +525,16 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * `use` is who the list is for. The register's list (`'register'`) is what the relay is told, and so is a re-read's
    * (`'reread'`, #1085) — but a re-read whose devicectl failed or timed out keeps the phones the last such list had:
    * an empty answer would read as every phone unplugged, and two of them in a row would drop a phone a tester is on.
+   * Only for `REREAD_FAILURES_BEFORE_EMPTY - 1` failures in a row, though: the next one offers none, so a phone
+   * unplugged while devicectl keeps failing leaves the list too.
    */
   private async listAllDevices(listTimeoutMs?: number, devicectlTimeoutMs?: number, use: 'register' | 'reread' | 'lookup' = 'lookup'): Promise<Device[]> {
+    // **No phones while this build cannot capture one.** Listing, install and launch land before screen capture, and
+    // with the unavailable stub every boot of a listed phone would fail — so phones are not offered at all (devicectl
+    // is not even asked). Screen capture removes this gate when it replaces the stub.
+    if (this.physicalCaptureFactory === physicalCaptureUnavailable) {
+      return (await this.simctl.listDevices(listTimeoutMs)).map((d): Device => ({ ...d, kind: 'simulator' }))
+    }
     const phones = use === 'reread'
       ? this.devicectl.listPhysicalDevices(devicectlTimeoutMs, { rejectOnFailure: true }).catch((e: unknown) => {
         logger.debug(`devicectl re-read failed, keeping the USB-connected devices it last listed: ${e instanceof Error ? e.message : String(e)}`)
@@ -527,7 +542,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       })
       : this.devicectl.listPhysicalDevices(devicectlTimeoutMs)
     const [simulators, listed] = await Promise.all([this.simctl.listDevices(listTimeoutMs), phones])
-    const physical = listed ?? this.reportedPhones
+    if (use === 'reread') this.rereadFailures = listed === null ? this.rereadFailures + 1 : 0
+    else if (use === 'register') this.rereadFailures = 0
+    const physical = listed ?? (this.rereadFailures >= REREAD_FAILURES_BEFORE_EMPTY ? [] : this.reportedPhones)
     if (use !== 'lookup') this.reportedPhones = physical
     for (const d of physical) this.physicalDevices.add(d.id)
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
@@ -562,7 +579,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.network.resume()
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null }
     this.relayUrl = relayUrl
-    const allDevices = await this.listAllDevices(listTimeoutMs, undefined, 'register')
+    // devicectl gets the boot's 3 s here too: on a Mac with no phone and a wedged CoreDevice, its 15 s default would
+    // hold up every register (and so every reconnect) for nothing.
+    const allDevices = await this.listAllDevices(listTimeoutMs, BOOT_DEVICECTL_TIMEOUT_MS, 'register')
     this.revertLeftoverLean(allDevices.filter((d) => !this.isPhysical(d.id)))
     // A `disconnect()` during this await or the one above does not cancel the connect. Every caller
     // today exits the process on the next line (the CLI's SIGINT handlers); one that keeps running
