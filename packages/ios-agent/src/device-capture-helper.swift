@@ -8,10 +8,13 @@
 // responsible process; it connects back to a loopback TCP port the agent opened.
 //
 // Socket, helper → agent:
-//   [nonce]                             once, first: the --nonce argument as passed (ASCII hex). Any local
+//   [nonce]                             once, first: the contents of the --nonce-file (ASCII hex). Any local
 //                                       process can reach the agent's loopback port; this is how the agent
-//                                       tells the helper it launched from whoever connected first.
-//   [status:u8]                         once: 0 = capture running, frames follow; otherwise the exit code
+//                                       tells the helper it launched from whoever connected first. The nonce
+//                                       is never in argv, which every local user can read (`ps`): the agent
+//                                       writes it to a 0600 file in its own user's cache, and the helper reads
+//                                       that file and deletes it before it connects.
+//   [status:u8]                         once, before any frame: 0 = capture running, frames follow; otherwise the exit code
 //                                       below, then why as UTF-8 text, after which the helper exits. `open`
 //                                       hides the child's exit status and its stderr from the agent, so this
 //                                       is how a failure, and its reason, reach it.
@@ -20,7 +23,7 @@
 //     jpeg: [u32 BE len][JPEG]
 // Socket, agent → helper: single bytes; 0x01 forces an IDR on the next H.264 frame.
 //
-// Args: <port> <udid> <fps> <h264|jpeg> --nonce HEX [--max-size N] [--name <device name>] [--sole]
+// Args: <port> <udid> <fps> <h264|jpeg> --nonce-file PATH [--max-size N] [--name <device name>] [--sole]
 //       --request-permission          prime the Camera prompt and exit (0 granted, 77 denied)
 //
 // The capture device's uniqueID is NOT the hardware UDID (measured on macOS 26 with an iPhone 16 Pro Max:
@@ -80,7 +83,7 @@ if rawArgs.contains("--request-permission") {
 var positional: [String] = []
 var maxSize = 0
 var deviceName: String?
-var nonce = ""
+var nonceFile = ""
 var sole = false
 do {
     var i = 0
@@ -88,11 +91,17 @@ do {
         let a = rawArgs[i]
         if a == "--max-size", i + 1 < rawArgs.count { maxSize = max(0, Int(rawArgs[i + 1]) ?? 0); i += 2; continue }
         if a == "--name", i + 1 < rawArgs.count { deviceName = rawArgs[i + 1]; i += 2; continue }
-        if a == "--nonce", i + 1 < rawArgs.count { nonce = rawArgs[i + 1]; i += 2; continue }
+        if a == "--nonce-file", i + 1 < rawArgs.count { nonceFile = rawArgs[i + 1]; i += 2; continue }
         if a == "--sole" { sole = true; i += 1; continue }
         positional.append(a); i += 1
     }
 }
+// Read once and deleted at once: the file is this launch's alone, and left behind it would outlive the launch.
+let nonce: String = {
+    guard !nonceFile.isEmpty, let text = try? String(contentsOfFile: nonceFile, encoding: .utf8) else { return "" }
+    unlink(nonceFile)
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}()
 // Plain globals rather than `guard let` bindings: top-level functions below read them, and Swift rejects a
 // function capturing a guard-bound top-level name.
 let port = positional.count == 4 ? UInt16(positional[0]) ?? 0 : 0
@@ -100,7 +109,7 @@ let fps = positional.count == 4 ? Double(positional[2]) ?? 0 : 0
 let targetUDID = positional.count == 4 ? positional[1] : ""
 let useH264 = positional.count == 4 && positional[3] == "h264"
 if port == 0 || fps <= 0 || targetUDID.isEmpty || nonce.isEmpty || !(useH264 || positional[3] == "jpeg") {
-    log("usage: device-capture-helper <port> <udid> <fps> <h264|jpeg> --nonce HEX [--max-size N] [--name NAME] [--sole] | --request-permission")
+    log("usage: device-capture-helper <port> <udid> <fps> <h264|jpeg> --nonce-file PATH [--max-size N] [--name NAME] [--sole] | --request-permission")
     exit(EXIT_USAGE)
 }
 
@@ -165,6 +174,9 @@ func sendFrame(_ payload: Data, keyframe: Bool) {
 
 let captureQueue = DispatchQueue(label: "io.tapflow.device-capture.capture", qos: .userInitiated)
 // Everything below is touched only on captureQueue.
+// Set, on captureQueue, right after the status byte is queued: a frame the session delivers before then is dropped, so
+// no frame can reach the socket ahead of the status byte the agent reads first.
+var started = false
 var pendingForceKeyFrame = true
 var lastBuffer: CVPixelBuffer?
 var lastEmitNs: UInt64 = 0
@@ -306,7 +318,7 @@ func emit(_ src: CVPixelBuffer, now: UInt64) {
 final class FrameSink: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     var frames = 0
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard started, let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         if frames == 0 { log("first frame \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb))") }
         frames += 1
         lastBuffer = pb
@@ -394,9 +406,12 @@ while device == nil && Date() < deadline {
     }
 }
 guard let device else {
+    // What was seen stays in this Mac's log: the failure text goes to the session, and every attached capture device's
+    // name and ID — other people's phones, a webcam — is nothing a tester of this one should be sent.
     let seen = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .muxed, position: .unspecified).devices
         .map { "\($0.localizedName) (\($0.uniqueID))" }.joined(separator: ", ")
-    fail(EXIT_NO_DEVICE, "no screen capture device for \(targetUDID)\(deviceName.map { " / \($0)" } ?? "") within 10 s — is it connected by USB, trusted and unlocked? seen: [\(seen)]")
+    log("no match for \(targetUDID); capture devices seen: [\(seen)]")
+    fail(EXIT_NO_DEVICE, "no screen capture device for \(targetUDID)\(deviceName.map { " / \($0)" } ?? "") within 10 s — is it connected by USB, trusted and unlocked?")
 }
 log("using \(device.localizedName) (\(device.uniqueID))")
 
@@ -421,7 +436,12 @@ guard session.canAddOutput(output) else { fail(EXIT_SESSION, "cannot add video o
 session.addOutput(output)
 session.startRunning()
 guard session.isRunning else { fail(EXIT_SESSION, "capture session did not start") }
-send(Data([0x00]))
+// On captureQueue, so the status byte is queued for the socket before any frame: captureOutput runs there and sends
+// nothing until `started` is set.
+captureQueue.sync {
+    send(Data([0x00]))
+    started = true
+}
 log("capturing \(useH264 ? "h264" : "jpeg") at \(fps) fps, max size \(maxSize)")
 
 // The phone sends nothing while its screen is static; re-send the last frame so a viewer that joins or

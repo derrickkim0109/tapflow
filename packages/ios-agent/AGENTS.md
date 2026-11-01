@@ -128,9 +128,7 @@ list for both the register and the re-read, so the `--device` filter, form facto
 phones cannot differ between them. A re-read gives devicectl the boot's 3 s, and one whose devicectl fails or times out
 offers the phones the last list had, not none: two empty answers in a row would drop a phone that never left. That
 holds for two failed re-reads in a row; the third offers none, so a phone unplugged while devicectl keeps failing
-leaves the list about 90 s later rather than never. While the agent has no phone screen capture (the factory is the
-`physicalCaptureUnavailable` stub), `listAllDevices` offers no phones at all and does not ask devicectl: a listed
-phone would fail every boot. **A re-read only adds to
+leaves the list about 90 s later rather than never. **A re-read only adds to
 what it knows about device types**: it asks `integratedPanelCounts` only about a type it has not seen, because that
 call reads a plist it cannot open as one panel, and asking again could drop a Duo in use onto the Indigo path. A
 connect still re-reads every type, as before. `agent:devices-applied` is the one relay message with no `sessionId`,

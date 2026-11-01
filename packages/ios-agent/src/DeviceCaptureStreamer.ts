@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, writeFile, rm, rename, readFile } from 'node:fs/promises'
+import { mkdir, writeFile, rm, rename, readFile, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createLogger, PlatformError } from '@tapflowio/agent-core'
@@ -57,9 +57,11 @@ export const DEVICE_CAPTURE_EXIT = {
   permission: 77,
 } as const
 
-// The helper opens with this launch's nonce (hex, as passed) before anything else. The port is loopback, but any local
-// process can connect to it, and the first connection used to be taken for the helper: frames from anyone would have
-// gone to the tester. A connection that does not open with the nonce is closed and the wait goes on.
+// The helper opens with this launch's nonce (hex) before anything else. The port is loopback, but any local process can
+// connect to it, and the first connection used to be taken for the helper: frames from anyone would have gone to the
+// tester. A connection that does not open with the nonce is closed and the wait goes on. The nonce does not travel in
+// the helper's argv, which every local user can read (`ps`) in time to connect first: it is written to a 0600 file in
+// this user's cache (`writeNonceFile`), whose path is passed instead, and the helper deletes the file once read.
 const NONCE_BYTES = 16
 const NONCE_LEN = NONCE_BYTES * 2
 // After a failure status the helper writes why, then exits; this bounds what is kept of it and how long it is waited for.
@@ -75,6 +77,28 @@ const CONNECT_TIMEOUT_MS = 15_000
 const STATUS_TIMEOUT_MS = 60_000
 
 const building = new Map<string, Promise<string>>()
+
+/** A capture failure a restart would only repeat, so the stream is not restarted: only a person can fix it. */
+export class PermanentCaptureError extends PlatformError {}
+
+/** Camera access was refused. Only granting it in System Settings helps. */
+export class CameraAccessDeniedError extends PermanentCaptureError {}
+
+// The swiftc and codesign arguments, but for the paths: part of the build stamp, so a change to how the helper is
+// built rebuilds it as a change to its source does.
+const SWIFTC_FLAGS = ['-O', '-suppress-warnings',
+  '-framework', 'AVFoundation', '-framework', 'CoreMediaIO', '-framework', 'CoreMedia',
+  '-framework', 'CoreVideo', '-framework', 'VideoToolbox', '-framework', 'ImageIO']
+const CODESIGN_FLAGS = ['--force', '--sign', '-']
+
+/** Writes `nonce` to a new file only this user can read, in `dir`, and returns its path. */
+export async function writeNonceFile(nonce: string, dir: string = defaultBuild.cacheDir): Promise<string> {
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  const path = join(dir, `device-capture-nonce-${randomBytes(8).toString('hex')}`)
+  // `wx`: never through a file (or link) someone put there first.
+  await writeFile(path, nonce, { mode: 0o600, flag: 'wx' })
+  return path
+}
 
 /** `text` with this user's home directory written as `~`, for a message that leaves the Mac. */
 export function tildePath(text: string, home: string = homedir()): string {
@@ -108,9 +132,10 @@ async function buildDeviceCaptureApp({ src, cacheDir, exec }: HelperBuild): Prom
   const stampFile = join(cacheDir, 'device-capture-helper.stamp')
   if (!existsSync(src)) {
     if (existsSync(bin)) return app
-    throw new PlatformError('device-capture-helper.app missing and source not found — reinstall @tapflowio/ios-agent')
+    throw new PermanentCaptureError('device-capture-helper.app missing and source not found — reinstall @tapflowio/ios-agent')
   }
-  const stamp = createHash('sha256').update(readFileSync(src)).update(INFO_PLIST).digest('hex')
+  const stamp = createHash('sha256').update(readFileSync(src)).update(INFO_PLIST)
+    .update(JSON.stringify([SWIFTC_FLAGS, CODESIGN_FLAGS])).digest('hex')
   if (existsSync(bin) && (await readFile(stampFile, 'utf8').catch(() => '')).trim() === stamp) return app
   logger.info('building device-capture-helper.app...')
   // Built aside and moved into place, with the stamp written last: a half-built or unsigned bundle at the real path
@@ -120,15 +145,11 @@ async function buildDeviceCaptureApp({ src, cacheDir, exec }: HelperBuild): Prom
   try {
     await rm(staging, { recursive: true, force: true })
     await mkdir(join(staging, 'Contents', 'MacOS'), { recursive: true })
-    await exec('swiftc', [
-      // -suppress-warnings: Swift 6 concurrency warnings on the top-level script globals would otherwise
-      // print into the agent log on every rebuild.
-      src, '-O', '-suppress-warnings', '-o', join(staging, 'Contents', 'MacOS', 'device-capture-helper'),
-      '-framework', 'AVFoundation', '-framework', 'CoreMediaIO', '-framework', 'CoreMedia',
-      '-framework', 'CoreVideo', '-framework', 'VideoToolbox', '-framework', 'ImageIO',
-    ], 300_000)
+    // -suppress-warnings (in SWIFTC_FLAGS): Swift 6 concurrency warnings on the top-level script globals would
+    // otherwise print into the agent log on every rebuild.
+    await exec('swiftc', [src, ...SWIFTC_FLAGS, '-o', join(staging, 'Contents', 'MacOS', 'device-capture-helper')], 300_000)
     await writeFile(join(staging, 'Contents', 'Info.plist'), INFO_PLIST)
-    await exec('codesign', ['--force', '--sign', '-', staging], 60_000)
+    await exec('codesign', [...CODESIGN_FLAGS, staging], 60_000)
     await rm(app, { recursive: true, force: true })
     try {
       await rename(staging, app)
@@ -144,26 +165,12 @@ async function buildDeviceCaptureApp({ src, cacheDir, exec }: HelperBuild): Prom
   } catch (e) {
     await rm(staging, { recursive: true, force: true })
     const stderr = typeof (e as { stderr?: unknown }).stderr === 'string' ? (e as { stderr: string }).stderr.trim() : ''
-    // Reaches the dashboard, so the home directory (a user name) is written as `~`.
-    throw new PlatformError(`could not build device-capture-helper.app in ${tildePath(cacheDir)}: ${tildePath(stderr.split('\n').slice(-3).join(' ') || (e as Error).message)}`)
+    // Reaches the dashboard, so the home directory (a user name) is written as `~`. Permanent: a restart would run
+    // swiftc again every few seconds and fail the same way, so the stream stops until the phone is opened again.
+    throw new PermanentCaptureError(`could not build device-capture-helper.app in ${tildePath(cacheDir)}: ${tildePath(stderr.split('\n').slice(-3).join(' ') || (e as Error).message)}`)
   }
   logger.info(`built ${app}`)
   return app
-}
-
-/**
- * Prime the Camera grant up front so the operator answers the prompt while present. `wait` resolves once
- * the helper exits (prompt answered); otherwise it is fire-and-forget and never rejects.
- */
-export async function requestDeviceCapturePermission(wait = true): Promise<void> {
-  try {
-    const app = await ensureDeviceCaptureApp()
-    const flags = wait ? ['-W', '-n'] : ['-g', '-n']
-    await execFileAsync('open', [...flags, '-a', app, '--args', '--request-permission'])
-  } catch (e) {
-    if (wait) throw e
-    logger.warn(`camera permission priming skipped: ${e instanceof Error ? e.message : String(e)}`)
-  }
 }
 
 /** The socket surface the streamer uses; `net.Socket` satisfies it. */
@@ -186,6 +193,8 @@ export interface DeviceCaptureDeps {
   listen(onConnection: (sock: HelperSocket) => void): Promise<HelperServer>
   /** Launches the app with these arguments. Rejects only when the launch itself fails. */
   launch(appPath: string, args: string[]): Promise<void>
+  /** Puts this launch's nonce where only the helper (this user) can read it, and returns the path to pass it. */
+  writeNonce(nonce: string): Promise<string>
 }
 
 const defaultDeps: DeviceCaptureDeps = {
@@ -205,13 +214,8 @@ const defaultDeps: DeviceCaptureDeps = {
   launch: (appPath, args) => new Promise((resolve, reject) => {
     execFile('open', ['-g', '-n', '-a', appPath, '--args', ...args], (err) => err ? reject(err) : resolve())
   }),
+  writeNonce: (nonce) => writeNonceFile(nonce),
 }
-
-/** A capture failure a restart would only repeat, so the stream is not restarted: only a person can fix it. */
-export class PermanentCaptureError extends PlatformError {}
-
-/** Camera access was refused. Only granting it in System Settings helps. */
-export class CameraAccessDeniedError extends PermanentCaptureError {}
 
 /** The error for a helper's failure status, with what it wrote about it (`detail`, empty when it said nothing). */
 function statusError(code: number, udid: string, detail: string): PlatformError {
@@ -265,8 +269,10 @@ export class DeviceCaptureStreamer {
   start(): ReadableStream<StreamFrame> {
     const h264 = this.codec === 'h264'
     const nonce = randomBytes(NONCE_BYTES).toString('hex')
-    const args = [this.udid, String(this.fps), this.codec, '--max-size', String(this.maxSize), '--nonce', nonce,
-      ...(this.deviceName ? ['--name', this.deviceName] : []), ...(this.sole ? ['--sole'] : [])]
+    const args = (nonceFile: string) => [this.udid, String(this.fps), this.codec, '--max-size', String(this.maxSize),
+      '--nonce-file', nonceFile, ...(this.deviceName ? ['--name', this.deviceName] : []), ...(this.sole ? ['--sole'] : [])]
+    // The helper deletes it once read; this is for a helper that never ran.
+    let nonceFile: string | null = null
 
     let done = false
     let server: HelperServer | null = null
@@ -282,6 +288,8 @@ export class DeviceCaptureStreamer {
       unproven.clear()
       server?.close()
       server = null
+      if (nonceFile) void unlink(nonceFile).catch(() => { /* the helper already deleted it */ })
+      nonceFile = null
     }
 
     return new ReadableStream<StreamFrame>({
@@ -330,12 +338,18 @@ export class DeviceCaptureStreamer {
               return
             }
             buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk])
-            if (buf.length >= 4 && buf.readUInt32BE(0) > MAX_FRAME_BYTES) {
-              fail(new PlatformError(`[DeviceCaptureStreamer] ${this.udid}: the helper announced a ${buf.readUInt32BE(0)}-byte frame — not a stream this agent reads`))
-              return
+            // Every header in reach, not just the first: an H.264 length of 0 has no flags byte, and parsing it would
+            // take the next frame's first byte for one and lose the framing for good.
+            for (let off = 0; off + 4 <= buf.length; off += 4 + buf.readUInt32BE(off)) {
+              const len = buf.readUInt32BE(off)
+              if (len > MAX_FRAME_BYTES || (h264 && len < 1)) {
+                fail(new PlatformError(`[DeviceCaptureStreamer] ${this.udid}: the helper announced a ${len}-byte frame — not a stream this agent reads`))
+                return
+              }
             }
             const { frames, rest } = parseStreamFrames(buf, h264)
-            for (const f of frames) controller.enqueue(f)
+            // An empty frame carries no picture: forwarded, it would count as the frame that shows the stream works.
+            for (const f of frames) if (f.payload.length > 0) controller.enqueue(f)
             buf = rest
           }
           sock.on('data', onData)
@@ -370,13 +384,16 @@ export class DeviceCaptureStreamer {
 
         this.deps.ensureApp().then((appPath) => {
           if (done) return
-          return this.deps.listen(onConnection).then((s) => {
+          return this.deps.listen(onConnection).then(async (s) => {
             if (done) { s.close(); return }
             server = s
+            const file = await this.deps.writeNonce(nonce)
+            if (done) { void unlink(file).catch(() => {}); return }
+            nonceFile = file
             timer = setTimeout(() => fail(new PlatformError(
               `[DeviceCaptureStreamer] ${this.udid}: device-capture-helper did not connect within ${CONNECT_TIMEOUT_MS / 1000} s`)),
             CONNECT_TIMEOUT_MS)
-            return this.deps.launch(appPath, [String(s.port), ...args])
+            return this.deps.launch(appPath, [String(s.port), ...args(file)])
           })
         }).catch((e: unknown) => fail(e instanceof Error ? e : new PlatformError(String(e))))
       },

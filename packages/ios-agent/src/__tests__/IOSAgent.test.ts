@@ -4094,20 +4094,37 @@ describe('IOSAgent', () => {
       agent.disconnect()
     })
 
-    // Mutation: drop the gate at the top of `listAllDevices` — a build with no physical capture then lists a phone
-    // whose every boot fails.
-    it('offers no phone, and asks devicectl nothing, while this build has no physical capture', async () => {
-      const devicectl = devicectlWith([PHONE])
-      const sent: Sent[] = []
-      const agent = new IOSAgent({ devicectl }, mockSimctl(false))
-      const internal = agent as unknown as Internals
-      const orig = internal.sendOn.bind(agent)
-      internal.sendOn = (ws, m) => { sent.push(m as Sent); orig(ws, m) }
-      await agent.connect(`ws://localhost:${port}`)
-      const register = sent.find((m) => m.type === 'agent:register') as unknown as { devices: Array<{ id: string }> }
-      expect(register.devices.map((d) => d.id)).toEqual(['dev-1'])
-      expect(devicectl.listPhysicalDevices).not.toHaveBeenCalled()
-      agent.disconnect()
+    // The capture helper has no single-instance check, so the agent holds one capture per phone. Mutations: drop the
+    // `capturing.has` refusal (a second helper fights the first over the phone's one capture device), or never release
+    // the claim on cancel (the phone could not be captured again until the agent restarts).
+    it('refuses a second capture of the same phone while one runs, and allows one after it ends', async () => {
+      const capture = vi.fn(fakeCapture)
+      const agent = new IOSAgent({ devicectl: devicectlWith([PHONE]), physicalCaptureFactory: capture }, mockSimctl(false))
+      type Capturing = { physicalCapture(udid: string, fps: number, codec: 'jpeg' | 'h264', maxSize: number): CaptureStreamer }
+      const internal = agent as unknown as Capturing
+      const first = internal.physicalCapture(PHONE.id, 30, 'h264', 0).start().getReader()
+      await expect(internal.physicalCapture(PHONE.id, 30, 'jpeg', 0).start().getReader().read()).rejects.toThrow(/already being captured/)
+      // Another phone is not held up by it.
+      const other = internal.physicalCapture('00008110-OTHER', 30, 'h264', 0).start().getReader()
+      void other.read()
+      await other.cancel()
+      // Cancelled with no read in flight: the claim must go with the cancel itself.
+      await first.cancel()
+      const again = internal.physicalCapture(PHONE.id, 30, 'h264', 0).start().getReader()
+      const pending = Promise.race([again.read().then(() => 'read', () => 'refused'), new Promise((r) => setTimeout(() => r('open'), 50))])
+      expect(await pending).toBe('open')
+      await again.cancel()
+    })
+
+    // Mutation: default the factory to `ScreenCaptureStreamer` — a physical boot would then stream a simulator path.
+    it('fails the boot, saying why, while this build has no physical capture', async () => {
+      const ctx = await connected({ capture: null })
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-nocap', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:boot-error')).toBe(true))
+      expect(ctx.sent.find((m) => m.type === 'device:boot-error')?.message).toMatch(/Physical iPhone screen capture is not available in this build/)
+      expect(ctx.sent.some((m) => m.type === 'device:ready')).toBe(false)
+      expect(vi.mocked(ScreenCaptureStreamer)).not.toHaveBeenCalledWith(PHONE.id, expect.anything(), expect.anything(), expect.anything(), expect.anything())
+      ctx.agent.disconnect()
     })
 
     // Mutation: register with devicectl's default timeout — on a Mac with a wedged CoreDevice every register, a

@@ -125,7 +125,7 @@ Connected straight to the relay's port on the Mac it runs on, the MCP server sta
 | Tool | Description |
 |------|-------------|
 | `list_builds` | List the apps and builds on the relay (where the `buildId` for `install_app` and `launch_app` comes from) |
-| `list_devices` | List connected simulators, emulators and USB-connected phones |
+| `list_devices` | List connected simulators, emulators and USB-connected devices (Android phones, iPhones), each with its `kind` |
 | `connect_device` | Join a session (required before controlling a device). Also returns `watchUrl`, a dashboard link for watching the device |
 | `disconnect_device` | End a session |
 | `boot_device` | Boot a simulator or emulator |

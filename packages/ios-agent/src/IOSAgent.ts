@@ -319,6 +319,10 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   /** How many USB-connected devices the last list returned. With one, the capture helper may take the only phone it
    *  sees even when its name reads differently there; with two, that phone could be the other one. */
   private physicalListed = 0
+  /** The phones a capture helper is running for. The helper has no single-instance check of its own (exit 71 is two
+   *  phones with one name), so without this `stream()` would start a second helper for a phone whose session is
+   *  streaming, and the two would fight over its one capture device. See `physicalCapture`. */
+  private readonly physicalCapturing = new Set<string>()
   private readonly network: SimulatorNetwork
   private readonly fps: number
   private readonly intervalMs: number | undefined
@@ -538,12 +542,6 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * unplugged while devicectl keeps failing leaves the list too.
    */
   private async listAllDevices(listTimeoutMs?: number, devicectlTimeoutMs?: number, use: 'register' | 'reread' | 'lookup' = 'lookup'): Promise<Device[]> {
-    // **No phones while this build cannot capture one.** Listing, install and launch land before screen capture, and
-    // with the unavailable stub every boot of a listed phone would fail — so phones are not offered at all (devicectl
-    // is not even asked). Screen capture removes this gate when it replaces the stub.
-    if (this.physicalCaptureFactory === physicalCaptureUnavailable) {
-      return (await this.simctl.listDevices(listTimeoutMs)).map((d): Device => ({ ...d, kind: 'simulator' }))
-    }
     const phones = use === 'reread'
       ? this.devicectl.listPhysicalDevices(devicectlTimeoutMs, { rejectOnFailure: true }).catch((e: unknown) => {
         logger.debug(`devicectl re-read failed, keeping the USB-connected devices it last listed: ${e instanceof Error ? e.message : String(e)}`)
@@ -558,6 +556,43 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     for (const d of physical) { this.physicalDevices.add(d.id); this.physicalNames.set(d.id, d.name) }
     this.physicalListed = physical.length
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
+  }
+
+  /**
+   * The phone's capture, one at a time per phone in this agent: a start while another capture of the same phone runs
+   * fails at once (a plain `PlatformError`, so a session stream restarts later rather than give up), and the running
+   * one keeps the device. The claim is let go when the stream ends, fails or is cancelled.
+   */
+  private physicalCapture(udid: string, fps: number, codec: 'jpeg' | 'h264', maxSize: number): CaptureStreamer {
+    const inner = this.physicalCaptureFactory(udid, fps, codec, maxSize)
+    const capturing = this.physicalCapturing
+    return {
+      requestKeyframe: () => inner.requestKeyframe(),
+      selectPanel: (panel) => inner.selectPanel(panel),
+      start: () => {
+        if (capturing.has(udid)) {
+          return new ReadableStream<StreamFrame>({
+            start: (c) => c.error(new PlatformError(`${udid} is already being captured by this agent — one capture per device`)),
+          })
+        }
+        capturing.add(udid)
+        let claimed = true
+        const release = () => { if (claimed) { claimed = false; capturing.delete(udid) } }
+        const reader = inner.start().getReader()
+        return new ReadableStream<StreamFrame>({
+          pull: async (c) => {
+            try {
+              const { value, done } = await reader.read()
+              if (done) { release(); c.close() } else c.enqueue(value)
+            } catch (e) {
+              release()
+              c.error(e)
+            }
+          },
+          cancel: (reason) => { release(); return reader.cancel(reason) },
+        }, { highWaterMark: 0 })
+      },
+    }
   }
 
   private isPhysical(deviceId: string): boolean {
@@ -1026,7 +1061,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     })
     let stream: ReadableStream<StreamFrame>
     if (physical) {
-      const capture = this.physicalCaptureFactory(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize())
+      const capture = this.physicalCapture(state.deviceId, this.fps, useH264 ? 'h264' : 'jpeg', maxSize())
       state.captureStreamer = capture
       stream = capture.start()
     } else if (this.intervalMs !== undefined) {
@@ -3382,7 +3417,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   stream(): ReadableStream<Buffer> {
     const first = this.soleDeviceState()
     const capture: CaptureStreamer = this.isPhysical(first.deviceId)
-      ? this.physicalCaptureFactory(first.deviceId, this.fps, 'jpeg', 0)
+      ? this.physicalCapture(first.deviceId, this.fps, 'jpeg', 0)
       : new ScreenCaptureStreamer(first.deviceId, this.fps)
     // DeviceAgent.stream() is the platform-neutral Buffer contract; unwrap StreamFrame payloads.
     return capture.start()

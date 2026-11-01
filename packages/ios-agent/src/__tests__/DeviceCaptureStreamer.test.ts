@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, statSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { DeviceCaptureStreamer, DEVICE_CAPTURE_EXIT, CameraAccessDeniedError, PermanentCaptureError, ensureDeviceCaptureApp, tildePath } from '../DeviceCaptureStreamer'
+import { DeviceCaptureStreamer, DEVICE_CAPTURE_EXIT, CameraAccessDeniedError, PermanentCaptureError, ensureDeviceCaptureApp, tildePath, writeNonceFile } from '../DeviceCaptureStreamer'
 import type { DeviceCaptureDeps, HelperSocket } from '../DeviceCaptureStreamer'
 
 // The system boundaries are the LaunchServices launch and the loopback socket; both are doubled here.
@@ -21,15 +21,18 @@ function harness(launchResult: Promise<void> = Promise.resolve()) {
   let accept: ((sock: HelperSocket) => void) | null = null
   const server = { port: 54321, close: vi.fn() }
   const launch = vi.fn((_app: string, _args: string[]) => launchResult)
+  // The nonce files written, by path: what the helper would read from the path it is launched with.
+  const files = new Map<string, string>()
   const deps: DeviceCaptureDeps = {
     ensureApp: () => Promise.resolve('/apps/device-capture-helper.app'),
     listen: (onConnection) => { accept = onConnection; return Promise.resolve(server) },
     launch,
+    writeNonce: vi.fn(async (n: string) => { const path = `/cache/nonce-${files.size}`; files.set(path, n); return path }),
   }
   // The nonce the helper was launched with, which it sends before anything else.
   const nonce = (): string => {
     const args = launch.mock.calls.at(-1)?.[1] ?? []
-    return args[args.indexOf('--nonce') + 1] ?? ''
+    return files.get(args[args.indexOf('--nonce-file') + 1] ?? '') ?? ''
   }
   // A connection to the capture port: the helper's, opening with its nonce, unless `opening` says otherwise.
   const connect = (opening: string = nonce()) => {
@@ -39,7 +42,7 @@ function harness(launchResult: Promise<void> = Promise.resolve()) {
     if (opening) sock.emit('data', Buffer.from(opening, 'latin1'))
     return sock
   }
-  return { deps, server, connect, nonce }
+  return { deps, server, connect, nonce, launch }
 }
 
 const h264Frame = (flags: number, payload: number[]) => {
@@ -60,7 +63,17 @@ describe('DeviceCaptureStreamer', () => {
     new DeviceCaptureStreamer('00008140-0000000000000001', 30, 'h264', 1280, 'Test Phone', deps).start()
     await vi.advanceTimersByTimeAsync(0)
     expect(deps.launch).toHaveBeenCalledWith('/apps/device-capture-helper.app',
-      ['54321', '00008140-0000000000000001', '30', 'h264', '--max-size', '1280', '--nonce', expect.stringMatching(/^[0-9a-f]{32}$/), '--name', 'Test Phone'])
+      ['54321', '00008140-0000000000000001', '30', 'h264', '--max-size', '1280', '--nonce-file', '/cache/nonce-0', '--name', 'Test Phone'])
+  })
+
+  // Mutation: pass the nonce in argv again. Every local user can read a process's arguments (`ps`), and one who does
+  // can connect to the port before the helper and stream to the tester.
+  it('keeps the nonce out of the helper\'s arguments, handing it over in a file', async () => {
+    const h = harness()
+    new DeviceCaptureStreamer('udid', 30, 'h264', 0, 'iPhone', h.deps).start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.nonce()).toMatch(/^[0-9a-f]{32}$/)
+    expect(h.launch.mock.calls[0]![1].join(' ')).not.toContain(h.nonce())
   })
 
   // Mutation: pass `--sole` always (or never). With two phones attached, the helper would take a lone visible device
@@ -234,6 +247,34 @@ describe('DeviceCaptureStreamer', () => {
     expect((e as Error).message).toMatch(/2 attached iPhones are named "iPhone" — give each iPhone its own name/)
   })
 
+  // Mutation: check only the first header against the cap. A 4 GiB length in a later header would be waited on, a frame
+  // that never completes.
+  it('fails on a frame header over the 64 MiB cap, even behind a good frame', async () => {
+    const { deps, connect } = harness()
+    const reader = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, deps).start().getReader()
+    await vi.advanceTimersByTimeAsync(0)
+    const huge = Buffer.alloc(5)
+    huge.writeUInt32BE(64 * 1024 * 1024 + 1, 0)
+    connect().emit('data', Buffer.concat([Buffer.from([0x00]), h264Frame(0x01, [1, 2]), huge]))
+    await expect(reader.read()).rejects.toThrow(/announced a 67108865-byte frame/)
+  })
+
+  // Mutations: let an H.264 length of 0 through (its missing flags byte is then read from the next frame, and the
+  // framing is lost); or forward a frame with no picture (it would count as the frame that proves capture works).
+  it('fails on a zero-length H.264 frame, and forwards no empty one', async () => {
+    const zero = harness()
+    const r1 = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, zero.deps).start().getReader()
+    await vi.advanceTimersByTimeAsync(0)
+    zero.connect().emit('data', Buffer.concat([Buffer.from([0x00]), Buffer.alloc(4), h264Frame(0x01, [1, 2])]))
+    await expect(r1.read()).rejects.toThrow(/announced a 0-byte frame/)
+
+    const empty = harness()
+    const r2 = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, empty.deps).start().getReader()
+    await vi.advanceTimersByTimeAsync(0)
+    empty.connect().emit('data', Buffer.concat([Buffer.from([0x00]), h264Frame(0x01, []), h264Frame(0x00, [7])]))
+    expect((await r2.read()).value).toEqual({ payload: Buffer.from([7]), keyframe: false })
+  })
+
   // Mutation: no status timeout — a phone that stays locked, or a Camera prompt nobody answers, would hang
   // the session silently after the helper connected.
   it('errors when the helper connects but capture never starts', async () => {
@@ -302,5 +343,24 @@ describe('ensureDeviceCaptureApp', () => {
     b.exec.mockRejectedValueOnce(Object.assign(new Error('Command failed'), { stderr: 'error: no such module' }))
     await expect(ensureDeviceCaptureApp(b)).rejects.toThrow(/could not build device-capture-helper\.app in .*: error: no such module/)
     expect(existsSync(join(b.cacheDir, 'device-capture-helper.app'))).toBe(false)
+  })
+
+  // Mutation: throw a plain PlatformError. The stream pump restarts on one, and every restart runs swiftc again, failing
+  // the same way, every few seconds for as long as the phone is open.
+  it('fails a build for good, so the stream is not restarted into another build', async () => {
+    const b = build()
+    b.exec.mockRejectedValueOnce(Object.assign(new Error('Command failed'), { stderr: 'error: no such module' }))
+    await expect(ensureDeviceCaptureApp(b)).rejects.toBeInstanceOf(PermanentCaptureError)
+  })
+})
+
+describe('writeNonceFile', () => {
+  // Mutation: write it with the default mode. Another local user could then read this launch's nonce.
+  it('writes the nonce to a new file only this user can read', async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), 'tapflow-nonce-')), 'cache')
+    const path = await writeNonceFile('ab'.repeat(16), dir)
+    expect(readFileSync(path, 'utf8')).toBe('ab'.repeat(16))
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+    expect(path.startsWith(dir)).toBe(true)
   })
 })
