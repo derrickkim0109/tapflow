@@ -126,6 +126,7 @@ import {
 import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer.js'
 import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
 import { DevicectlWrapper, AppIdentityMismatchError } from './DevicectlWrapper.js'
+import { DeviceCaptureStreamer } from './DeviceCaptureStreamer.js'
 import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
 import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio/audiotap-helper'
@@ -205,7 +206,7 @@ export interface IOSAgentOptions {
   helperBootReadyMs?: number
   /** USB-connected iPhones and iPads. Injectable so a suite never runs devicectl; under vitest the default lists none. */
   devicectl?: DevicectlWrapper
-  /** How a USB-connected device's screen is captured. */
+  /** How a USB-connected device's screen is captured. Under vitest the default refuses rather than launch the app. */
   physicalCaptureFactory?: PhysicalCaptureFactory
 }
 
@@ -303,6 +304,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private readonly simctl: SimctlWrapper
   private readonly devicectl: DevicectlWrapper
   private readonly physicalCaptureFactory: PhysicalCaptureFactory
+  /** devicectl's name for each USB-connected device. The capture device's uniqueID is not the UDID (measured: a random
+   *  UUID on an iPhone 16 Pro Max), so the capture helper finds the device by this name. */
+  private readonly physicalNames = new Map<string, string>()
   /** Every USB-connected device any list has returned. Never pruned: a hardware UDID never names a simulator, and a
    *  device unplugged mid-session must still be kept off simctl's paths (a shutdown must not `simctl shutdown` it). */
   private readonly physicalDevices = new Set<string>()
@@ -452,7 +456,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     }
     this.simctl = simctl ?? new SimctlWrapper()
     this.devicectl = options.devicectl ?? new DevicectlWrapper(process.env.VITEST ? () => Promise.resolve('{}') : undefined)
-    this.physicalCaptureFactory = options.physicalCaptureFactory ?? physicalCaptureUnavailable
+    this.physicalCaptureFactory = options.physicalCaptureFactory ?? (process.env.VITEST
+      ? physicalCaptureUnavailable
+      : (udid, fps, codec, maxSize) => new DeviceCaptureStreamer(udid, fps, codec, maxSize, this.physicalNames.get(udid) ?? null))
     // **Never the real filter under vitest.** Layer 1 is a system extension installed on the
     // developer's Mac, and `arm()` runs on every boot — so a suite that booted a mock device was
     // launching the notarized container app and rewriting the host's live filter configuration, once
@@ -546,7 +552,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     else if (use === 'register') this.rereadFailures = 0
     const physical = listed ?? (this.rereadFailures >= REREAD_FAILURES_BEFORE_EMPTY ? [] : this.reportedPhones)
     if (use !== 'lookup') this.reportedPhones = physical
-    for (const d of physical) this.physicalDevices.add(d.id)
+    for (const d of physical) { this.physicalDevices.add(d.id); this.physicalNames.set(d.id, d.name) }
     return [...simulators.map((d): Device => ({ ...d, kind: 'simulator' })), ...physical]
   }
 
