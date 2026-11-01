@@ -47,7 +47,7 @@ function setup(opts: { team?: string; bundlePrefix?: string; built?: string; tun
   const native = {
     sourceStamp: vi.fn(async () => 'stamp-1'),
     builtStamp: vi.fn((): string | undefined => opts.built),
-    build: vi.fn(async () => {}),
+    build: vi.fn(async (_destination: string, _stamp: string, _device?: { team: string; bundlePrefix?: string }) => {}),
     spawn: vi.fn((_destination: string, token: string): ChildProcess => {
       tokens.push(token)
       const proc = fakeProc()
@@ -93,7 +93,7 @@ describe('XCUITreeReader on a physical device', () => {
     const s = setup({ team: 'TEAM123' })
     tokens = s.tokens
     await s.reader.read('udid-P', 'com.app')
-    expect(s.native.build).toHaveBeenCalledWith('platform=iOS,id=udid-P', 'stamp-1:TEAM123', { team: 'TEAM123' })
+    expect(s.native.build).toHaveBeenCalledWith('platform=iOS,id=udid-P', 'stamp-1:TEAM123|udid-P', { team: 'TEAM123' })
     expect(s.native.spawn).toHaveBeenCalledWith('platform=iOS,id=udid-P', s.tokens[0], 'physical')
     s.reader.stop()
   })
@@ -125,28 +125,68 @@ describe('XCUITreeReader on a physical device', () => {
   // Mutation: compare the built stamp against the bare source stamp. A build signed by another team would then be
   // reused, and installing it fails with a provisioning error.
   it('rebuilds when the team changed, and reuses a build by the same team', async () => {
-    const same = setup({ team: 'TEAM123', built: 'stamp-1:TEAM123' })
+    const same = setup({ team: 'TEAM123', built: 'stamp-1:TEAM123|udid-P' })
     tokens = same.tokens
     await same.reader.read('udid-P', 'com.app')
     expect(same.native.builtStamp).toHaveBeenCalledWith('physical')
     expect(same.native.build).not.toHaveBeenCalled()
     same.reader.stop()
 
-    const other = setup({ team: 'TEAM456', built: 'stamp-1:TEAM123' })
+    const other = setup({ team: 'TEAM456', built: 'stamp-1:TEAM123|udid-P' })
     tokens = other.tokens
     await other.reader.read('udid-P', 'com.app')
     expect(other.native.build).toHaveBeenCalledTimes(1)
     other.reader.stop()
   })
 
+  // Mutation: leave the device out of the stamp (or its check). A second phone then skips the build that registers it
+  // and puts it in the profile, and `test-without-building`, which does not re-sign, cannot install the runner there.
+  it('rebuilds for a phone the build was not made for, keeping the phones it was', async () => {
+    const s = setup({ team: 'TEAM123', built: 'stamp-1:TEAM123|udid-P', physical: ['udid-P', 'udid-Q'] })
+    tokens = s.tokens
+    await s.reader.read('udid-Q', 'com.app')
+    expect(s.native.build).toHaveBeenCalledWith('platform=iOS,id=udid-Q', 'stamp-1:TEAM123|udid-P,udid-Q', { team: 'TEAM123' })
+    s.reader.stop()
+  })
+
+  // Mutation: let a phone that joined another phone's build in flight return with it. That build was for the first
+  // phone only, so the second would run products its profile does not name.
+  it('builds again for a phone that joined another phone\'s build', async () => {
+    const s = setup({ team: 'TEAM123', physical: ['udid-P', 'udid-Q'] })
+    let built: string | undefined
+    s.native.builtStamp.mockImplementation(() => built)
+    s.native.build.mockImplementation(async (_d: string, stamp: string) => { built = stamp })
+    tokens = s.tokens
+    await Promise.all([s.reader.read('udid-P', 'com.app'), s.reader.read('udid-Q', 'com.app')])
+    expect(s.native.build.mock.calls.map((c) => c[1])).toEqual(['stamp-1:TEAM123|udid-P', 'stamp-1:TEAM123|udid-P,udid-Q'])
+    s.reader.stop()
+  })
+
+  // Mutation: keep the simulator's "check Xcode/simulator state" for a phone, or drop xcodebuild's own lines — the
+  // tester is sent to a simulator that is not involved, without the reason xcodebuild printed.
+  it('says what to check on the phone, with xcodebuild\'s reason, when its runner exits before it is ready', async () => {
+    const s = setup({ team: 'T' })
+    s.native.spawn.mockImplementation((): ChildProcess => {
+      const proc = fakeProc()
+      queueMicrotask(() => {
+        proc.stdout.emit('data', 'Testing started\nxcodebuild: error: The device is locked.\n')
+        proc.exitCode = 65
+        proc.emit('exit', 65, null)
+      })
+      return proc as unknown as ChildProcess
+    })
+    await expect(s.reader.read('udid-P', 'com.app')).rejects.toThrow(/device is unlocked, trusts this Mac.*The device is locked/)
+    s.reader.stop()
+  })
+
   // App IDs are unique across every Apple team, so a team that cannot register `dev.tapflow.treerunner.*` signs under
   // its own prefix. Mutation: leave the prefix out of the stamp — a prefix change reuses products signed under the old
   // IDs — or out of `build` — the device build ignores it.
   it('builds under a bundle prefix when one is set, and rebuilds when it changes', async () => {
-    const s = setup({ team: 'TEAM123', bundlePrefix: 'com.example.tapflow', built: 'stamp-1:TEAM123' })
+    const s = setup({ team: 'TEAM123', bundlePrefix: 'com.example.tapflow', built: 'stamp-1:TEAM123|udid-P' })
     tokens = s.tokens
     await s.reader.read('udid-P', 'com.app')
-    expect(s.native.build).toHaveBeenCalledWith('platform=iOS,id=udid-P', 'stamp-1:TEAM123:com.example.tapflow', { team: 'TEAM123', bundlePrefix: 'com.example.tapflow' })
+    expect(s.native.build).toHaveBeenCalledWith('platform=iOS,id=udid-P', 'stamp-1:TEAM123:com.example.tapflow|udid-P', { team: 'TEAM123', bundlePrefix: 'com.example.tapflow' })
     s.reader.stop()
   })
 
@@ -224,6 +264,27 @@ describe('XCUITreeReader on a physical device', () => {
       expect(client.state()).toBe('starting')
       await expect(client.request('/tap?x=0.5&y=0.5')).rejects.toThrow(/TAPFLOW_IOS_TEAM_ID/)
       expect(client.state()).toBe('unavailable')
+    })
+
+    // Mutations: keep only that it failed (a Set), not why — the tester would read "not ready" with nothing to act on,
+    // while the reason (here, no team) sits in the agent's log on another Mac; or forget it as soon as a retry starts —
+    // an input refused during that retry would lose it too.
+    it('keeps why the last start failed through a retry, until a start succeeds', async () => {
+      let team: string | undefined = undefined
+      const s = setup({})
+      const reader = new XCUITreeReader(s.native, { platformOf: () => 'physical', team: () => team })
+      tokens = s.tokens
+      const client = reader.inputClient('udid-P')
+      expect(client.lastError?.()).toBeNull()
+      await expect(client.request('/tap?x=0.5&y=0.5')).rejects.toThrow()
+      expect(client.lastError?.()).toMatch(/TAPFLOW_IOS_TEAM_ID/)
+      team = 'T'
+      const retry = client.request('/tap?x=0.5&y=0.5')
+      expect(client.state()).toBe('starting')
+      expect(client.lastError?.()).toMatch(/TAPFLOW_IOS_TEAM_ID/)
+      await retry
+      expect(client.lastError?.()).toBeNull()
+      reader.stop()
     })
   })
 })

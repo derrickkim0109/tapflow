@@ -227,6 +227,64 @@ describe('XCUITestInput', () => {
       expect(input.ownsGesture()).toBe(false)
       expect(runner.request).not.toHaveBeenCalled()
     })
+
+    // Mutation: leave `unsupportedReason` unset for a pinch's end, a chord or the side button. The agent then reads
+    // the refusal as "no gesture in progress" or "not ready", and the caller retries something that never works.
+    it('says why it refused an input it can never send, and only for that write', () => {
+      const { input } = make()
+      input.pinchStart(0.4, 0.4, 0.6, 0.6)
+      expect(input.pinchEnd()).toBe(false)
+      expect(input.unsupportedReason()).toMatch(/^A pinch cannot be sent to a USB-connected device/)
+      expect(input.sendKey(0x04, 0x08)).toBe(false)
+      expect(input.unsupportedReason()).toMatch(/^A keyboard shortcut/)
+      expect(input.pressLegacyButton(1)).toBe(false)
+      expect(input.unsupportedReason()).toMatch(/^The side button/)
+      expect(input.pressLegacyButton(0)).toBe(true)
+      expect(input.unsupportedReason()).toBeNull()
+    })
+
+    // Mutation: refuse a write that only found the runner down as unsupported. The agent would tell the caller never
+    // to retry, while the next write after the runner starts goes through.
+    it('does not call a write refused for a runner that is not up unsupported', () => {
+      const { input } = make({ state: 'unavailable' })
+      expect(input.sendKey(0x04)).toBe(false)
+      expect(input.unsupportedReason()).toBeNull()
+    })
+  })
+
+  describe('what the runner answered', () => {
+    // Mutation: drop `lastWrite`, or let it resolve whatever the runner said. A key typed with nothing focused would
+    // be acked as delivered while the runner answered 409.
+    it('hands the request a write sent to its ack, once, with the runner\'s answer', async () => {
+      const { input, runner } = make()
+      runner.request.mockRejectedValueOnce(new Error('UI-test runner refused /type: no element has keyboard focus'))
+      expect(input.sendKey(0x04)).toBe(true)
+      const write = input.takeLastWrite()
+      expect(input.takeLastWrite()).toBeNull()
+      await expect(write).rejects.toThrow(/no element has keyboard focus/)
+      expect(input.sendKey(0x05)).toBe(true)
+      await expect(input.takeLastWrite()).resolves.toBeUndefined()
+    })
+
+    // Mutation: hand over a tap's request too. Its ack would then wait for the runner to play it out, which can outlast
+    // a client's 2 s ack deadline and fail a tap that landed.
+    it('has no request to hand over for a tap or a drag', async () => {
+      const { input } = make()
+      input.touchStart(0.5, 0.5)
+      input.touchEnd()
+      expect(input.takeLastWrite()).toBeNull()
+      input.pressButton(0x0c, 0xe9)
+      expect(input.takeLastWrite()).not.toBeNull()
+    })
+
+    // Mutation: leave the last write in place for a write that sends nothing. A touch's start would then be answered
+    // with the outcome of a key typed before it.
+    it('has no request to hand over for a write that sent nothing', () => {
+      const { input } = make()
+      input.sendKey(0x04)
+      input.touchStart(0.5, 0.5)
+      expect(input.takeLastWrite()).toBeNull()
+    })
   })
 
   describe('lifecycle', () => {

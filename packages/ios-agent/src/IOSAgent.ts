@@ -45,6 +45,22 @@ const INPUT_ERROR_MESSAGES: Record<InputErrorReason, string> = {
   'not-session-owner': 'this input was addressed to a session the sender does not hold',
 }
 
+// How long a phone's input ack waits for its runner's answer: under the 2 s a client (mcp-server) waits for the ack,
+// so a key that lands slowly is still answered rather than timed out. `input:type` has its own reply, waited 15 s.
+const RUNNER_ANSWER_WAIT_MS = 1_500
+const RUNNER_TYPE_WAIT_MS = 10_000
+
+/** The runner's refusal of `write` as prose, or null once it took it or `ms` passed without an answer. */
+async function runnerAnswer(write: Promise<void>, ms: number): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), ms) })
+  try {
+    return await Promise.race([write.then(() => null, (e: unknown) => (e instanceof Error ? e.message : String(e))), late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // A devicectl list answers in under a second (see `DevicectlWrapper`); a boot does not wait longer for a stuck one,
 // and neither does the 30 s re-read of the device list (#1085), which a hung CoreDevice must not stall.
 const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
@@ -52,8 +68,10 @@ const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
 /**
  * What a USB-connected iPhone or iPad cannot do yet, and what the requester is told. Each would otherwise reach a
  * simctl-only path — run against a hardware UDID it would fail with xcrun's noise at best — so it is refused up
- * front, through the reply that message type already uses for a failure. `input` is the exception: input on a phone
- * goes through its UI-test runner, and this is what a write is told while that runner is not ready.
+ * front, through the reply that message type already uses for a failure. `input` and `button` are the exceptions:
+ * input on a phone goes through its UI-test runner, and `input` is what a write is told while that runner is not
+ * ready (with the reason its last start failed, when it did — see `physicalInputMessage`); `button` is a hardware
+ * button the runner has no way to press.
  */
 const PHYSICAL_REFUSALS = {
   'full-erase': 'Full reset is not available on a USB-connected device',
@@ -64,7 +82,8 @@ const PHYSICAL_REFUSALS = {
   rotation: 'Rotation is not available on a USB-connected device yet',
   'open-url': 'Opening a URL on a USB-connected device is not supported yet',
   screenshot: 'Screenshots of a USB-connected device are not supported yet',
-  input: 'The UI-test runner on this USB-connected device is not ready — it is still starting, or its last start failed (see the agent log); retry in a moment',
+  input: 'The UI-test runner on this USB-connected device is not ready — it is still starting; retry in a moment',
+  button: 'cannot be pressed on a USB-connected device: XCUITest presses only home and the volume buttons',
   keyboard: 'The software keyboard cannot be shown or hidden on a USB-connected device',
 } as const
 type PhysicalRefusal = keyof typeof PHYSICAL_REFUSALS
@@ -2145,10 +2164,16 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * Safe to read at the ack site rather than inside the write, because iOS writes are synchronous —
    * but only for the question readiness answers. That is why ownership is asked separately.
    */
-  private refusalReason(helper: InputChannel | null, kind: 'continuation' | 'standalone'): InputErrorReason {
-    // Not `channel-unavailable`, which tells the caller to reconnect: no reconnect brings input to this device.
-    if (helper instanceof UnavailableInput) return 'unsupported'
+  private refusalReason(helper: InputChannel | null, kind: 'continuation' | 'standalone', fromWrite = true): InputErrorReason {
+    // First, and not `channel-unavailable` (which tells the caller to reconnect) nor `no-gesture` (which tells it to
+    // start another): an input the channel can never send — a pinch, a ⌘ chord, the side button on a phone — fails
+    // the same way however often it is retried. Only for a refusal a write just made (`fromWrite`): asked without
+    // one, the channel's last refusal is some earlier input's.
+    if (fromWrite && helper?.unsupportedReason?.()) return 'unsupported'
     const state = helper?.inputState() ?? 'unavailable'
+    // A phone whose runner failed and is being tried again: `channel-starting` is silent to the tester, and the next
+    // start is likely to fail the same way (no team set, a locked phone), so this says why rather than "a moment".
+    if (state === 'starting' && helper instanceof XCUITestInput && helper.runnerFailure()) return 'channel-unavailable'
     // No channel at all dominates: the caller must reconnect, and telling it to re-open a gesture
     // would send it round a loop that cannot succeed.
     if (state === 'unavailable') return 'channel-unavailable'
@@ -2172,15 +2197,51 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   // `requestId` is a parameter, never read from shared state: a gesture is dozens of frames and two can
   // overlap, so a correlator hoisted out of per-request scope would answer one input with another's id —
   // which is #499 rebuilt inside the agent. Same reason `seq` is passed in on the Android side.
-  private async ackInput(state: DeviceState, outcome: 'delivered' | InputErrorReason, requestId: string): Promise<void> {
-    const reason: InputErrorReason | null = outcome !== 'delivered'
+  //
+  // `message` overrides the prose, for a refusal no channel write produced. On a phone, a key, typed text or a button
+  // is answered once its runner has (see `XCUITestInput.takeLastWrite`, which hands over only those): the runner
+  // refuses a key with nothing focused (409), and `delivered` there would be a success the tester never got. The wait
+  // is capped below a client's own ack deadline (MCP's is 2 s), past which `delivered` stands, as it did before. Taken
+  // before the first await, so it is this write's request and not a later one's.
+  private async ackInput(state: DeviceState, outcome: 'delivered' | InputErrorReason, requestId: string, message?: string): Promise<void> {
+    const write = outcome === 'delivered' && state.touchHelper instanceof XCUITestInput ? state.touchHelper.takeLastWrite() : null
+    // Read now, while the refused write is still the channel's last.
+    const prose = outcome === 'delivered' ? undefined : message ?? this.inputErrorMessage(state, outcome)
+    let reason: InputErrorReason | null = outcome !== 'delivered'
       ? outcome
       : (state.booted || (await this.isBooted(state.deviceId))) ? null : 'not-booted'
-    if (reason === null) state.booted = true // cache the post-reconnect verify so later inputs skip simctl
+    let refused: string | undefined
+    if (reason === null && write) {
+      const failure = await runnerAnswer(write, RUNNER_ANSWER_WAIT_MS)
+      if (failure) {
+        reason = 'dispatch-failed'
+        refused = failure
+      }
+    }
+    if (outcome === 'delivered' && reason !== 'not-booted') state.booted = true // cache the post-reconnect verify so later inputs skip simctl
     this.sendMsg(
       reason === null
         ? { type: 'input:done', sessionId: state.sessionId, requestId }
-        : { type: 'input:error', sessionId: state.sessionId, requestId, message: (reason === 'unsupported' && this.physicalRefusal(state.deviceId, 'input')) || INPUT_ERROR_MESSAGES[reason], reason })
+        : { type: 'input:error', sessionId: state.sessionId, requestId, message: refused ?? prose ?? INPUT_ERROR_MESSAGES[reason], reason })
+  }
+
+  /** The prose for a refused input: on a phone, what its channel says about the refusal, else the reason's own. */
+  private inputErrorMessage(state: DeviceState, reason: InputErrorReason): string {
+    if (this.isPhysical(state.deviceId)) {
+      const unsupported = reason === 'unsupported' ? state.touchHelper?.unsupportedReason?.() : null
+      if (unsupported) return unsupported
+      if (reason === 'channel-unavailable' || reason === 'channel-starting') return this.physicalInputMessage(state)
+    }
+    return INPUT_ERROR_MESSAGES[reason]
+  }
+
+  /** Why a phone's runner is not taking input: the reason its last start failed (no team, a locked phone), or that it
+   *  is still starting. The agent log is on the agent's Mac, which the tester usually is not at. */
+  private physicalInputMessage(state: DeviceState): string {
+    const failure = state.touchHelper instanceof XCUITestInput ? state.touchHelper.runnerFailure() : null
+    return failure
+      ? `The UI-test runner on this USB-connected device did not start: ${failure}`
+      : PHYSICAL_REFUSALS.input
   }
 
   private async isBooted(deviceId: string): Promise<boolean> {
@@ -2441,11 +2502,23 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           break
         }
         // A physical device has no simctl pasteboard; its runner types the text into the focused field instead.
+        // Answered once the runner has: with nothing focused it refuses the text (409), and `input:type-done` then would
+        // tell the caller the field holds text it never got.
         if (this.isPhysical(state.deviceId)) {
-          const typed = !text || (state.touchHelper instanceof XCUITestInput && state.touchHelper.typeText(text))
-          this.sendMsg(typed
-            ? { type: 'input:type-done', sessionId, requestId }
-            : { type: 'input:type-error', sessionId, requestId, message: PHYSICAL_REFUSALS.input })
+          const helper = state.touchHelper
+          if (!text) {
+            this.sendMsg({ type: 'input:type-done', sessionId, requestId })
+            break
+          }
+          const write = helper instanceof XCUITestInput && helper.typeText(text) ? helper.takeLastWrite() : null
+          if (!write) {
+            this.sendMsg({ type: 'input:type-error', sessionId, requestId, message: this.physicalInputMessage(state) })
+            break
+          }
+          // Capped below MCP's 15 s wait for this reply; past it, done stands as it did before.
+          void runnerAnswer(write, RUNNER_TYPE_WAIT_MS).then((failure) => this.sendMsg(failure
+            ? { type: 'input:type-error', sessionId, requestId, message: failure }
+            : { type: 'input:type-done', sessionId, requestId }))
           break
         }
         // simctl pbcopy → Cmd+V paste. Works for arbitrary Unicode (unlike a
@@ -2543,8 +2616,20 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         // decision, and it is why iOS never sends `unsupported` for a button while Android does.
         let outcome: 'delivered' | InputErrorReason = btnHelper?.inputState() === 'ready'
           ? 'delivered'
-          : this.refusalReason(btnHelper, 'standalone')
-        if (chromeName === 'home') {
+          : this.refusalReason(btnHelper, 'standalone', false)
+        if (this.isPhysical(state.deviceId)) {
+          // A phone has no chrome to look its buttons up in, so they are mapped here. Pressed once, on release (or a
+          // phase-less press), like home below; a held button has no XCUITest equivalent. Any other button — the side
+          // button, the Action button — is refused rather than answered `delivered` having sent nothing.
+          const usage = chromeName === 'volume-up' ? 0xe9 : chromeName === 'volume-down' ? 0xea : undefined
+          if (chromeName !== 'home' && usage === undefined) {
+            void this.ackInput(state, 'unsupported', requestId, `The ${name} button ${PHYSICAL_REFUSALS.button}`)
+            break
+          }
+          if (phase !== 'down') {
+            outcome = wrote(chromeName === 'home' ? btnHelper?.pressLegacyButton(0) ?? false : btnHelper?.pressButton(0x0c, usage!) ?? false)
+          }
+        } else if (chromeName === 'home') {
           // Home has no HID down/up split — always a single legacy press. Send once on release
           // (or on a phase-less legacy message) so a down+up pair doesn't fire it twice.
           if (phase !== 'down') outcome = wrote(btnHelper?.pressLegacyButton(0) ?? false)
