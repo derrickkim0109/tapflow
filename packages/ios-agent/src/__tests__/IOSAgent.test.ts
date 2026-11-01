@@ -4116,6 +4116,32 @@ describe('IOSAgent', () => {
       await again.cancel()
     })
 
+    // The claim also goes when the capture itself ends: a helper that exits (an unplugged phone) or fails (Camera
+    // denied, a locked phone) must not keep the phone from being captured again. Mutations: drop the `release()` in
+    // the read's `catch`, or in its `done` branch — the next start for the phone is then refused for good.
+    it.each([
+      { name: 'fails', end: (c: ReadableStreamDefaultController<StreamFrame>) => c.error(new Error('helper exited')) },
+      { name: 'ends', end: (c: ReadableStreamDefaultController<StreamFrame>) => c.close() },
+    ])('allows a new capture of the same phone after its capture $name', async ({ end }) => {
+      const controllers: ReadableStreamDefaultController<StreamFrame>[] = []
+      const capture = vi.fn((): CaptureStreamer => ({
+        start: () => new ReadableStream<StreamFrame>({ start(c) { controllers.push(c) } }),
+        requestKeyframe: vi.fn(),
+        selectPanel: vi.fn(),
+      }))
+      const agent = new IOSAgent({ devicectl: devicectlWith([PHONE]), physicalCaptureFactory: capture }, mockSimctl(false))
+      type Capturing = { physicalCapture(udid: string, fps: number, codec: 'jpeg' | 'h264', maxSize: number): CaptureStreamer }
+      const internal = agent as unknown as Capturing
+      const first = internal.physicalCapture(PHONE.id, 30, 'h264', 0).start().getReader()
+      const read = first.read().then(() => 'ended', () => 'failed')
+      end(controllers[0]!)
+      await read
+      const again = internal.physicalCapture(PHONE.id, 30, 'h264', 0).start().getReader()
+      const pending = Promise.race([again.read().then(() => 'read', () => 'refused'), new Promise((r) => setTimeout(() => r('open'), 50))])
+      expect(await pending).toBe('open')
+      await again.cancel()
+    })
+
     // Mutation: default the factory to `ScreenCaptureStreamer` — a physical boot would then stream a simulator path.
     it('fails the boot, saying why, while this build has no physical capture', async () => {
       const ctx = await connected({ capture: null })

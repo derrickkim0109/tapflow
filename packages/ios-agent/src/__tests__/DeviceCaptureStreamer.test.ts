@@ -286,6 +286,48 @@ describe('DeviceCaptureStreamer', () => {
     await vi.advanceTimersByTimeAsync(60_000)
     await rejected
   })
+
+  // The helper deletes the nonce file once it has read it; one that never ran leaves it. Mutations: drop the unlink in
+  // `release` (a stream stopped after the launch leaves its nonce behind), or the one after `writeNonce` (a stream
+  // stopped while the file was being written does).
+  describe('the nonce file', () => {
+    beforeEach(() => { vi.useRealTimers() })
+    const settle = async (path: string) => {
+      for (let i = 0; i < 50 && existsSync(path); i++) await new Promise((r) => setTimeout(r, 10))
+    }
+
+    it('is removed when the stream is stopped after the helper was launched', async () => {
+      const { deps, launch } = harness()
+      const dir = mkdtempSync(join(tmpdir(), 'tapflow-nonce-'))
+      deps.writeNonce = (n) => writeNonceFile(n, dir)
+      const reader = new DeviceCaptureStreamer('00008140-0000000000000001', 30, 'h264', 1280, 'Test Phone', deps).start().getReader()
+      void reader.read().catch(() => {})
+      await vi.waitFor(() => expect(launch).toHaveBeenCalled())
+      const path = launch.mock.calls[0]![1][launch.mock.calls[0]![1].indexOf('--nonce-file') + 1]!
+      expect(existsSync(path)).toBe(true)
+      await reader.cancel()
+      await settle(path)
+      expect(existsSync(path)).toBe(false)
+    })
+
+    it('is removed when the stream was stopped while it was being written', async () => {
+      const { deps, launch } = harness()
+      const dir = mkdtempSync(join(tmpdir(), 'tapflow-nonce-'))
+      let written: (path: string) => void = () => {}
+      const path = new Promise<string>((r) => { written = r })
+      let finish: () => void = () => {}
+      const gate = new Promise<void>((r) => { finish = r })
+      deps.writeNonce = async (n) => { const p = await writeNonceFile(n, dir); written(p); await gate; return p }
+      const reader = new DeviceCaptureStreamer('00008140-0000000000000001', 30, 'h264', 1280, 'Test Phone', deps).start().getReader()
+      void reader.read().catch(() => {})
+      const file = await path
+      await reader.cancel()
+      finish()
+      await settle(file)
+      expect(existsSync(file)).toBe(false)
+      expect(launch).not.toHaveBeenCalled()
+    })
+  })
 })
 
 describe('ensureDeviceCaptureApp', () => {
@@ -362,5 +404,14 @@ describe('writeNonceFile', () => {
     expect(readFileSync(path, 'utf8')).toBe('ab'.repeat(16))
     expect(statSync(path).mode & 0o777).toBe(0o600)
     expect(path.startsWith(dir)).toBe(true)
+  })
+
+  // Mutation: drop `flag: 'wx'`. The write then goes through a file (or a link to one) another process put at the
+  // path first, and leaves this launch's nonce wherever that points.
+  it('refuses a path that already exists, leaving what is there', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tapflow-nonce-'))
+    writeFileSync(join(dir, 'taken'), 'someone else')
+    await expect(writeNonceFile('ab'.repeat(16), dir, 'taken')).rejects.toMatchObject({ code: 'EEXIST' })
+    expect(readFileSync(join(dir, 'taken'), 'utf8')).toBe('someone else')
   })
 })
