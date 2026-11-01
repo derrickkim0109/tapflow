@@ -14,10 +14,12 @@ import type { BrowserInbound } from '@/lib/types'
 // shipped: a tab stuck on "Starting device…", or a picture that has simply stopped updating (#426).
 const send = vi.fn<(msg: BrowserToRelay) => void>()
 let deliver: ((msg: BrowserInbound) => void) | null = null
+let frame: ((data: ArrayBuffer) => void) | undefined
 
 vi.mock('@/hooks/useRelay', () => ({
-  useRelay: (onMessage: (msg: BrowserInbound) => void) => {
+  useRelay: (onMessage: (msg: BrowserInbound) => void, onBinaryFrame?: (data: ArrayBuffer) => void) => {
     deliver = onMessage
+    frame = onBinaryFrame
     return { send, connected: true }
   },
 }))
@@ -94,6 +96,35 @@ describe('DeviceViewer correlates the lifecycle replies, selectively', () => {
     act(() => { deliver!({ type: 'device:boot-error', sessionId: 's1', message: 'scrcpy failed to restart' }) })
 
     expect(screen.getByText(/Boot failed: scrcpy failed to restart/)).toBeTruthy()
+  })
+
+  // Mutation: keep the report once frames arrive again. A phone that was locked and is unlocked streams again, and
+  // the card would go on saying the device failed for the rest of the session.
+  it('clears an uncorrelated report once frames arrive again, and only that kind', () => {
+    render(<DeviceViewer sessionId="s1" deviceId="dev-1" />)
+    join()
+    act(() => { deliver!({ type: 'device:boot-error', sessionId: 's1', message: 'Screen capture: no screen capture device' }) })
+    expect(screen.getByText(/Boot failed: Screen capture/)).toBeTruthy()
+    act(() => { frame!(new Uint8Array([0, 0, 0, 1, 0x65]).buffer) })
+    expect(screen.queryByText(/Boot failed/)).toBeNull()
+
+    // A boot that failed did not start a stream, so a stray frame does not take its report away.
+    join()
+    act(() => { deliver!({ type: 'device:boot-error', sessionId: 's1', requestId: lastBootId(), message: 'simctl boot failed' }) })
+    act(() => { frame!(new Uint8Array([0, 0, 0, 1, 0x65]).buffer) })
+    expect(screen.getByText(/Boot failed: simctl boot failed/)).toBeTruthy()
+  })
+
+  // Mutation: let a stream failure outrank the install. The tester who just picked a build would read about the
+  // screen while the install they are waiting on goes unmentioned.
+  it('says an install is under way rather than an earlier stream failure', () => {
+    render(<DeviceViewer sessionId="s1" deviceId="dev-1" buildId={7} />)
+    join()
+    act(() => { deliver!({ type: 'device:ready', sessionId: 's1', requestId: lastBootId(), payload: { deviceId: 'dev-1' } }) })
+    expect(installs()).toHaveLength(1)
+    act(() => { deliver!({ type: 'device:boot-error', sessionId: 's1', message: 'Screen capture: no screen capture device' }) })
+    expect(screen.getByText('Installing app…')).toBeTruthy()
+    expect(screen.queryByText(/Boot failed/)).toBeNull()
   })
 
   it('says nothing about a boot it has already replaced', () => {
