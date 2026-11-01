@@ -127,6 +127,7 @@ import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer
 import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
 import { DevicectlWrapper, AppIdentityMismatchError } from './DevicectlWrapper.js'
 import { DeviceCaptureStreamer, PermanentCaptureError } from './DeviceCaptureStreamer.js'
+import { XCUITestInput } from './XCUITestInput.js'
 import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
 import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio/audiotap-helper'
@@ -208,6 +209,8 @@ export interface IOSAgentOptions {
   devicectl?: DevicectlWrapper
   /** How a USB-connected device's screen is captured. Under vitest the default refuses rather than launch the app. */
   physicalCaptureFactory?: PhysicalCaptureFactory
+  /** A USB-connected device's input channel. Under vitest the default refuses rather than build the XCUITest runner. */
+  physicalInputFactory?: (deviceId: string) => InputChannel
 }
 
 // The postures of a multi-panel device (iPhone Duo), most closed first as the protocol requires. Two, not
@@ -304,6 +307,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private readonly simctl: SimctlWrapper
   private readonly devicectl: DevicectlWrapper
   private readonly physicalCaptureFactory: PhysicalCaptureFactory
+  private readonly physicalInputFactory: (deviceId: string) => InputChannel
   /** devicectl's name for each USB-connected device. The capture device's uniqueID is not the UDID (measured: a random
    *  UUID on an iPhone 16 Pro Max), so the capture helper finds the device by this name. */
   private readonly physicalNames = new Map<string, string>()
@@ -426,7 +430,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private readonly posturing = new Set<string>()
   // The posture last reported per device, so the poll reports only a change.
   private readonly reportedPosture = new Map<string, string | null>()
-  private readonly uiTreeReader = new XCUITreeReader()
+  private readonly uiTreeReader = new XCUITreeReader(undefined, { platformOf: (udid) => (this.isPhysical(udid) ? 'physical' : 'simulator') })
   // Holds a macOS power assertion while connected so the host doesn't idle-throttle the
   // simulator capture/encode when the Mac is unattended. No-op off macOS.
   private readonly sleepBlocker: SleepBlocker
@@ -466,6 +470,12 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     this.physicalCaptureFactory = options.physicalCaptureFactory ?? (process.env.VITEST
       ? physicalCaptureUnavailable
       : (udid, fps, codec, maxSize) => new DeviceCaptureStreamer(udid, fps, codec, maxSize, this.physicalNames.get(udid) ?? null, undefined, this.physicalListed === 1))
+    this.physicalInputFactory = options.physicalInputFactory ?? (process.env.VITEST
+      ? () => new UnavailableInput()
+      : (deviceId) => new XCUITestInput({
+        runner: this.uiTreeReader.inputClient(deviceId),
+        foregroundBundleId: () => this.lastBundleIds.get(deviceId) ?? null,
+      }))
     // **Never the real filter under vitest.** Layer 1 is a system extension installed on the
     // developer's Mac, and `arm()` runs on every boot — so a suite that booted a mock device was
     // launching the notarized container app and rewriting the host's live filter configuration, once
@@ -1727,7 +1737,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * answer success and land on a dark panel or nowhere.
    */
   private createInputChannel(deviceId: string): InputChannel {
-    if (this.isPhysical(deviceId)) return new UnavailableInput()
+    if (this.isPhysical(deviceId)) return this.physicalInputFactory(deviceId)
     if (!this.multiPanelDevices.has(deviceId)) return new TouchHelper(deviceId)
     this.ensureGuest(deviceId)
     return new FoldableInput({
@@ -2427,10 +2437,12 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           this.sendMsg({ type: 'input:type-error', sessionId, requestId, message: 'No booted device' })
           break
         }
-        // Typing goes through the pasteboard.
-        const typeRefusal = this.physicalRefusal(state.deviceId, 'clipboard')
-        if (typeRefusal) {
-          this.sendMsg({ type: 'input:type-error', sessionId, requestId, message: typeRefusal })
+        // A physical device has no simctl pasteboard; its runner types the text into the focused field instead.
+        if (this.isPhysical(state.deviceId)) {
+          const typed = !text || (state.touchHelper instanceof XCUITestInput && state.touchHelper.typeText(text))
+          this.sendMsg(typed
+            ? { type: 'input:type-done', sessionId, requestId }
+            : { type: 'input:type-error', sessionId, requestId, message: PHYSICAL_REFUSALS.input })
           break
         }
         // simctl pbcopy → Cmd+V paste. Works for arbitrary Unicode (unlike a
