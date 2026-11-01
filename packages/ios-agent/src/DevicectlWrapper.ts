@@ -75,12 +75,39 @@ export function parsePhysicalDevices(doc: unknown): Device[] {
   return devices
 }
 
-/** Whether an app with `bundleId` is in a `devicectl device info apps -j` document. */
-export function parseAppInstalled(doc: unknown, bundleId: string): boolean {
+/** An app installed on a device, as `devicectl device info apps` describes it. */
+export interface InstalledApp {
+  /** `CFBundleShortVersionString (CFBundleVersion)` as far as devicectl reports them. */
+  version?: string
+}
+
+/** The app with `bundleId` in a `devicectl device info apps -j` document, or null when it is not there. */
+export function parseInstalledApp(doc: unknown, bundleId: string): InstalledApp | null {
   const result = isObj(doc) ? doc.result : undefined
   const apps = isObj(result) && Array.isArray(result.apps) ? result.apps : []
-  return apps.some((a) => isObj(a) && a.bundleIdentifier === bundleId)
+  const app = apps.find((a): a is Obj => isObj(a) && a.bundleIdentifier === bundleId)
+  if (!app) return null
+  const short = str(app.version)
+  const build = str(app.bundleVersion)
+  const version = short && build ? `${short} (${build})` : short ?? build
+  return version ? { version } : {}
 }
+
+/**
+ * Whether a refused install was refused because the build cannot replace the copy already on the device: a build
+ * signed for another App ID prefix or team than the installed one (a development or ad-hoc build over the App Store
+ * or TestFlight copy, or the other way round). installd says so in the error devicectl passes on, as
+ * `MismatchedApplicationIdentifierEntitlement` or in prose ("… does not match installed application's …; rejecting
+ * upgrade"). Only this failure is cured by removing the installed copy first; anything else (a profile without the
+ * device, an expired certificate, a locked phone) fails the same way again, after the tester's copy is gone.
+ */
+export function isIdentityMismatch(e: unknown): boolean {
+  const text = [isObj(e) && typeof e.stderr === 'string' ? e.stderr : '', e instanceof Error ? e.message : String(e)].join('\n')
+  return /MismatchedApplicationIdentifierEntitlement|does not match (the )?installed application|rejecting upgrade/i.test(text)
+}
+
+/** An install refused only because the installed copy is signed differently (see `isIdentityMismatch`). */
+export class AppIdentityMismatchError extends PlatformError {}
 
 /** An Info.plist (as JSON) read as `AppBundleInfo`: `iPhoneOS` in `CFBundleSupportedPlatforms` is a device build. */
 export function parseAppBundleInfo(plist: unknown): AppBundleInfo {
@@ -118,23 +145,25 @@ export class DevicectlWrapper {
     }
   }
 
-  /** Whether `bundleId` is installed on the device. `--include-all-apps`: by default devicectl lists only apps a
+  /** `bundleId` as installed on the device, or null. `--include-all-apps`: by default devicectl lists only apps a
    *  developer built, and one from TestFlight or the App Store would read as missing. */
-  async isAppInstalled(udid: string, bundleId: string): Promise<boolean> {
+  async installedApp(udid: string, bundleId: string): Promise<InstalledApp | null> {
     try {
       const out = await this.exec(['devicectl', 'device', 'info', 'apps', '--device', udid, '--bundle-id', bundleId, '--include-all-apps', '-j', '-', '-q'])
-      return parseAppInstalled(JSON.parse(out), bundleId)
+      return parseInstalledApp(JSON.parse(out), bundleId)
     } catch (e) {
       throw devicectlFailure(`could not list the apps on ${udid}`, e)
     }
   }
 
-  /** Installs a device-signed `.app` on the device. */
+  /** Installs a device-signed `.app` on the device, over the installed copy of the same app (its data is kept). Rejects
+   *  with `AppIdentityMismatchError` when that copy is signed so differently that it has to be removed first. */
   async installApp(udid: string, appPath: string): Promise<void> {
     try {
       await this.exec(['devicectl', 'device', 'install', 'app', '--device', udid, appPath, '-q'], INSTALL_TIMEOUT_MS)
     } catch (e) {
-      throw devicectlFailure('install failed', e)
+      const failure = devicectlFailure('install failed', e)
+      throw isIdentityMismatch(e) ? new AppIdentityMismatchError(failure.message) : failure
     }
   }
 

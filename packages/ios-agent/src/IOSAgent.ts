@@ -121,7 +121,7 @@ import {
 } from '@tapflowio/agent-core'
 import { ScreenCaptureStreamer, type StreamFrame } from './ScreenCaptureStreamer.js'
 import type { CaptureStreamer, PhysicalCaptureFactory } from './CaptureStreamer.js'
-import { DevicectlWrapper } from './DevicectlWrapper.js'
+import { DevicectlWrapper, AppIdentityMismatchError } from './DevicectlWrapper.js'
 import { UnavailableInput } from './UnavailableInput.js'
 import { AudioCaptureStreamer, readSimVolume, applyGain } from './AudioCaptureStreamer.js'
 import { ensureHelperApp, launchAudioHelper, isAudioSupported } from '@tapflowio/audiotap-helper'
@@ -2142,7 +2142,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
           break
         }
         this.installBuild(installState.deviceId, filePath, bundleId, { buildTicket, buildName, buildBytes })
-          .then(() => respond({ type: 'app:install-done' }))
+          .then((warning) => respond(warning ? { type: 'app:install-done', warning } : { type: 'app:install-done' }))
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e)
             respond({ type: 'app:install-error', message })
@@ -2841,13 +2841,14 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    * .app.zip / .tar.gz(.tgz) 이면 임시 디렉토리에 풀어 .app 경로로 설치, 그 외(.apk 등)는
    * 직접 설치. tar 추출은 실행 비트·심볼릭 링크를 보존하고(재압축이 아니라 네이티브 보관),
    * macOS tar(libarchive)가 path traversal·symlink 탈출을 기본 차단한다. 완료 후 임시 정리.
+   * Resolves with a warning for the requester when the app is ready but is not the build sent (see `installOnPhone`).
    */
   private async installBuild(
     udid: string,
     filePath: string,
     bundleId?: string,
     remote?: { buildTicket?: string; buildName?: string; buildBytes?: number },
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const tmpDir = path.join(tmpdir(), `tapflow-install-${randomUUID()}`)
     fs.mkdirSync(tmpDir, { recursive: true })
     try {
@@ -2878,7 +2879,8 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       if (bundleId) {
         await this.simctl.uninstallApp(udid, bundleId).catch(() => { /* 미설치 상태면 무시 */ })
       }
-      return await this.installFrom(udid, source, tmpDir)
+      await this.installFrom(udid, source, tmpDir)
+      return undefined
     } finally {
       // Async for the same reason as the extraction: a large .app is a lot of files to unlink.
       await fs.promises.rm(tmpDir, { recursive: true, force: true })
@@ -2896,26 +2898,38 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
 
   /**
    * A USB-connected device takes only a device-signed build: an `.ipa` (what Firebase App Distribution and an
-   * ad-hoc or development export produce), or an archived `.app` built for iphoneos. Installed clean, as on a
-   * simulator. A simulator build cannot run there, but the same app is often already on the phone from TestFlight
-   * or Firebase, so that copy is used when it is.
+   * ad-hoc or development export produce), or an archived `.app` built for iphoneos. A simulator build cannot run
+   * there, but the same app is often already on the phone from TestFlight or Firebase, so that copy is used when it
+   * is — and the answer says so (the returned warning), since the tester is then not testing the build they sent.
+   *
+   * **Installed over the copy on the phone, not after removing it.** On a simulator a clean install costs nothing
+   * that cannot be rebuilt; on a phone a refused install is common (a profile without this device, an expired
+   * certificate, a locked phone), and removing first would leave the tester with neither app nor its data. Only the
+   * refusal that removing cures — the installed copy signed for another App ID or team — removes it, once.
    */
-  private async installOnPhone(udid: string, source: string, tmpDir: string, bundleId?: string): Promise<void> {
+  private async installOnPhone(udid: string, source: string, tmpDir: string, bundleId?: string): Promise<string | undefined> {
     const lower = source.toLowerCase()
     const archived = ['.ipa', '.zip', '.tar.gz', '.tgz'].some((ext) => lower.endsWith(ext))
     const appPath = archived ? await this.extractApp(source, tmpDir) : source
     const info = await this.devicectl.appBundleInfo(appPath)
     const id = bundleId ?? info.bundleId
     if (info.platform !== 'simulator') {
-      // Only a build known to be for a device is worth removing the installed copy for: one whose Info.plist could
-      // not be read may still be refused, and the tester would be left with neither.
-      if (id && info.platform === 'device') await this.devicectl.uninstallApp(udid, id).catch(() => { /* not installed */ })
-      await this.devicectl.installApp(udid, appPath)
-      return
+      try {
+        await this.devicectl.installApp(udid, appPath)
+      } catch (e) {
+        if (!(e instanceof AppIdentityMismatchError) || !id) throw e
+        logger.warn(`${id} on ${udid} is signed differently from this build; removing it to install the build`)
+        await this.devicectl.uninstallApp(udid, id)
+        await this.devicectl.installApp(udid, appPath)
+      }
+      return undefined
     }
-    if (id && await this.devicectl.isAppInstalled(udid, id)) {
-      logger.info(`${id}: a simulator build cannot be installed on ${udid}; using the copy already installed there`)
-      return
+    const installed = id ? await this.devicectl.installedApp(udid, id) : null
+    if (id && installed) {
+      const warning = `This is a simulator build, which cannot run on a USB-connected device, so the ${id} already on the phone`
+        + `${installed.version ? ` (version ${installed.version})` : ''} is used instead — you are not testing the build you sent. Upload its device build (.ipa) to test that one.`
+      logger.warn(`${udid}: ${warning}`)
+      return warning
     }
     throw new ValidationError(
       `Install ${id ?? 'the app'} on the phone first (TestFlight or Firebase App Distribution), or upload its device build (.ipa); tapflow cannot install a simulator build on a device`,
@@ -2977,7 +2991,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
    *  alias, which would quietly act on whichever simulator happened to be up. */
   async installApp(appPath: string): Promise<void> {
     const deviceId = await this.soleLiveDeviceId()
-    if (this.isPhysical(deviceId)) return this.installBuild(deviceId, appPath)
+    if (this.isPhysical(deviceId)) {
+      // This interface has no way to carry the warning; `installOnPhone` has logged it.
+      await this.installBuild(deviceId, appPath)
+      return
+    }
     await this.simctl.installApp(deviceId, appPath)
   }
   // ── network control (#607) ─────────────────────────────────────────────────
