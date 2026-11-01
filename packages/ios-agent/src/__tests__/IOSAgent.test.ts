@@ -4037,7 +4037,7 @@ describe('IOSAgent', () => {
     it('still registers the simulators when devicectl fails', async () => {
       const failing = new DevicectlWrapper(() => Promise.reject(new Error('devicectl not found')))
       const sent: Sent[] = []
-      const agent = new IOSAgent({ devicectl: failing }, mockSimctl(false))
+      const agent = new IOSAgent({ devicectl: failing, physicalCaptureFactory: vi.fn(fakeCapture) }, mockSimctl(false))
       const internal = agent as unknown as Internals
       const orig = internal.sendOn.bind(agent)
       internal.sendOn = (ws, m) => { sent.push(m as Sent); orig(ws, m) }
@@ -4050,7 +4050,7 @@ describe('IOSAgent', () => {
     // Mutation: drop `deviceFilter` from the merged list — a filter naming one simulator would expose the phone too.
     it('applies deviceFilter to the USB-connected devices as well', async () => {
       const sent: Sent[] = []
-      const agent = new IOSAgent({ deviceFilter: 'iPhone 15', devicectl: devicectlWith([PHONE]) }, mockSimctl(false))
+      const agent = new IOSAgent({ deviceFilter: 'iPhone 15', devicectl: devicectlWith([PHONE]), physicalCaptureFactory: vi.fn(fakeCapture) }, mockSimctl(false))
       const internal = agent as unknown as Internals
       const orig = internal.sendOn.bind(agent)
       internal.sendOn = (ws, m) => { sent.push(m as Sent); orig(ws, m) }
@@ -4093,15 +4093,30 @@ describe('IOSAgent', () => {
       agent.disconnect()
     })
 
-    // Mutation: default the factory to `ScreenCaptureStreamer` — a physical boot would then stream a simulator path.
-    it('fails the boot, saying why, while this build has no physical capture', async () => {
-      const ctx = await connected({ capture: null })
-      ctx.deliver({ type: 'device:boot', requestId: 'rq-nocap', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
-      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:boot-error')).toBe(true))
-      expect(ctx.sent.find((m) => m.type === 'device:boot-error')?.message).toMatch(/Physical iPhone screen capture is not available in this build/)
-      expect(ctx.sent.some((m) => m.type === 'device:ready')).toBe(false)
-      expect(vi.mocked(ScreenCaptureStreamer)).not.toHaveBeenCalledWith(PHONE.id, expect.anything(), expect.anything(), expect.anything(), expect.anything())
-      ctx.agent.disconnect()
+    // Mutation: drop the gate at the top of `listAllDevices` — a build with no physical capture then lists a phone
+    // whose every boot fails.
+    it('offers no phone, and asks devicectl nothing, while this build has no physical capture', async () => {
+      const devicectl = devicectlWith([PHONE])
+      const sent: Sent[] = []
+      const agent = new IOSAgent({ devicectl }, mockSimctl(false))
+      const internal = agent as unknown as Internals
+      const orig = internal.sendOn.bind(agent)
+      internal.sendOn = (ws, m) => { sent.push(m as Sent); orig(ws, m) }
+      await agent.connect(`ws://localhost:${port}`)
+      const register = sent.find((m) => m.type === 'agent:register') as unknown as { devices: Array<{ id: string }> }
+      expect(register.devices.map((d) => d.id)).toEqual(['dev-1'])
+      expect(devicectl.listPhysicalDevices).not.toHaveBeenCalled()
+      agent.disconnect()
+    })
+
+    // Mutation: register with devicectl's default timeout — on a Mac with a wedged CoreDevice every register, a
+    // simulator-only one too, then waits out 15 s.
+    it('bounds the devicectl list a register waits on', async () => {
+      const devicectl = devicectlWith([PHONE])
+      const agent = new IOSAgent({ devicectl, physicalCaptureFactory: vi.fn(fakeCapture) }, mockSimctl(false))
+      await agent.connect(`ws://localhost:${port}`)
+      expect(devicectl.listPhysicalDevices).toHaveBeenCalledWith(3_000)
+      agent.disconnect()
     })
 
     // Mutation: remove either refusal in `bootPhysical` — a Full reset or a run reset would answer ready having done
@@ -4296,7 +4311,7 @@ describe('IOSAgent', () => {
     // phone, and its `boot`/`shutdown` would hand a hardware UDID to simctl.
     it('the DeviceAgent delegates list the phone and never pass it to simctl', async () => {
       const simctl = mockSimctl(false)
-      const agent = new IOSAgent({ devicectl: devicectlWith([PHONE]) }, simctl)
+      const agent = new IOSAgent({ devicectl: devicectlWith([PHONE]), physicalCaptureFactory: vi.fn(fakeCapture) }, simctl)
       expect((await agent.listDevices()).map((d) => [d.id, d.kind])).toEqual([['dev-1', 'simulator'], [PHONE.id, 'physical']])
       await agent.boot(PHONE.id)
       await agent.shutdown(PHONE.id)

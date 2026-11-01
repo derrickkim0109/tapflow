@@ -130,6 +130,9 @@ function devicectlFailure(what: string, e: unknown): PlatformError {
 }
 
 export class DevicectlWrapper {
+  /** Whether a failed device list has been logged as a warning yet (see `listPhysicalDevices`). */
+  private listFailureWarned = false
+
   constructor(
     private readonly exec: XcrunExec = defaultExec,
     private readonly readPlist: PlistReader = defaultPlistReader,
@@ -204,7 +207,11 @@ export class DevicectlWrapper {
       return parsePhysicalDevices(JSON.parse(await (timeoutMs === undefined ? this.exec(args) : this.exec(args, timeoutMs))))
     } catch (e) {
       if (options.rejectOnFailure) throw e
-      logger.warn(`physical devices unavailable: ${e instanceof Error ? e.message : String(e)}`)
+      // Every boot and register asks, so a Mac without devicectl (or with a failing one) says so once, not each time.
+      const message = `physical devices unavailable: ${e instanceof Error ? e.message : String(e)}`
+      if (this.listFailureWarned) logger.debug(message)
+      else logger.warn(message)
+      this.listFailureWarned = true
       return []
     }
   }
