@@ -76,6 +76,7 @@ const enSidebar = [
           { text: 'Agents', link: '/operate/agents' },
           { text: 'iOS network extension', link: '/operate/network-extension' },
           { text: 'Android phones over USB', link: '/operate/android-usb-devices' },
+          { text: 'USB-connected iPhones', link: '/operate/usb-iphone' },
         ],
       },
       {
@@ -191,6 +192,7 @@ const koSidebar = [
           { text: '에이전트 설정', link: '/ko/operate/agents' },
           { text: 'iOS 네트워크 확장', link: '/ko/operate/network-extension' },
           { text: 'USB로 연결한 Android 폰', link: '/ko/operate/android-usb-devices' },
+          { text: 'USB로 연결한 iPhone', link: '/ko/operate/usb-iphone' },
         ],
       },
       {

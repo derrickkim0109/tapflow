@@ -45,6 +45,7 @@
 - [Agent Setup](https://www.tapflow.dev/operate/agents): Start the Mac agent and connect it to the relay. listing and creating devices for iOS and Android, and authenticating a remote agent with a PAT.
 - [iOS Network Extension](https://www.tapflow.dev/operate/network-extension): Install and approve the network extension that iOS network control needs on the agent Mac, and recover when replacing it cuts the Mac off or a device comes back online by itself.
 - [Android Phones over USB](https://www.tapflow.dev/operate/android-usb-devices): Open an Android phone plugged into the agent Mac like an emulator: the TAPFLOW_ANDROID_USB_DEVICES switch (off by default), turning on and authorizing USB debugging, what a phone refuses, and the rotation setting that comes back when a session ends.
+- [USB-connected iPhones](https://www.tapflow.dev/operate/usb-iphone): Prepare an iPhone plugged into the agent Mac by USB — Developer Mode, `TAPFLOW_IOS_TEAM_ID` for the runner's signing, the Camera permission for screen capture, Auto-Lock — how builds install over the copy on the phone, and what a phone cannot do.
 
 ### Deploy the relay
 
