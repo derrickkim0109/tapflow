@@ -122,7 +122,9 @@ at the ack site instead, which is safe because writes here are synchronous.
 
 An unmapped **button** still answers success: the device genuinely has no such button (#484). An
 unmapped **key code** answers `unsupported` and keeps its existing prose, which names the code. That
-asymmetry is a decision, and it is why iOS never sends `unsupported` for a button while Android does.
+asymmetry is a decision, and it is why iOS never sends `unsupported` for a simulator's button while Android does.
+A USB-connected phone is the exception: it has no chrome, so `input:button` maps home and volume itself and answers
+`unsupported` for any other button (the side button, the Action button), which XCUITest cannot press.
 
 ### The device list is re-read every 30 s (#1085)
 
@@ -315,8 +317,8 @@ The iOS UI tree comes from a resident **XCUITest runner** that runs *inside* the
 - Source: `xctest-runner/` — xcodegen `project.yml` → **committed `.xcodeproj`** (no xcodegen at runtime).
   - `TreeHost` — minimal host app the UI-test target attaches to.
   - `TreeRunner` — the UI-test target: `TreeServer.swift` opens an `NWListener` HTTP server; `TreeServerTest.swift` starts it and blocks so the process stays resident.
-- Protocol: `GET /health` → the token the host passed (readiness, and proof the runner is ours); `GET /tree?bundleId=<id>` → the app's `XCUIApplication.debugDescription` (text); and the input routes `GET /tap`, `GET /drag`, `POST /type`, `GET /key`, which need the `X-Tapflow-Token` header (see `TreeServer.swift` for the parameters). The simulator shares `localhost` with the host (WDA pattern), so the host reaches the in-simulator server directly.
-- **On a USB-connected device** the runner is built for `platform=iOS` into `xctest-runner/build-iphoneos/` (gitignored, its own stamp, which includes the team and bundle prefix), started with `TEST_RUNNER_TAPFLOW_TREE_BIND_ANY=1`, and binds `::` — the device's loopback is not the Mac's, so the host reaches it at the device's CoreDevice tunnel address (`devicectl device info details` → `connectionProperties.tunnelIPAddress`). Bound beyond loopback, every route needs the token, and a runner with no token refuses everything. A request whose `Content-Length` is negative or over 1 MiB is dropped, because the runner is reachable from the device's Wi-Fi; so is a head over 8 KiB or a connection that has not sent a whole request in 10 s, and bound beyond loopback a caller without the token is answered 401 as soon as its head is in, before any body is read. Typing looks for the focused field in the named app, else in whichever app the accessibility layer reports active (WebDriverAgent's private `activeApplications` / `applicationWithPID:`, each behind `responds(to:)`), then SpringBoard.
+- Protocol: `GET /health` → the token the host passed (readiness, and proof the runner is ours); `GET /tree?bundleId=<id>` → the app's `XCUIApplication.debugDescription` (text); and the input routes `GET /tap`, `GET /drag`, `POST /type`, `GET /key`. Every route, `/health` and `/tree` included, needs the `X-Tapflow-Token` header (see `TreeServer.swift` for the parameters). The simulator shares `localhost` with the host (WDA pattern), so the host reaches the in-simulator server directly.
+- **On a USB-connected device** the runner is built for `platform=iOS` into `xctest-runner/build-iphoneos/` (gitignored, its own stamp, which includes the team and bundle prefix), started with `TEST_RUNNER_TAPFLOW_TREE_BIND_ANY=1`, and binds `::` — the device's loopback is not the Mac's, so the host reaches it at the device's CoreDevice tunnel address (`devicectl device info details` → `connectionProperties.tunnelIPAddress`). Every route needs the token, on a simulator's loopback too (its `/health` used to hand the token to any local caller, which opened the input routes), and bound beyond loopback a runner with no token refuses everything. A request whose `Content-Length` is negative, not a number or over 1 MiB is dropped, because the runner is reachable from the device's Wi-Fi; so is a head over 8 KiB, whether or not it has ended, or a connection that has not sent a whole request in 10 s, and bound beyond loopback a caller without the token is answered 401 as soon as its head is in, before any body is read. Typing looks for the focused field in the named app, else in whichever app the accessibility layer reports active (WebDriverAgent's private `activeApplications` / `applicationWithPID:`, each behind `responds(to:)`), then SpringBoard.
 - **One runner per simulator, on a port the runner picks.** The host passes `TEST_RUNNER_TAPFLOW_TREE_PORT=0` and `TEST_RUNNER_TAPFLOW_TREE_TOKEN` (xcodebuild strips the prefix; without it nothing arrives). The runner prints `TAPFLOW_TREE_READY port=<n>` once it is listening, and the host reads that line from xcodebuild's stdout (so no `-quiet`, and the pipe is drained for the runner's life), then requires `/health` to answer with its token. A fixed port let a runner that lost its port still look ready, while another simulator's runner answered every request: measured, not theoretical.
 - `XCUITreeReader.ts` builds the runner (`build-for-testing`, cached under `xctest-runner/build/`, gitignored) and rebuilds when `build/tapflow-runner.stamp` no longer matches the runner sources, the checked-in project and `xcodebuild -version`. It launches one runner per device (`test-without-building`, resident), then fetches `/tree` from that device's port. Faults on one device (a refused read, a start that never answered) drop only that device's runner. `xcuiTree.ts` parses the debugDescription text into the unified schema — kept a **pure function** so it stays unit-testable against the `xcuiTree.test.ts` fixture (Open Q9: a future Xcode format change fails there).
 - Queries by bundleId: the reader needs the foreground app's bundleId, tracked in `IOSAgent.lastBundleIds` on `app:launch` — deliberately outside `DeviceState`, so it survives a relay reconnect that rebuilds that map. `readUITree` throws an actionable `PlatformError` if no app has been launched — never a silent empty tree.
@@ -349,11 +351,16 @@ plugged in again, it gets a fresh session.
 - **Capture**: `DeviceCaptureStreamer` launches `device-capture-helper.app` with `open` (a LaunchServices launch
   is the only way to hold the Camera TCC grant a screen-capture device needs). The bundle is built (async) and ad-hoc
   signed on first use from `src/device-capture-helper.swift`, which ships in the package for that reason, into
-  `~/Library/Caches/tapflow`, gated on a hash of the source; it is never packed. The helper opens its loopback
-  connection with a per-launch `--nonce` (any other connection is closed), then a status byte, then frames — or,
-  after a failure status, why as text. It matches the phone by name and refuses (71) when two attached devices have
+  `~/Library/Caches/tapflow`, gated on a hash of the source and the swiftc/codesign flags; it is never packed. The
+  helper opens its loopback connection with a per-launch nonce (any other connection is closed), then a status byte,
+  then frames — or, after a failure status, why as text. The nonce is never in argv, which any local user can read:
+  it is written to a 0600 file in the cache (`--nonce-file`), which the helper reads and deletes. The status byte is
+  queued before any frame, and the devices the helper saw when it found no match stay in its own log. Every frame
+  header is checked against a 64 MiB cap, a zero-length H.264 frame fails the stream, and an empty frame is not
+  forwarded. The helper has no single-instance check of its own, so `IOSAgent.physicalCapture` allows one capture
+  per phone in the agent: a second (`stream()` while the session streams) fails at once. It matches the phone by name and refuses (71) when two attached devices have
   it; it falls back to the only iOS capture device only with `--sole` (the agent lists one phone). A Camera denial or
-  an ambiguous name is not restarted (`PermanentCaptureError`); that, or a second frameless failure in a row, is sent
+  an ambiguous name is not restarted (`PermanentCaptureError`), and neither is a failed helper build; that, or a second frameless failure in a row, is sent
   to the session as an uncorrelated `device:boot-error`.
 - **Input**: `XCUITestInput`, through the device's XCUITest runner (see the runner section) — SimulatorKit HID does
   not reach hardware. A touch is buffered and sent as one `/tap` or `/drag` when it ends; pinches, held buttons, the
@@ -361,7 +368,10 @@ plugged in again, it gets a fresh session.
   for them. A phone has no chrome, so `input:button` maps home and volume itself and refuses any other button. An
   ack waits for the runner's answer to the request the write sent (`takeLastWrite`), so a refusal (409, nothing
   focused) is `dispatch-failed`, and `input:type` answers only once the runner has. A refusal because the runner is
-  not up says why its last start failed (`RunnerInputClient.lastError`). The runner needs `TAPFLOW_IOS_TEAM_ID`
+  not up says why its last start failed (`RunnerInputClient.lastError`). Its reason is `channel-unavailable`, which on
+  a phone means that start failed, not that the channel is gone: each input tries the runner again, so a retry helps
+  once the cause is fixed, and the message says so (`channel-starting` would be silent in the dashboard). After a
+  failed device build, no build is tried again for that phone, team and prefix for 60 s. The runner needs `TAPFLOW_IOS_TEAM_ID`
   (and, for a team that cannot register `dev.tapflow.*`, `TAPFLOW_IOS_BUNDLE_PREFIX`); its device build stamp
   records the devices it was built for, and a phone not among them rebuilds it.
 - **The first device build changes the team's Apple developer account.** It runs with `-allowProvisioningUpdates`,

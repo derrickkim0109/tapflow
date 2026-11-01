@@ -29,7 +29,7 @@ tapflow agent start
 
 | 변수 | 설명 |
 |---|---|
-| `TAPFLOW_IOS_TEAM_ID` | 러너를 서명할 Apple 개발자 팀 ID(10자). 없으면 화면은 미러링되지만 입력이 거절되고, 대시보드는 이 변수를 지정하라고 알려 줍니다. `security find-identity -v -p codesigning`이 보여 주는 서명 인증서의 괄호 안 값이 팀 ID입니다. |
+| `TAPFLOW_IOS_TEAM_ID` | 러너를 서명할 Apple 개발자 팀 ID(10자). 없으면 화면은 미러링되지만 입력이 거절되고, 대시보드는 이 변수를 지정하라고 알려 줍니다. developer.apple.com/account의 **Membership details**에서 확인하거나, 서명 인증서의 `OU=` 값을 읽습니다: `security find-certificate -c "Apple Development" -p \| openssl x509 -noout -subject`. `security find-identity`가 Apple Development 인증서 뒤 괄호 안에 보여 주는 값은 팀 ID가 아닙니다. |
 | `TAPFLOW_IOS_BUNDLE_PREFIX` | 러너의 번들 ID 접두사. 기본값 `dev.tapflow`. App ID는 모든 Apple 팀을 통틀어 하나뿐이라, 다른 팀이 이미 `dev.tapflow.treerunner.*`를 등록했다면 `com.example.tapflow`처럼 자기 팀이 쓰는 접두사를 지정합니다. |
 
 맥의 Xcode에 그 팀의 계정으로 로그인돼 있어야 합니다(**Xcode › Settings › Accounts**).

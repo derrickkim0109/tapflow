@@ -8,15 +8,16 @@ import XCTest
 // the only input path: SimulatorKit's HID injection does not reach hardware.
 //
 // Routes:
-//   GET  /health                          → the token the host passed, or "ok" without one (readiness probe)
+//   GET  /health                          → the token the host passed, to a caller that sent it; "ok" without one (readiness probe)
 //   GET  /tree?bundleId=<id>              → the app's XCUIApplication.debugDescription (text)
 //   GET  /tap?x=&y=                       → tap at a point normalized to the screen (0–1)
 //   GET  /drag?x1=&y1=&x2=&y2=&ms=        → press at (x1,y1) and drag to (x2,y2) over ms; equal points = long press
 //   POST /type[?bundleId=]                → type the UTF-8 body into the element with keyboard focus
 //   GET  /key?name=<name>[&bundleId=]     → return | delete | tab | home | volumeUp | volumeDown (device only)
-// Input routes answer JSON — {"ok":true} or {"ok":false,"error":"…"} — and need the `X-Tapflow-Token`
-// header whenever the host passed a token (it always does). Bound beyond loopback (TAPFLOW_TREE_BIND_ANY),
-// /health and /tree need it too, and with no token there every route is refused.
+// Input routes answer JSON — {"ok":true} or {"ok":false,"error":"…"}. Every route needs the `X-Tapflow-Token`
+// header whenever the host passed a token (it always does), on loopback too: any local process can reach a
+// simulator's loopback port, and a /health that handed the token to whoever asked would open the input routes
+// to it. Bound beyond loopback (TAPFLOW_TREE_BIND_ANY) with no token, every route is refused.
 final class TreeServer {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "dev.tapflow.treeserver")
@@ -141,6 +142,8 @@ final class TreeServer {
 
     private static func parse(_ buf: Data) -> Parsed {
         guard let sep = buf.range(of: Data("\r\n\r\n".utf8)) else { return .incomplete(headers: nil) }
+        // A head over the limit is refused even when it arrived whole, in one read with its terminator.
+        guard sep.lowerBound - buf.startIndex <= headLimit else { return .invalid }
         guard let head = String(data: buf[..<sep.lowerBound], encoding: .utf8) else { return .invalid }
         let lines = head.components(separatedBy: "\r\n")
         let parts = (lines.first ?? "").split(separator: " ")
@@ -150,7 +153,9 @@ final class TreeServer {
             let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
             headers[name] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         }
-        let length = Int(headers["content-length"] ?? "0") ?? 0
+        // A Content-Length that is not a number is refused, not read as 0: that would answer a request whose body is
+        // still arriving, and take the body for the next request's head.
+        guard let length = Int(headers["content-length"] ?? "0") else { return .invalid }
         // A negative length would pass the check below and trap in `prefix`, killing the runner for any caller.
         guard length >= 0 && length <= bodyLimit else { return .invalid }
         let body = buf[sep.upperBound...]
@@ -189,14 +194,14 @@ final class TreeServer {
         let path = request.path
         let text = "text/plain; charset=utf-8"
         if path.hasPrefix("/health") {
-            // The token tells the host this is the runner it started, not one another agent left on the port.
-            // Beyond loopback anyone on the device's network could ask, so there it answers only a caller that
-            // already holds it.
-            if bindAny && !authorized(request) { return ("401 Unauthorized", text, "unauthorized") }
+            // The token tells the host this is the runner it started, not one another agent left on the port. It is
+            // answered only to a caller that already holds it, in every mode: on a simulator any local process can
+            // reach this port, and the token is what gates the input routes.
+            if !authorized(request) { return ("401 Unauthorized", text, "unauthorized") }
             return ("200 OK", text, token.isEmpty ? "ok" : token)
         }
         if path.hasPrefix("/tree") {
-            if bindAny && !authorized(request) { return ("401 Unauthorized", text, "unauthorized") }
+            if !authorized(request) { return ("401 Unauthorized", text, "unauthorized") }
             guard let bundleId = Self.query(path, "bundleId"), !bundleId.isEmpty else {
                 return ("400 Bad Request", text, "missing bundleId")
             }

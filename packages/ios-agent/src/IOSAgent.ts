@@ -72,6 +72,11 @@ const BOOT_DEVICECTL_TIMEOUT_MS = 3_000
  * input on a phone goes through its UI-test runner, and `input` is what a write is told while that runner is not
  * ready (with the reason its last start failed, when it did — see `physicalInputMessage`); `button` is a hardware
  * button the runner has no way to press.
+ *
+ * On a phone, `channel-unavailable` means the runner's last start failed, for the reason the message gives — not that
+ * the session's channel is gone: each input tries to start the runner again, so a retry helps once that cause is
+ * fixed (the phone unlocked), and reconnecting does not. The reason is still `channel-unavailable` rather than
+ * `channel-starting` because the dashboard shows nothing for the latter, and the tester would never see why.
  */
 const PHYSICAL_REFUSALS = {
   'full-erase': 'Full reset is not available on a USB-connected device',
@@ -2248,7 +2253,7 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
   private physicalInputMessage(state: DeviceState): string {
     const failure = state.touchHelper instanceof XCUITestInput ? state.touchHelper.runnerFailure() : null
     return failure
-      ? `The UI-test runner on this USB-connected device did not start: ${failure}`
+      ? `The UI-test runner on this USB-connected device did not start: ${failure}. Each input tries to start it again, so retry once that is fixed; reconnecting does not help`
       : PHYSICAL_REFUSALS.input
   }
 
@@ -2621,7 +2626,9 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
         // The two branches that write nothing answer from the channel's state, which is `delivered`
         // when it is ready. A button this device's chrome lacks stays a *success* — the device
         // genuinely has no such button, so an error would be a false failure (#484). That is a
-        // decision, and it is why iOS never sends `unsupported` for a button while Android does.
+        // decision, and it is why iOS never sends `unsupported` for a simulator's button while Android does. A phone
+        // is the exception below: with no chrome to look its buttons up in, it answers `unsupported` for a button
+        // XCUITest cannot press.
         let outcome: 'delivered' | InputErrorReason = btnHelper?.inputState() === 'ready'
           ? 'delivered'
           : this.refusalReason(btnHelper, 'standalone', false)
