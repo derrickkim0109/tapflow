@@ -89,4 +89,11 @@ describe('DevicectlWrapper.listPhysicalDevices', () => {
     const exec = vi.fn().mockRejectedValue(new Error('xcrun: error: unable to find utility "devicectl"'))
     await expect(new DevicectlWrapper(exec).listPhysicalDevices()).resolves.toEqual([])
   })
+
+  // The 30 s re-read must tell "devicectl failed" from "no phones": the second, twice in a row, drops every phone.
+  // Mutation: swallow the error under `rejectOnFailure` too.
+  it('rejects when asked to, so a re-read can tell a failure from no phones', async () => {
+    const exec = vi.fn().mockRejectedValue(new Error('Command failed: timed out'))
+    await expect(new DevicectlWrapper(exec).listPhysicalDevices(3_000, { rejectOnFailure: true })).rejects.toThrow('timed out')
+  })
 })
