@@ -92,9 +92,11 @@ const SWIFTC_FLAGS = ['-O', '-suppress-warnings',
 const CODESIGN_FLAGS = ['--force', '--sign', '-']
 
 /** Writes `nonce` to a new file only this user can read, in `dir`, and returns its path. */
-export async function writeNonceFile(nonce: string, dir: string = defaultBuild.cacheDir): Promise<string> {
+export async function writeNonceFile(
+  nonce: string, dir: string = defaultBuild.cacheDir, name = `device-capture-nonce-${randomBytes(8).toString('hex')}`,
+): Promise<string> {
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  const path = join(dir, `device-capture-nonce-${randomBytes(8).toString('hex')}`)
+  const path = join(dir, name)
   // `wx`: never through a file (or link) someone put there first.
   await writeFile(path, nonce, { mode: 0o600, flag: 'wx' })
   return path
