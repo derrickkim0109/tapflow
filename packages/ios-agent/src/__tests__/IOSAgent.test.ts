@@ -111,7 +111,7 @@ import { IOSAgent, leanSupported, streamRestartPlan } from '../IOSAgent'
 import type { DeviceChromeLoader, ChromeData } from '../DeviceChromeLoader'
 import { ScreenCaptureStreamer, type StreamFrame } from '../ScreenCaptureStreamer'
 import type { CaptureStreamer, PhysicalCaptureFactory } from '../CaptureStreamer'
-import { DevicectlWrapper, type AppBundleInfo } from '../DevicectlWrapper'
+import { DevicectlWrapper, AppIdentityMismatchError, type AppBundleInfo } from '../DevicectlWrapper'
 import type { Device } from '@tapflowio/agent-core'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
 import { enumerateSimPids } from '../SimProcessTree'
@@ -4149,10 +4149,10 @@ describe('IOSAgent', () => {
     // A phone installs and launches through devicectl, never simctl. The devicectl half is scripted; what it runs is
     // DevicectlWrapper's tests'.
     describe('installing and launching on a phone', () => {
-      const devicectlFor = (info: AppBundleInfo, installed = false) => ({
+      const devicectlFor = (info: AppBundleInfo, installed: { version?: string } | null = null) => ({
         listPhysicalDevices: vi.fn().mockResolvedValue([PHONE]),
         appBundleInfo: vi.fn().mockResolvedValue(info),
-        isAppInstalled: vi.fn().mockResolvedValue(installed),
+        installedApp: vi.fn().mockResolvedValue(installed),
         installApp: vi.fn().mockResolvedValue(undefined),
         uninstallApp: vi.fn().mockResolvedValue(undefined),
         launchApp: vi.fn().mockResolvedValue(undefined),
@@ -4177,38 +4177,56 @@ describe('IOSAgent', () => {
         return ctx.sent.find((m) => m.type.startsWith(`${prefix}-`))!
       }
 
-      // Mutations: skip the Payload/ lookup (an .ipa reads as "no .app"), or install through simctl.
-      it('installs an .ipa clean, through devicectl', async () => {
+      // Mutations: skip the Payload/ lookup (an .ipa reads as "no .app"), install through simctl, or remove the
+      // installed copy first — the tester's app and its data would go with it, on a phone where refused installs
+      // (a profile without this device, a locked phone) are common.
+      it('installs an .ipa over the copy on the phone, through devicectl', async () => {
         const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'device' })
         const ctx = await phoneWith(devicectl)
         const answer = await reply(ctx, { type: 'app:install', payload: { filePath: ipa(), bundleId: 'com.example.app' } }, 'app:install')
-        expect(answer.type).toBe('app:install-done')
-        expect(devicectl.uninstallApp).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
+        expect(answer).toEqual(expect.objectContaining({ type: 'app:install-done' }))
+        expect(answer).not.toHaveProperty('warning')
         expect(devicectl.installApp).toHaveBeenCalledWith(PHONE.id, expect.stringMatching(/Payload\/Example\.app$/))
-        expect(devicectl.uninstallApp.mock.invocationCallOrder[0]).toBeLessThan(devicectl.installApp.mock.invocationCallOrder[0]!)
+        expect(devicectl.uninstallApp).not.toHaveBeenCalled()
         expect(ctx.simctl.installApp).not.toHaveBeenCalled()
         ctx.agent.disconnect()
       })
 
-      // Mutation: uninstall whatever the build is. A bundle whose Info.plist could not be read may still be refused,
-      // and the tester would lose the copy they had.
-      it('keeps the installed copy when it cannot tell what the build is for', async () => {
-        const devicectl = devicectlFor({ platform: 'unknown' })
+      // Mutation: uninstall before any refused install. A build the phone refuses for another reason would leave the
+      // tester with neither the old app nor the new one.
+      it('leaves the installed copy in place when the phone refuses the build', async () => {
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'device' })
+        devicectl.installApp.mockRejectedValue(new Error('install failed: A valid provisioning profile for this executable was not found.'))
         const ctx = await phoneWith(devicectl)
-        await reply(ctx, { type: 'app:install', payload: { filePath: ipa(), bundleId: 'com.example.app' } }, 'app:install')
+        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: ipa(), bundleId: 'com.example.app' } }, 'app:install')
+        expect(answer).toMatchObject({ type: 'app:install-error', message: expect.stringMatching(/provisioning profile/) })
         expect(devicectl.uninstallApp).not.toHaveBeenCalled()
-        expect(devicectl.installApp).toHaveBeenCalled()
         ctx.agent.disconnect()
       })
 
-      // Mutation: install a simulator build anyway — devicectl refuses it, after the clean install removed the
-      // TestFlight copy the tester was going to use.
-      it('uses the copy already on the phone for a simulator build', async () => {
-        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'simulator' }, true)
+      // Mutation: never retry after a signature mismatch. A development build could then never replace the TestFlight
+      // copy, which is the one refusal removing the installed copy cures.
+      it('removes the installed copy and installs once more only when it is signed differently', async () => {
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'device' })
+        devicectl.installApp.mockRejectedValueOnce(new AppIdentityMismatchError('install failed: MismatchedApplicationIdentifierEntitlement'))
         const ctx = await phoneWith(devicectl)
-        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: '/builds/Example.app', bundleId: 'com.example.app' } }, 'app:install')
+        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: ipa(), bundleId: 'com.example.app' } }, 'app:install')
         expect(answer.type).toBe('app:install-done')
-        expect(devicectl.isAppInstalled).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
+        expect(devicectl.uninstallApp).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
+        expect(devicectl.installApp).toHaveBeenCalledTimes(2)
+        expect(devicectl.uninstallApp.mock.invocationCallOrder[0]).toBeLessThan(devicectl.installApp.mock.invocationCallOrder[1]!)
+        ctx.agent.disconnect()
+      })
+
+      // Mutations: install a simulator build anyway (devicectl refuses it), or answer done without the warning — the
+      // tester would believe they are testing the build they sent while the phone runs the TestFlight one.
+      it('uses the copy already on the phone for a simulator build, and says so', async () => {
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'simulator' }, { version: '3.0.3 (4)' })
+        const ctx = await phoneWith(devicectl)
+        const answer = await reply(ctx, { type: 'app:install', payload: { filePath: '/builds/Example.app', bundleId: 'com.example.app' } }, 'app:install') as Sent & { warning?: string }
+        expect(answer.type).toBe('app:install-done')
+        expect(answer.warning).toMatch(/simulator build.*com\.example\.app already on the phone \(version 3\.0\.3 \(4\)\) is used instead/)
+        expect(devicectl.installedApp).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
         expect(devicectl.installApp).not.toHaveBeenCalled()
         expect(devicectl.uninstallApp).not.toHaveBeenCalled()
         ctx.agent.disconnect()
@@ -4216,7 +4234,7 @@ describe('IOSAgent', () => {
 
       // Mutation: answer done whatever the check said. A run would then go on against an app that is not there.
       it('asks for a device build when a simulator build\'s app is not on the phone', async () => {
-        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'simulator' }, false)
+        const devicectl = devicectlFor({ bundleId: 'com.example.app', platform: 'simulator' }, null)
         const ctx = await phoneWith(devicectl)
         const answer = await reply(ctx, { type: 'app:install', payload: { filePath: '/builds/Example.app' } }, 'app:install')
         expect(answer.type).toBe('app:install-error')
