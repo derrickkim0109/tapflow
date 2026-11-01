@@ -34,6 +34,12 @@ export function isPhysicalDevice(deviceId: string): boolean {
   return deviceId.startsWith('usb:')
 }
 
+/** The adb serial a `usb:<serial>` id names. Known from the id alone, so a phone the serial map has not seen since it
+ *  came back — the device list re-read does not sync that map — can still be reached, and torn down. */
+export function physicalSerial(deviceId: string): string {
+  return deviceId.slice('usb:'.length)
+}
+
 /**
  * Whether USB-connected devices are offered at all (`TAPFLOW_ANDROID_USB_DEVICES=1`). Off by default: a phone plugged
  * into the agent Mac to charge would otherwise be open to everyone who can reach the relay — its screen, its apps and
@@ -47,14 +53,15 @@ export function usbDevicesEnabled(env: NodeJS.ProcessEnv = process.env): boolean
 /** How long a phone's properties may take to read before the listing goes on without it (#152). */
 const DESCRIBE_PHYSICAL_TIMEOUT_MS = 10_000
 
-/** Why adb cannot drive a device in `state`, for the one line said when it gets there. */
+/** Why adb cannot drive a device in `state`, for the one line said when it gets there. Nothing asks for a restart: the
+ *  device list is re-read every 30 s (#1085), and a phone that becomes drivable is offered on the next read. */
 function notDrivable(state: string, rest: readonly string[]): string {
   switch (state) {
-    case 'unauthorized': return 'authorize USB debugging on the phone, then reconnect the agent'
+    case 'unauthorized': return 'authorize USB debugging on the phone, and it is offered on the next device list read'
     case 'authorizing': return 'it is waiting for USB debugging to be authorized on the phone'
-    case 'offline': return 'adb reports it offline; unplug it and plug it in again, then reconnect the agent'
+    case 'offline': return 'adb reports it offline; unplug it and plug it in again'
     case 'recovery': case 'sideload': case 'rescue': case 'bootloader':
-      return `it is in ${state} mode; start Android on it, then reconnect the agent`
+      return `it is in ${state} mode; start Android on it`
     case 'no': return `adb has ${[state, ...rest].join(' ')}`
     default: return `adb reports it as ${[state, ...rest].join(' ') || 'unknown'}`
   }
@@ -138,9 +145,6 @@ export class AdbWrapper {
     // Remove stale serials (emulator was killed externally, phone unplugged)
     for (const [id] of this.serialMap) {
       if (!present.has(id)) this.serialMap.delete(id)
-    }
-    for (const serial of this.physicalInfo.keys()) {
-      if (!attached.usb.includes(serial)) this.physicalInfo.delete(serial)
     }
 
     return this.describe(avdNames, attached)
@@ -236,6 +240,9 @@ export class AdbWrapper {
       }
       // Unplugged: plugged in again in the same state, it is said again.
       for (const serial of [...this.undrivableSaid.keys()]) if (!listedUsb.has(serial)) this.undrivableSaid.delete(serial)
+      // Unplugged: plugged in again, it is described again. Here rather than in `listDevices` so the re-read, which is
+      // what sees a phone come and go while the agent runs (#1085), drops it too.
+      for (const serial of [...this.physicalInfo.keys()]) if (!usb.includes(serial)) this.physicalInfo.delete(serial)
 
       await Promise.all(
         serials.map(async (serial) => {

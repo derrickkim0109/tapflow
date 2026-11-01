@@ -28,15 +28,15 @@ Use a phone kept for testing rather than a personal one. A phone with a messenge
 3. Connect the phone to the agent Mac with a USB cable.
 4. When the phone asks **Allow USB debugging?**, check **Always allow from this computer** and tap **Allow**.
 
-Plug the phone in **before** you start the agent. The agent tells the relay its device list once, when it starts, so a phone plugged in while it runs appears after the agent restarts. A phone you unplug stays in the list until then, and opening it fails with `Device not found`.
+You can plug the phone in before or after you start the agent. The agent re-reads its device list every 30 seconds, as it does for emulators, so a phone plugged in while it runs appears within about 35 seconds without restarting the agent. A phone you unplug leaves the list the same way, or after its session ends if someone is using it. This needs a relay on a version that includes the device list refresh; with an older relay, a phone plugged in or unplugged shows up only after the agent restarts.
 
 When a phone cannot be used, the agent prints why, once. It prints again when the same phone reaches another state or is plugged in again.
 
 | State | What to do |
 |---|---|
-| `unauthorized` | Answer the USB debugging prompt on the phone, then restart the agent. |
-| `offline` | Unplug the cable, plug it back in, then restart the agent. |
-| `recovery` and similar | The phone is not running Android, as in recovery mode. Start Android on it, then restart the agent. |
+| `unauthorized` | Answer the USB debugging prompt on the phone. The phone appears within about 35 seconds. |
+| `offline` | Unplug the cable and plug it back in. |
+| `recovery` and similar | The phone is not running Android, as in recovery mode. Start Android on it. |
 
 A phone connected over wireless debugging (`ip:port`) is not listed yet.
 
@@ -67,7 +67,7 @@ When the phone shows **Verify apps over USB** or a Play Protect scan, `adb insta
 Pressing **Rotate** locks the phone's rotation, which also turns its auto-rotate off. When the session ends, the rotation setting from before the session comes back: auto-rotate if it was on, or the orientation it was locked to.
 
 - If you stop the agent mid-session (Ctrl+C), it puts the setting back as it exits.
-- If it cannot (the phone was unplugged first, or the agent crashed), it keeps the setting in `~/.android/tapflow-usb-rotation.json` and puts it back the next time the agent lists that phone. With `ANDROID_USER_HOME` set, the file is kept in that directory.
+- If it cannot (the phone was unplugged first, or the agent crashed), it keeps the setting in `~/.android/tapflow-usb-rotation.json` and puts it back the next time the agent lists that phone: within about 35 seconds of plugging it back in, or when the next agent starts. With `ANDROID_USER_HOME` set, the file is kept in that directory.
 
 Rotation does not work on an older Android phone without the `wm user-rotation` command.
 

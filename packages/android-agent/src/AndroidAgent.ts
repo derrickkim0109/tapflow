@@ -55,7 +55,7 @@ import {
   DeviceListWatcher,
 } from '@tapflowio/agent-core/utils'
 import { execFile } from 'child_process'
-import { AdbWrapper, isPhysicalDevice } from './AdbWrapper.js'
+import { AdbWrapper, isPhysicalDevice, physicalSerial } from './AdbWrapper.js'
 import { SCRCPY_SERVER_DEVICE_PATH } from './adb.js'
 import { EmulatorLauncher, findEmulatorPid, probeEmulator, stopEmulatorProcess } from './EmulatorLauncher.js'
 import { ensureHelperApp, launchMuteOnlyTap, isAudioSupported } from '@tapflowio/audiotap-helper'
@@ -585,9 +585,15 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
     this.avdFormFactor = options.avdFormFactor ?? ((name) => formFactorOf(name))
     // Never the developer's real AVDs under vitest: a suite's expectations would follow whatever images this Mac has.
     this.avdOsVersion = options.avdOsVersion ?? (process.env.VITEST ? () => undefined : (name) => osVersionOf(name))
-    // `peekDevices`, not `listDevices`: the re-read must not sync the serial map a boot is relying on.
+    // `peekDevices`, not `listDevices`: the re-read must not sync the serial map a boot is relying on. It lists USB
+    // phones as the register does, so a phone plugged in or unplugged while the agent runs comes and goes like an
+    // emulator, and one that comes back owing its rotation lock gets it here, as any listing gives it.
     this.deviceWatcher = new DeviceListWatcher({
-      read: async () => this.offerDevices(await this.adb.peekDevices()),
+      read: async () => {
+        const devices = await this.adb.peekDevices()
+        this.restoreReturnedPhones(devices)
+        return this.offerDevices(devices)
+      },
       send: (devices) => { if (this.ws) this.sendOn(this.ws, { type: 'agent:devices', devices }) },
       onReadError: (e) => logger.debug(`device list re-read failed, trying again later: ${e instanceof Error ? e.message : String(e)}`),
       intervalMs: options.deviceRereadMs,
@@ -779,6 +785,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
       this.bumpBootSeq(state, 'shut-down')
       this.cleanupDeviceState(state)
       this.deviceStates.delete(sessionId)
+      // An unplugged phone: what its sessions left in memory goes, so plugged in again it starts as new. Its rotation
+      // lock, if still owed, stays — it is written back when a listing sees the phone again.
+      if (isPhysicalDevice(state.deviceId)) this.forgetPhysicalSession(state.deviceId)
     }
     this.initDeviceStates(added.filter(({ sessionId }) => !this.deviceStates.has(sessionId)))
   }
@@ -920,7 +929,9 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   private cleanupDeviceState(state: DeviceState): void {
     if (state.screenWatch) clearInterval(state.screenWatch)
     state.screenWatch = null
-    const serial = this.adb.getSerial(state.deviceId)
+    // A phone's serial is its id's, so its scrcpy session is stopped even once a listing has dropped it from the map —
+    // an unplugged phone's would otherwise keep its local `adb shell` and port forward.
+    const serial = this.adb.getSerial(state.deviceId) ?? (isPhysicalDevice(state.deviceId) ? physicalSerial(state.deviceId) : undefined)
     if (serial && state.scrcpySession) state.scrcpySession.stop(serial)
     state.scrcpySession = null
     state.emulatorVideo?.stop()
@@ -3748,13 +3759,21 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    */
   private async listAllDevices(): Promise<Device[]> {
     const devices = await this.adb.listDevices()
+    this.restoreReturnedPhones(devices)
+    return devices
+  }
+
+  /** Write back the rotation lock of each phone in `devices` that still owes one and that no session holds. Run by
+   *  every listing — the boot's, the register's and the 30 s re-read's — so a phone plugged in again gets it within one
+   *  re-read, without an agent restart. */
+  private restoreReturnedPhones(devices: Device[]): void {
     // Nothing to read with no phone listed — which is every listing while USB devices are off.
-    if (!devices.some((d) => d.kind === 'physical')) return devices
+    if (!devices.some((d) => d.kind === 'physical')) return
     for (const id of [...this.physicalRotation.keys()]) {
       const held = [...this.deviceStates.values()].some((s) => s.deviceId === id && (s.booted || s.bootsInFlight.size > 0))
-      if (!held && devices.some((d) => d.id === id)) void this.restoreRotation(id)
+      // The serial from the id: the re-read does not sync the serial map, and listed is reachable.
+      if (!held && devices.some((d) => d.id === id)) void this.restoreRotation(id, physicalSerial(id))
     }
-    return devices
   }
 
   /**
@@ -3762,10 +3781,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    * `wm user-rotation lock`, which turns auto-rotate off on the phone outside tapflow too. Forgotten only once written,
    * so a device that is gone keeps it for the next listing that sees it again — in this agent or, from disk, the next.
    */
-  private restoreRotation(deviceId: string): Promise<void> {
+  private restoreRotation(deviceId: string, listedSerial?: string): Promise<void> {
     return this.enqueueRotation(deviceId, async () => {
       const before = this.physicalRotation.get(deviceId)
-      const serial = this.adb.getSerial(deviceId)
+      const serial = listedSerial ?? this.adb.getSerial(deviceId)
       if (!before || !serial) return
       await bounded(before.mode === 'free' ? this.adb.freeRotation(serial) : this.adb.setRotation(serial, before.rotation),
         ROTATION_RESTORE_TIMEOUT_MS, `writing back ${deviceId}'s rotation lock`)
@@ -3781,14 +3800,20 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
    */
   private async endPhysicalSession(deviceId: string): Promise<void> {
     await this.restoreRotation(deviceId)
-    this.ownedDevices.delete(deviceId)
-    this.installedOnPhone.delete(deviceId)
+    this.forgetPhysicalSession(deviceId)
     const serial = this.adb.getSerial(deviceId)
     if (serial) {
       await this.adb.removePushedFiles(serial, PHYSICAL_CLEANUP_TIMEOUT_MS).catch((e: unknown) => {
         logger.warn(`could not remove tapflow's files from ${deviceId}: ${(e as Error).message}`)
       })
     }
+  }
+
+  /** What a phone's sessions leave in memory: tapflow's claim on it, and which packages it installed there — the record
+   *  `app:clear-state` and a run reset go by. Shared by a shutdown and by the phone leaving the list (`applyDevices`). */
+  private forgetPhysicalSession(deviceId: string): void {
+    this.ownedDevices.delete(deviceId)
+    this.installedOnPhone.delete(deviceId)
   }
 
   /**

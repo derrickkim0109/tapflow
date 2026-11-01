@@ -1192,6 +1192,40 @@ describe('listDevices — USB-connected devices (#152)', () => {
     expect(shellsFor(SERIAL)).toBe(2)
   })
 
+  // #1085: the 30 s re-read is what keeps a phone in the relay's list after the register. Mutation: read emulators only in
+  // `peekDevices` — a phone registered at connect drops out of the list on the second read without it.
+  it('offers the phone on the re-read exactly as the listing does, bounded, and leaves the serial map alone', async () => {
+    const { runner, exec } = usbRunner(`List of devices attached\nemulator-5554\tdevice\n${SERIAL}\tdevice\n`)
+    const bounded = vi.fn((_ms: number, ...args: string[]) => exec(...args))
+    const wrapper = new AdbWrapper({ ...runner, execBounded: bounded }, { usbDevices: true })
+    const peeked = await wrapper.peekDevices()
+    expect(peeked.find((d) => d.id === `usb:${SERIAL}`)).toMatchObject({ kind: 'physical', name: 'Galaxy Z Flip4', status: 'booted' })
+    expect(peeked.find((d) => d.id === 'avd:Pixel_8_API_34')).toMatchObject({ kind: 'emulator' })
+    expect(bounded.mock.calls.some((c) => c[2] === SERIAL && c[3] === 'shell')).toBe(true)
+    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBeUndefined()
+    expect(await wrapper.listDevices()).toEqual(peeked)
+  })
+
+  // Mutation: forget a phone's properties only in `listDevices` — a phone unplugged and plugged back while only the
+  // re-read runs keeps what was read before it left.
+  it('reads a phone again on the re-read once it was unplugged and plugged back in', async () => {
+    const rows = { now: `List of devices attached\n${SERIAL}\tdevice\n` }
+    const { runner, exec, shellsFor } = usbRunner('')
+    exec.mockImplementation(async (...args: string[]) => {
+      if (args[0] === 'devices') return rows.now
+      return args.includes('shell') ? FLIP4_PROPS : ''
+    })
+    const wrapper = new AdbWrapper(runner, { usbDevices: true })
+    await wrapper.peekDevices()
+    await wrapper.peekDevices()
+    expect(shellsFor(SERIAL)).toBe(1)
+    rows.now = 'List of devices attached\n'
+    expect((await wrapper.peekDevices()).some((d) => d.kind === 'physical')).toBe(false)
+    rows.now = `List of devices attached\n${SERIAL}\tdevice\n`
+    expect((await wrapper.peekDevices()).some((d) => d.id === `usb:${SERIAL}`)).toBe(true)
+    expect(shellsFor(SERIAL)).toBe(2)
+  })
+
   // Mutation: let one phone's failed read reject the whole listing, which costs the emulators too.
   it('lists the rest when a phone cannot be read', async () => {
     const { runner, exec } = usbRunner(`List of devices attached\nemulator-5554\tdevice\n${SERIAL}\tdevice\n`)

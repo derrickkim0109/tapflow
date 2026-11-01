@@ -215,6 +215,19 @@ config is read once per connection (`avdInfo`): its form factor, and its version
 (`osVersionFromConfig`), so an emulator that is not running is grouped by version too. A running emulator's
 `getprop` answer wins.
 
+USB phones (#152) are part of the re-read exactly as of the register: `peekDevices` and `listDevices` share
+`getAttached` and `describe`, so the same opt-in (`TAPFLOW_ANDROID_USB_DEVICES=1`), filtering and `kind` apply. A
+re-read that left phones out would drop a registered phone from the relay about a minute after it registered. A phone
+plugged in or unplugged therefore comes and goes without a restart, and per-phone state follows it:
+- **Leaving** (`applyDevices` removed): the session's state is retired by `cleanupDeviceState`, as a reconnect retires
+  it. That cleanup stops the scrcpy session by the serial in the phone's id (`physicalSerial`) when the serial map no
+  longer has it, so an unplugged phone's local `adb shell` and port forward do not outlive it. `forgetPhysicalSession`
+  drops `ownedDevices` and `installedOnPhone`, as a shutdown does. A rotation lock still owed is **kept**, in memory and
+  in `tapflow-usb-rotation.json`.
+- **Coming back**: a new session state from `initDeviceStates`, the properties read again (`physicalInfo` is pruned in
+  `getAttached`, which both listings run), and the owed rotation lock written back by `restoreReturnedPhones`, which
+  every listing runs — the re-read included, by the serial in the id, since the re-read does not sync `serialMap`.
+
 ## HOW NOT
 
 - Do not hardcode the ADB or emulator path, or read `ANDROID_HOME` directly — call `getAdbPath()` / `getEmulatorPath()` from `sdk.ts`.

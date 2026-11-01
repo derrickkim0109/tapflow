@@ -919,6 +919,96 @@ describe('AndroidAgent', () => {
       })
     })
 
+    // #1085: the agent re-reads its device list every 30 s, so a phone comes and goes without an agent restart. What the
+    // re-read offers must match the register, and what a phone leaves behind must not outlast it leaving.
+    describe('the device list re-read (#1085)', () => {
+      type PhoneMemory = {
+        ownedDevices: Set<string>
+        installedOnPhone: Map<string, Set<string>>
+        physicalRotation: Map<string, unknown>
+      }
+      const listedIds = async () => {
+        const relayWs = new WebSocket(`ws://localhost:${port}`)
+        await waitForOpen(relayWs)
+        relayWs.send(JSON.stringify({ type: 'agents:list' }))
+        const listed = await waitForType(relayWs, 'agents:listed')
+        relayWs.close()
+        const sessions = listed['sessions'] as Array<{ devices: Array<{ id: string; kind?: string }> }>
+        return sessions.flatMap((s) => s.devices)
+      }
+
+      // Mutation: re-read emulators only (drop the phones from `peekDevices`' result in the watcher's read) — the phone
+      // misses two reads in a row and the relay removes it, about a minute after it registered.
+      it('keeps offering the phone, as physical, read after read', async () => {
+        const adb = mockPhoneAdb()
+        const peek = vi.spyOn(adb, 'peekDevices').mockImplementation(() => adb.listDevices())
+        const agent = new AndroidAgent({ physicalRotationMemory: inMemoryPhysicalRotation(), deviceRereadMs: 10 }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        await vi.waitFor(() => expect(peek.mock.calls.length).toBeGreaterThanOrEqual(4))
+        await new Promise((r) => setTimeout(r, 30))
+        expect(await listedIds()).toContainEqual(expect.objectContaining({ id: PHONE_ID, kind: 'physical' }))
+        agent.disconnect()
+      })
+
+      // Mutation: look the serial up only in the serial map — a listing that ran after the phone was unplugged dropped
+      // it there, and the session's scrcpy `adb shell` and port forward outlive the phone.
+      it('stops an unplugged phone\'s stream when its session ends, though no listing knows its serial any more', async () => {
+        const adb = mockPhoneAdb()
+        vi.mocked(ScrcpySession).mockClear()
+        const { browser, send, close } = await bootPhone(adb)
+        const session = vi.mocked(ScrcpySession).mock.results[0]!.value as { stop: ReturnType<typeof vi.fn> }
+        adb.clearSerial(PHONE_ID)
+        const done = waitForType(browser, 'device:shutdown-done')
+        send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+        await done
+        expect(session.stop).toHaveBeenCalledWith(PHONE_SERIAL)
+        close()
+      })
+
+      // Mutation: drop the forget from `applyDevices` — plugged in again, the phone would still count as tapflow's and
+      // `app:clear-state` would clear a package installed in a session that is long over.
+      it('forgets what its sessions left when it leaves the list, and keeps a rotation lock it still owes', async () => {
+        const adb = mockPhoneAdb()
+        const peek = vi.spyOn(adb, 'peekDevices').mockImplementation(() => adb.listDevices())
+        const agent = new AndroidAgent({ physicalRotationMemory: inMemoryPhysicalRotation(), deviceRereadMs: 10 }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        const memory = agent as unknown as PhoneMemory
+        memory.ownedDevices.add(PHONE_ID)
+        memory.installedOnPhone.set(PHONE_ID, new Set(['com.example.app']))
+        memory.physicalRotation.set(PHONE_ID, { mode: 'free' })
+        vi.mocked(adb.freeRotation).mockClear()
+        peek.mockResolvedValue([])
+        await vi.waitFor(() => expect([...internals(agent).deviceStates.values()].some((s) => s.deviceId === PHONE_ID)).toBe(false))
+        expect(memory.ownedDevices.has(PHONE_ID)).toBe(false)
+        expect(memory.installedOnPhone.has(PHONE_ID)).toBe(false)
+        expect(memory.physicalRotation.get(PHONE_ID)).toEqual({ mode: 'free' })
+        expect(adb.freeRotation).not.toHaveBeenCalled()
+        agent.disconnect()
+      })
+
+      // Mutation: give the lock back only from `listAllDevices` (the boot's and the register's listing), or by the serial
+      // map alone — a phone plugged in again would keep tapflow's lock until something else listed the devices.
+      it('gives a phone that comes back its rotation lock from the re-read, and a fresh session', async () => {
+        const adb = mockPhoneAdb({ mode: 'lock', rotation: 3 })
+        const phone = await adb.listDevices()
+        vi.mocked(adb.listDevices).mockResolvedValue([])
+        adb.clearSerial(PHONE_ID)
+        const peek = vi.spyOn(adb, 'peekDevices').mockResolvedValue([])
+        const memory = inMemoryPhysicalRotation()
+        memory.remember(PHONE_ID, { mode: 'free' })
+        const agent = new AndroidAgent({ physicalRotationMemory: memory, deviceRereadMs: 10 }, adb)
+        await agent.connect(`ws://localhost:${port}`)
+        expect(internals(agent).deviceStates.size).toBe(0)
+        peek.mockResolvedValue(phone)
+        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL))
+        expect(memory.ids()).toEqual([])
+        await vi.waitFor(() => expect([...internals(agent).deviceStates.values()]).toContainEqual(
+          expect.objectContaining({ deviceId: PHONE_ID, booted: false }),
+        ))
+        agent.disconnect()
+      })
+    })
+
     describe('what it refuses', () => {
       // Mutation: drop the network row — airplane mode is written to the phone and outlives the session.
       it('refuses network control through network:error, and writes nothing', async () => {
