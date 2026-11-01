@@ -50,8 +50,26 @@ All color values are defined as CSS variables in `src/index.css`. Tailwind refer
 |-------|-------|------|-----|
 | `--destructive` | `0 100% 47%` (~`#ee0000`) | `0 70% 62%` | Destructive actions, error states |
 | `--destructive-foreground` | `#ffffff` | `#fafafa` | Text on destructive backgrounds |
+| `--warning` | `48 100% 96%` (~`#fffbeb`) | `31 60% 14%` | Background of a notice that needs attention but blocks nothing |
+| `--warning-foreground` | `31 85% 25%` | `48 65% 78%` | The notice's title. Its body stays `--foreground` |
+| `--warning-border` | `48 97% 77%` (~`#fde68a`) | `31 50% 30%` | The notice's border |
 
 > **Dark mode `--destructive`**: lightness is raised from `47%` to `62%`. Both the `/10` background opacity and the text color need L ≥ 60% to stay visible on dark surfaces.
+
+> **`--warning` is a surface, not a solid colour.** `--destructive` fills a button, so it is the saturated
+> red and its foreground is the text on it. A warning only ever appears as a notice box, so `--warning` is
+> the box's pale fill and `--warning-foreground` its title. It follows the avatar palette's rule: light
+> mode pairs a pale fill with a dark title, dark mode a desaturated dark fill with a light one, and the
+> title colours are slot 3's. The body is `--foreground` because it has to be read — `--muted-foreground`
+> on the light fill is 3.4:1. Red stays for errors and destructive actions, so a notice that blocks
+> nothing does not read as a failure next to a field's error.
+>
+> ```tsx
+> <div role="note" className="rounded-lg border border-warning-border bg-warning px-4 py-3 text-sm">
+>   <p className="font-medium text-warning-foreground">Title</p>
+>   <p className="mt-1">Body</p>
+> </div>
+> ```
 
 ### Border / Input
 
