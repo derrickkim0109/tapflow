@@ -140,13 +140,17 @@ async function resolveSession(client: RelayClient, opts: FlowRunOptions): Promis
     // The same device name can exist on two agents (two Macs) — never pick one silently.
     if (candidates.length > 1) envFail(`multiple devices named "${opts.device}" — narrow with --session <id> (the MCP server's list_devices shows each device's session id)`)
   } else {
-    const booted = devices.filter((d) => d.status === 'booted')
+    // A USB-connected phone always reads as booted, and it may be someone's own: a run lands on one only when it is
+    // named, as a lease never hands one out (#152).
+    const booted = devices.filter((d) => d.status === 'booted' && d.kind !== 'physical')
+    const phones = devices.filter((d) => d.kind === 'physical')
+    const named = phones.length > 0 ? ` (USB-connected devices are used only when named: ${phones.map((d) => d.name).join(', ')})` : ''
     if (booted.length === 1) {
       candidates = booted
     } else {
       envFail(
         booted.length === 0
-          ? 'no booted device — pass --device <name> to boot one, or boot it in the dashboard'
+          ? `no booted device — pass --device <name> to boot one, or boot it in the dashboard${named}`
           : `multiple booted devices — pick one with --device <name> or --session <id> (booted: ${booted.map((d) => d.name).join(', ')})`,
       )
     }

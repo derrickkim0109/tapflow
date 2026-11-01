@@ -114,6 +114,36 @@ describe('cmdFlowRun exit codes (#543)', () => {
 
   const run = (args: string[], opts = {}) => cmdFlowRun(args, opts).catch((e: unknown) => e)
 
+  // #152: a USB phone always reads as booted. Mutation: drop the `kind` filter from the default pick — the run lands on a
+  // phone nobody named, or fails as "multiple booted devices" because one is plugged in somewhere on the relay.
+  describe('picking a device when none is named', () => {
+    const phone = { sessionId: 's2', name: 'Galaxy S24', status: 'booted', busy: false, id: 'usb:R3CX', platform: 'android', kind: 'physical' }
+    const sim = { sessionId: 's1', name: 'dev', status: 'booted', busy: false, id: 'dev1', platform: 'ios', kind: 'simulator' }
+
+    it('skips a USB phone and takes the one booted simulator', async () => {
+      mocks.runFlow.mockResolvedValue(resultOf('passed'))
+      mocks.listDevices.mockResolvedValue([{ devices: [phone] }, { devices: [sim] }])
+      await run([flowFile('a.yaml')])
+      expect(mocks.joinSession).toHaveBeenCalledWith('s1')
+      expect(mocks.joinSession).not.toHaveBeenCalledWith('s2')
+    })
+
+    it('does not pick a phone that is the only booted device, and says how to use it', async () => {
+      mocks.listDevices.mockResolvedValue([{ devices: [phone] }])
+      await run([flowFile('a.yaml')])
+      expect(mocks.joinSession).not.toHaveBeenCalled()
+      expect(vi.mocked(console.error).mock.calls.flat().join('\n')).toMatch(/no booted device.*used only when named: Galaxy S24/)
+      expect(process.exitCode).toBe(2)
+    })
+
+    it('uses a phone named with --device', async () => {
+      mocks.runFlow.mockResolvedValue(resultOf('passed'))
+      mocks.listDevices.mockResolvedValue([{ devices: [phone] }, { devices: [sim] }])
+      await run([flowFile('a.yaml')], { device: 'Galaxy S24' })
+      expect(mocks.joinSession).toHaveBeenCalledWith('s2')
+    })
+  })
+
   // Printed before the device boots, so the person who started the run has the link while it is still worth
   // watching. `vi.stubEnv` because this suite itself may run under CI.
   // A2: watchers see each step as it starts, under the engine's redacted label; the video keeps its own marks.

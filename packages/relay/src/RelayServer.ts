@@ -2781,7 +2781,7 @@ export class RelayServer {
     if (ofPlatform.length === 0) {
       const phones = this.sessions.all().some((s) => s.devicePlatform === platform && !excluded.has(s.id) && s.deviceKind === 'physical')
       return refuse('no-device', phones
-        ? `no ${platform} device this relay can lease: a USB-connected phone is used only when a run names it by device id`
+        ? `no ${platform} device this relay can lease: a USB-connected phone is used only when a client names it (the CLI's --device <name> or --session <id>)`
         : `no ${platform} device on this relay`)
     }
 

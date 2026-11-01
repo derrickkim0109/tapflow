@@ -308,7 +308,7 @@ describe('the relay leases a device to an automation client', () => {
     const runner = await open()
     lease(runner, 'L1', { platform: 'android' })
     // Mutation: say only that there is no android device — the person looking at the phone in the list is not told why.
-    expect(await refused(runner, 'L1')).toMatchObject({ reason: 'no-device', retryable: false, message: expect.stringMatching(/USB-connected phone .* by device id/) })
+    expect(await refused(runner, 'L1')).toMatchObject({ reason: 'no-device', retryable: false, message: expect.stringMatching(/USB-connected phone is used only when a client names it \(the CLI's --device <name> or --session <id>\)/) })
   })
 
   it('never takes a device another client holds', async () => {
