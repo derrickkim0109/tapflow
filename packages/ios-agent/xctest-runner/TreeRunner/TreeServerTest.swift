@@ -13,7 +13,9 @@ final class TreeServerTest: XCTestCase {
             XCTFail("invalid TAPFLOW_TREE_PORT: \(portStr)")
             return
         }
-        let server = try TreeServer(port: port, token: env["TAPFLOW_TREE_TOKEN"] ?? "")
+        // Input routes synthesize events from this test; a failed XCUI action must not end the resident runner.
+        continueAfterFailure = true
+        let server = try TreeServer(port: port, token: env["TAPFLOW_TREE_TOKEN"] ?? "", bindAny: env["TAPFLOW_TREE_BIND_ANY"] == "1")
         server.start()
         // Block forever — the host kills the process to stop the runner. The server's handlers hold it weakly, so
         // keep it alive here explicitly rather than trusting the local to outlive its last use.
