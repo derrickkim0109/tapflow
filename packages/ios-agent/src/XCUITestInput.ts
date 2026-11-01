@@ -58,14 +58,20 @@ export interface XCUITestInputDeps {
  * finished gesture is sent when it ends — a tap, a drag lasting as long as the touch did, or a long press. A drag
  * therefore plays out after the finger lifts, along a straight line from where it started to where it ended.
  *
- * Writes answer as the contract asks: synchronously, whether the channel took them. What the runner then refuses
- * (nothing focused for a key, a button it cannot press) is logged, the way FoldableInput logs its helper's refusals.
- * What XCUITest cannot do at all — a pinch, holding a button down, the side button — is refused with `false`.
+ * Writes answer as the contract asks: synchronously, whether the channel took them. What the runner then answers
+ * arrives later, so the request a write sent is handed to whoever acks it (`takeLastWrite`): a refusal there (nothing
+ * focused for a key) must not be answered as delivered. What XCUITest cannot do at all — a pinch, holding a button
+ * down, the side button, a ⌘ chord — is refused with `false`, and `unsupportedReason` says which, so the refusal can
+ * be told apart from a runner that is not up yet.
  */
 export class XCUITestInput implements InputChannel {
   private touch: Touch | null = null
   private stopped = true
   private queue: Promise<void> = Promise.resolve()
+  // What the last write was refused for, when it can never be sent; cleared by every write.
+  private refusal: string | null = null
+  // The request the last write queued, until its ack takes it.
+  private lastWrite: Promise<void> | null = null
 
   constructor(private readonly deps: XCUITestInputDeps) {}
 
@@ -88,6 +94,7 @@ export class XCUITestInput implements InputChannel {
   }
 
   touchStart(x: number, y: number): boolean {
+    this.beginWrite()
     this.touch = null
     if (!this.ready()) return false
     this.touch = { x, y, lastX: x, lastY: y, moved: false, startedAt: Date.now() }
@@ -105,6 +112,7 @@ export class XCUITestInput implements InputChannel {
   }
 
   touchEnd(): boolean {
+    this.beginWrite()
     const t = this.touch
     if (!t) return false
     this.touch = null
@@ -123,57 +131,89 @@ export class XCUITestInput implements InputChannel {
     return Promise.resolve(this.touchEnd())
   }
 
+  // Every frame of a pinch is refused as one, the end included: that end is what gets an answer, and it must say
+  // "never" rather than "no gesture in progress", which would send the caller to start another pinch.
   pinchStart(_x1: number, _y1: number, _x2: number, _y2: number): boolean {
+    this.beginWrite()
     this.touch = null
-    return this.unsupported('a pinch')
+    return this.unsupported('A pinch')
   }
 
   pinchMove(_x1: number, _y1: number, _x2: number, _y2: number): boolean {
-    return false
+    this.beginWrite()
+    return this.unsupported('A pinch', false)
   }
 
   pinchEnd(): boolean {
-    return false
+    this.beginWrite()
+    return this.unsupported('A pinch')
   }
 
   sendKey(usage: number, modifiers = 0): boolean {
+    this.beginWrite()
     // ⌘/⌃/⌥ chords are shortcuts, not text; XCUITest on iOS has no way to press them.
-    if (modifiers & CTRL_ALT_META) return this.unsupported(`key 0x${usage.toString(16)} with modifiers 0x${modifiers.toString(16)}`)
+    if (modifiers & CTRL_ALT_META) return this.unsupported('A keyboard shortcut (⌘, ⌃ or ⌥ with a key)')
     const named = NAMED_KEYS[usage]
     if (named) return this.key(named)
     const chars = CHARS[usage]
-    if (!chars) return this.unsupported(`key 0x${usage.toString(16)}`)
+    if (!chars) return this.unsupported(`Key 0x${usage.toString(16)}`)
     return this.typeText(chars[modifiers & SHIFT ? 1 : 0])
   }
 
   /** Types `text` into the focused element in one request — what `input:type` wants, rather than a key per character. */
   typeText(text: string): boolean {
+    this.beginWrite()
     if (!this.ready()) return false
-    this.send(this.withApp('/type'), text)
+    this.send(this.withApp('/type'), text, true)
     return true
   }
 
   pressButton(usagePage: number, usage: number): boolean {
+    this.beginWrite()
     const name = usagePage === CONSUMER_PAGE ? CONSUMER_BUTTONS[usage] : undefined
-    return name ? this.key(name) : this.unsupported(`button 0x${usagePage.toString(16)}/0x${usage.toString(16)}`)
+    return name ? this.key(name) : this.unsupported(`Button 0x${usagePage.toString(16)}/0x${usage.toString(16)}`)
   }
 
   pressButtonDown(_usagePage: number, _usage: number): boolean {
-    return this.unsupported('holding a button')
+    this.beginWrite()
+    return this.unsupported('Holding a button down')
   }
 
   pressButtonUp(_usagePage: number, _usage: number): boolean {
-    return false
+    this.beginWrite()
+    return this.unsupported('Holding a button down')
   }
 
   /** 0 = home; 1 = lock, which XCUITest cannot press. */
   pressLegacyButton(code: number): boolean {
-    return code === 0 ? this.key('home') : this.unsupported('the side button')
+    this.beginWrite()
+    return code === 0 ? this.key('home') : this.unsupported('The side button')
+  }
+
+  /** Why the last write was refused, when it was refused because it can never be sent from here; null otherwise. */
+  unsupportedReason(): string | null {
+    return this.refusal
+  }
+
+  /**
+   * The runner's answer to the request the last write sent — resolves when it took it, rejects with its reason — or
+   * null when that write sent nothing, or sent a tap or drag (acked without waiting, see `send`). Taken once, by the write's ack: a key typed with nothing focused is refused by
+   * the runner (409), and answering it as delivered is a success the tester never got.
+   */
+  takeLastWrite(): Promise<void> | null {
+    const write = this.lastWrite
+    this.lastWrite = null
+    return write
+  }
+
+  /** Why the runner could not be started, when its last start failed. */
+  runnerFailure(): string | null {
+    return this.deps.runner.lastError?.() ?? null
   }
 
   private key(name: string): boolean {
     if (!this.ready()) return false
-    this.send(this.withApp(`/key?name=${name}`))
+    this.send(this.withApp(`/key?name=${name}`), undefined, true)
     return true
   }
 
@@ -191,16 +231,29 @@ export class XCUITestInput implements InputChannel {
     return `${path}${path.includes('?') ? '&' : '?'}bundleId=${encodeURIComponent(bundleId)}`
   }
 
-  // One at a time and in order: a tap that focuses a field must land before the text typed into it.
-  private send(path: string, body?: string): void {
-    this.queue = this.queue
-      // A write queued before stop() must not reach (or restart) the runner after it.
-      .then(() => (this.stopped ? undefined : this.deps.runner.request(path, body)))
+  private beginWrite(): void {
+    this.refusal = null
+    this.lastWrite = null
+  }
+
+  // One at a time and in order: a tap that focuses a field must land before the text typed into it. `answered`: the
+  // write's ack waits for the runner (`takeLastWrite`) — a key, text or button, which the runner can refuse. A tap or
+  // drag is acked at once, as on a simulator: the runner plays it out before it answers, which can outlast a client's
+  // ack deadline, and it refuses nothing a retry would fix.
+  private send(path: string, body?: string, answered = false): void {
+    // A write queued before stop() must not reach (or restart) the runner after it.
+    const write = this.queue.then(() => (this.stopped ? undefined : this.deps.runner.request(path, body)))
+    // Nobody may take it (a write whose ack is not waited on), so its rejection is handled here as well.
+    write.catch(() => { /* logged below */ })
+    if (answered) this.lastWrite = write
+    this.queue = write
       .catch((e: unknown) => logger.warn(`runner did not take ${path.split('?')[0]}: ${e instanceof Error ? e.message : String(e)}`))
   }
 
-  private unsupported(what: string): boolean {
-    logger.warn(`${what} cannot be sent to a physical iPhone through XCUITest`)
+  // `log` is off for a pinch's moves, which arrive dozens a second and are refused for the reason its start was.
+  private unsupported(what: string, log = true): boolean {
+    this.refusal = `${what} cannot be sent to a USB-connected device: XCUITest has no way to send it`
+    if (log) logger.warn(this.refusal)
     return false
   }
 }

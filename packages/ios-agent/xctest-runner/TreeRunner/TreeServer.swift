@@ -46,11 +46,23 @@ final class TreeServer {
         listener = try NWListener(using: params)
     }
 
+    // Bounds on a request nobody has authenticated yet. Bound beyond loopback the runner is on the device's Wi-Fi, and
+    // without them anyone there could hold connections open forever and make it buffer a megabyte each before the
+    // token is even read. A head is a few hundred bytes; only an authorized request may bring a body up to 1 MiB.
+    private static let headLimit = 8 * 1024
+    private static let bodyLimit = 1 << 20
+    private static let requestTimeout: TimeInterval = 10
+
     func start() {
         listener.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
             conn.start(queue: self.queue)
-            self.receive(conn, buffer: Data())
+            let pending = Pending()
+            // A connection that has not delivered a whole request in time is dropped, whoever it is.
+            self.queue.asyncAfter(deadline: .now() + Self.requestTimeout) {
+                if !pending.answered { conn.cancel() }
+            }
+            self.receive(conn, buffer: Data(), pending: pending)
         }
         // Surface a bind failure immediately by
         // exiting — otherwise the process stays alive looking "ready" and the host
@@ -81,36 +93,55 @@ final class TreeServer {
         let body: Data
     }
 
+    /// Whether a connection has been answered (or refused) — what its timeout checks. Touched only on `queue`.
+    private final class Pending {
+        var answered = false
+    }
+
     // Accumulate bytes until the request head and, for a POST, its Content-Length of body have arrived.
-    private func receive(_ conn: NWConnection, buffer: Data) {
+    private func receive(_ conn: NWConnection, buffer: Data, pending: Pending) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             var buf = buffer
             if let data { buf.append(data) }
             switch Self.parse(buf) {
             case .request(let request):
+                pending.answered = true
                 self.handleRequest(conn, request)
                 return
             case .invalid:
+                pending.answered = true
                 conn.cancel()
                 return
-            case .incomplete:
-                break
+            case .incomplete(let headers):
+                // The head is in and the body is not: a caller without the token is refused now, on this queue,
+                // rather than buffered up to the body limit and then handed to the main thread to be refused there.
+                if let headers, self.bindAny, !self.tokenMatches(headers["x-tapflow-token"]) {
+                    pending.answered = true
+                    self.respond(conn, status: "401 Unauthorized", contentType: "text/plain; charset=utf-8", body: "unauthorized")
+                    return
+                }
+                let limit = headers == nil ? Self.headLimit : Self.headLimit + Self.bodyLimit
+                if isComplete || error != nil || buf.count > limit {
+                    pending.answered = true
+                    conn.cancel()
+                    return
+                }
             }
-            if isComplete || error != nil || buf.count > 1 << 20 { conn.cancel(); return }
-            self.receive(conn, buffer: buf)
+            self.receive(conn, buffer: buf, pending: pending)
         }
     }
 
     private enum Parsed {
-        case incomplete
+        /// Not all there yet; `headers` once the head is.
+        case incomplete(headers: [String: String]?)
         case invalid
         case request(Request)
     }
 
     private static func parse(_ buf: Data) -> Parsed {
-        guard let sep = buf.range(of: Data("\r\n\r\n".utf8)),
-              let head = String(data: buf[..<sep.lowerBound], encoding: .utf8) else { return .incomplete }
+        guard let sep = buf.range(of: Data("\r\n\r\n".utf8)) else { return .incomplete(headers: nil) }
+        guard let head = String(data: buf[..<sep.lowerBound], encoding: .utf8) else { return .invalid }
         let lines = head.components(separatedBy: "\r\n")
         let parts = (lines.first ?? "").split(separator: " ")
         var headers: [String: String] = [:]
@@ -121,9 +152,9 @@ final class TreeServer {
         }
         let length = Int(headers["content-length"] ?? "0") ?? 0
         // A negative length would pass the check below and trap in `prefix`, killing the runner for any caller.
-        guard length >= 0 && length <= 1 << 20 else { return .invalid }
+        guard length >= 0 && length <= bodyLimit else { return .invalid }
         let body = buf[sep.upperBound...]
-        if body.count < length { return .incomplete }
+        if body.count < length { return .incomplete(headers: headers) }
         return .request(Request(
             method: parts.first.map(String.init) ?? "GET",
             path: parts.count >= 2 ? String(parts[1]) : "/",
@@ -141,9 +172,17 @@ final class TreeServer {
     }
 
     private func authorized(_ request: Request) -> Bool {
-        // Without a token there is nothing to check a caller against; beyond loopback that refuses everyone.
+        tokenMatches(request.headers["x-tapflow-token"])
+    }
+
+    // Without a token there is nothing to check a caller against; beyond loopback that refuses everyone. Compared in
+    // time that does not depend on where the two first differ.
+    private func tokenMatches(_ presented: String?) -> Bool {
         if token.isEmpty { return !bindAny }
-        return request.headers["x-tapflow-token"] == token
+        let a = Array(token.utf8), b = Array((presented ?? "").utf8)
+        var diff = a.count ^ b.count
+        for i in 0..<a.count { diff |= Int(a[i] ^ (i < b.count ? b[i] : 0)) }
+        return diff == 0
     }
 
     private func route(_ request: Request) -> (String, String, String) {
@@ -235,13 +274,16 @@ final class TreeServer {
         )
     }
 
-    // The element with keyboard focus in the given foreground app, else in SpringBoard (its search, a system alert).
+    // The element with keyboard focus in the app in front, else in SpringBoard (its search, a system alert). The app in
+    // front is the one the host names (the last it launched), or, when that is not in front — the tester opened
+    // another app from the home screen, as one does on a phone — whichever the accessibility layer says is active.
     private func focused(bundleId: String?) -> XCUIElement? {
         var apps: [XCUIApplication] = []
         if let bundleId, !bundleId.isEmpty {
             let app = XCUIApplication(bundleIdentifier: bundleId)
             if app.state == .runningForeground { apps.append(app) }
         }
+        if apps.isEmpty { apps.append(contentsOf: Self.activeApplications()) }
         apps.append(screen)
         for app in apps {
             let el = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
@@ -273,6 +315,37 @@ final class TreeServer {
         case "": throw InputError.bad("missing name")
         default: throw InputError.unsupported("key \(name) cannot be pressed from XCUITest")
         }
+    }
+
+    /// The apps the accessibility layer reports as active (SpringBoard among them while it is up). XCUITest has no public way to ask which
+    /// app is in front without naming it, so this goes through the same private calls WebDriverAgent uses —
+    /// `XCUIDevice.accessibilityInterface.activeApplications` for the pids and `+[XCUIApplication applicationWithPID:]`
+    /// for the app — each checked with `responds(to:)` first. Where an Xcode lacks them it returns nothing, and typing
+    /// falls back to the named app and SpringBoard, as before.
+    private static func activeApplications() -> [XCUIApplication] {
+        let device = XCUIDevice.shared as NSObject
+        let interfaceSel = NSSelectorFromString("accessibilityInterface")
+        let activeSel = NSSelectorFromString("activeApplications")
+        let byPidSel = NSSelectorFromString("applicationWithPID:")
+        guard device.responds(to: interfaceSel),
+              let ax = device.perform(interfaceSel)?.takeUnretainedValue() as? NSObject,
+              ax.responds(to: activeSel),
+              let elements = ax.perform(activeSel)?.takeUnretainedValue() as? [NSObject],
+              let appClass = XCUIApplication.self as AnyObject as? NSObject,
+              appClass.responds(to: byPidSel) else { return [] }
+        typealias ByPid = @convention(c) (AnyObject, Selector, Int32) -> AnyObject?
+        let byPid = unsafeBitCast(appClass.method(for: byPidSel), to: ByPid.self)
+        // Asked before KVC reads it: `value(forKey:)` on a key an object lacks raises an Objective-C exception, which
+        // Swift cannot catch, and the runner would die with the phone's only input path.
+        let pidSel = NSSelectorFromString("processIdentifier")
+        var apps: [XCUIApplication] = []
+        for element in elements {
+            guard element.responds(to: pidSel),
+                  let pid = (element.value(forKey: "processIdentifier") as? NSNumber)?.int32Value, pid > 0,
+                  let app = byPid(appClass, byPidSel, pid) as? XCUIApplication else { continue }
+            apps.append(app)
+        }
+        return apps
     }
 
     private static func json(_ status: String, error: String?) -> (String, String, String) {

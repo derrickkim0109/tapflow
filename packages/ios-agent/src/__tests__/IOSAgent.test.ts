@@ -113,6 +113,7 @@ import { ScreenCaptureStreamer, type StreamFrame } from '../ScreenCaptureStreame
 import type { CaptureStreamer, PhysicalCaptureFactory } from '../CaptureStreamer'
 import { DevicectlWrapper, AppIdentityMismatchError, type AppBundleInfo } from '../DevicectlWrapper'
 import { CameraAccessDeniedError } from '../DeviceCaptureStreamer'
+import type { RunnerInputClient } from '../XCUITreeReader'
 import type { Device } from '@tapflowio/agent-core'
 import { AudioCaptureStreamer } from '../AudioCaptureStreamer'
 import { enumerateSimPids } from '../SimProcessTree'
@@ -4396,19 +4397,125 @@ describe('IOSAgent', () => {
       ctx.agent.disconnect()
     })
 
-    // Mutation: hand a physical device a `TouchHelper` in `createInputChannel`, or drop the `UnavailableInput` check
-    // in `refusalReason` — input then either drives a simulator or answers "reconnect", which never helps.
-    it('answers input on a USB-connected device without a runner with "the runner is not ready"', async () => {
-      const ctx = await bootPhone()
+    // The production input path: an `XCUITestInput` over a scripted runner. `UnavailableInput`, the vitest default,
+    // refuses everything and so cannot show what a real phone answers.
+    function runnerOf(opts: { state?: 'ready' | 'starting' | 'unavailable'; lastError?: string | null } = {}) {
+      return {
+        warm: vi.fn(),
+        state: vi.fn(() => opts.state ?? 'ready'),
+        request: vi.fn(async (_path: string, _body?: string): Promise<void> => {}),
+        lastError: () => opts.lastError ?? null,
+      } satisfies RunnerInputClient
+    }
+    async function phoneWithRunner(runner: RunnerInputClient) {
+      return bootPhone({}, () => new XCUITestInput({ runner }))
+    }
+    const inputErrors = (ctx: { sent: Sent[] }) => ctx.sent.filter((m) => m.type === 'input:error')
+
+    // Mutation: hand a physical device a `TouchHelper` in `createInputChannel`, or drop the runner's failure from the
+    // message — the tester reads "input channel not ready" while the reason (no team set) is on the agent's Mac.
+    it('answers input on a phone whose runner failed to start with why it failed', async () => {
+      const ctx = await phoneWithRunner(runnerOf({ state: 'unavailable', lastError: 'a physical iPhone needs the UI-test runner signed by your Apple development team — set TAPFLOW_IOS_TEAM_ID' }))
       ctx.deliver({ type: 'input:touch:start', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
       ctx.deliver({ type: 'input:touch:end', requestId: 'rq-tap', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
       ctx.deliver({ type: 'input:key', requestId: 'rq-key', sessionId: ctx.phoneSession, payload: { code: 'KeyA' } })
-      await vi.waitFor(() => expect(ctx.sent.filter((m) => m.type === 'input:error')).toHaveLength(2))
-      for (const e of ctx.sent.filter((m) => m.type === 'input:error')) {
-        expect(e.reason).toBe('unsupported')
-        expect(e.message).toMatch(/The UI-test runner on this USB-connected device is not ready/)
+      await vi.waitFor(() => expect(inputErrors(ctx)).toHaveLength(2))
+      for (const e of inputErrors(ctx)) {
+        expect(e.reason).toBe('channel-unavailable')
+        expect(e.message).toMatch(/^The UI-test runner on this USB-connected device did not start: .*TAPFLOW_IOS_TEAM_ID/)
       }
       expect(MockTouchHelper).not.toHaveBeenCalledWith(PHONE.id)
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: answer a phone's buttons from the (absent) chrome, as before — volume would answer `delivered` having
+    // sent nothing, and the side button would too.
+    it('presses home and the volume buttons on a phone, and refuses the side button as unsupported', async () => {
+      const runner = runnerOf()
+      const ctx = await phoneWithRunner(runner)
+      ctx.deliver({ type: 'input:button', requestId: 'rq-up', sessionId: ctx.phoneSession, payload: { name: 'volume_up' } })
+      ctx.deliver({ type: 'input:button', requestId: 'rq-home', sessionId: ctx.phoneSession, payload: { name: 'home' } })
+      ctx.deliver({ type: 'input:button', requestId: 'rq-lock', sessionId: ctx.phoneSession, payload: { name: 'lock' } })
+      await vi.waitFor(() => expect(ctx.sent.filter((m) => m.type === 'input:done' || m.type === 'input:error')).toHaveLength(3))
+      expect(runner.request.mock.calls.map((c) => c[0])).toEqual(['/key?name=volumeUp', '/key?name=home'])
+      expect(inputErrors(ctx)).toEqual([expect.objectContaining({ reason: 'unsupported', message: expect.stringMatching(/^The lock button cannot be pressed on a USB-connected device/) })])
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: drop `unsupportedReason` from `refusalReason`. A pinch then answers `no-gesture` ("start a new one")
+    // and a ⌘ chord the same, so a caller retries input that can never be sent.
+    it('answers a pinch and a keyboard shortcut on a phone as unsupported, saying which', async () => {
+      const ctx = await phoneWithRunner(runnerOf())
+      ctx.deliver({ type: 'input:pinch:start', sessionId: ctx.phoneSession, payload: { f0: { x: 0.4, y: 0.4 }, f1: { x: 0.6, y: 0.6 } } })
+      ctx.deliver({ type: 'input:pinch:end', requestId: 'rq-pinch', sessionId: ctx.phoneSession, payload: {} })
+      ctx.deliver({ type: 'input:key', requestId: 'rq-chord', sessionId: ctx.phoneSession, payload: { code: 'KeyA', modifiers: 0x08 } })
+      await vi.waitFor(() => expect(inputErrors(ctx)).toHaveLength(2))
+      expect(inputErrors(ctx).map((e) => [e.reason, e.message?.split(' cannot')[0]])).toEqual([['unsupported', 'A pinch'], ['unsupported', 'A keyboard shortcut (⌘, ⌃ or ⌥ with a key)']])
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: ack a phone's key as soon as it is queued. With nothing focused the runner refuses it (409), and the
+    // caller would be told it was typed.
+    it('answers a key the phone\'s runner refused with the runner\'s reason', async () => {
+      const runner = runnerOf()
+      runner.request.mockRejectedValueOnce(new Error('UI-test runner refused /type: no element has keyboard focus — tap a text field first'))
+      const ctx = await phoneWithRunner(runner)
+      ctx.deliver({ type: 'input:key', requestId: 'rq-a', sessionId: ctx.phoneSession, payload: { code: 'KeyA' } })
+      await vi.waitFor(() => expect(inputErrors(ctx)).toHaveLength(1))
+      expect(inputErrors(ctx)[0]).toMatchObject({ reason: 'dispatch-failed', message: expect.stringMatching(/no element has keyboard focus/) })
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: wait for the runner before acking a tap, or wait for it without a cap for a key. A tap is played out
+    // before the runner answers and a slow runner can take seconds, past MCP's 2 s ack deadline: input that landed would
+    // be reported as failed.
+    it('acks a phone tap at once, and a key once its runner answers or 1.5 s pass', async () => {
+      const runner = runnerOf()
+      runner.request.mockImplementation(() => new Promise<void>(() => { /* the runner never answers */ }))
+      const ctx = await phoneWithRunner(runner)
+      ctx.deliver({ type: 'input:touch:start', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
+      ctx.deliver({ type: 'input:touch:end', requestId: 'rq-tap', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'input:done')).toBe(true), { timeout: 500 })
+      const started = Date.now()
+      ctx.deliver({ type: 'input:key', requestId: 'rq-key', sessionId: ctx.phoneSession, payload: { code: 'KeyA' } })
+      await vi.waitFor(() => expect(ctx.sent.filter((m) => m.type === 'input:done')).toHaveLength(2), { timeout: 3_000 })
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1_400)
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: read the channel's last refusal for a button press-down that wrote nothing. A pinch refused earlier
+    // would answer it `unsupported`, telling the caller never to press that button again.
+    it('does not answer a phone button press-down with an earlier input\'s refusal', async () => {
+      const runner = runnerOf({ state: 'starting' })
+      const ctx = await phoneWithRunner(runner)
+      ctx.deliver({ type: 'input:pinch:start', sessionId: ctx.phoneSession, payload: { f0: { x: 0.4, y: 0.4 }, f1: { x: 0.6, y: 0.6 } } })
+      ctx.deliver({ type: 'input:button', requestId: 'rq-down', sessionId: ctx.phoneSession, payload: { name: 'home', phase: 'down' } })
+      await vi.waitFor(() => expect(inputErrors(ctx)).toHaveLength(1))
+      expect(inputErrors(ctx)[0]!.reason).toBe('channel-starting')
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: answer `channel-starting` while a failed runner is tried again. The dashboard shows nothing for it, so a
+    // tester tapping a phone with no team set would see nothing at all, tap after tap.
+    it('says why the runner failed while it is being started again', async () => {
+      const ctx = await phoneWithRunner(runnerOf({ state: 'starting', lastError: 'set TAPFLOW_IOS_TEAM_ID' }))
+      ctx.deliver({ type: 'input:touch:start', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
+      ctx.deliver({ type: 'input:touch:end', requestId: 'rq-tap', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
+      await vi.waitFor(() => expect(inputErrors(ctx)).toHaveLength(1))
+      expect(inputErrors(ctx)[0]).toMatchObject({ reason: 'channel-unavailable', message: expect.stringMatching(/did not start: set TAPFLOW_IOS_TEAM_ID/) })
+      ctx.agent.disconnect()
+    })
+
+    // Mutation: answer `input:type-done` once the text is queued. The runner refusing it (nothing focused) would then
+    // be a log line on the agent's Mac while the caller goes on as if the field were filled.
+    it('answers input:type on a phone with the runner\'s refusal', async () => {
+      const runner = runnerOf()
+      runner.request.mockRejectedValueOnce(new Error('UI-test runner refused /type: no element has keyboard focus — tap a text field first'))
+      const ctx = await phoneWithRunner(runner)
+      ctx.deliver({ type: 'input:type', requestId: 'rq-t', sessionId: ctx.phoneSession, payload: { text: 'hello' } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'input:type-error')).toBe(true))
+      expect(ctx.sent.find((m) => m.type === 'input:type-error')?.message).toMatch(/no element has keyboard focus/)
+      expect(ctx.sent.some((m) => m.type === 'input:type-done')).toBe(false)
       ctx.agent.disconnect()
     })
 
