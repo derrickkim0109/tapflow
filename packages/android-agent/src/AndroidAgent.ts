@@ -2872,9 +2872,10 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
   /** Run `step` after every rotation already queued for this device. A failing step is logged and does
    *  not stop the ones behind it.
    *
-   *  **No timeout, unlike iOS.** A hung `adb` would hold this device's queue and the boot waiting on it.
-   *  The boot already awaits other `adb` calls with none (`normaliseOnBoot`), and bounding them means a
-   *  timeout on `AdbRunner.exec` for every caller — a change to make once a hang has been seen. */
+   *  **The queue has no timeout, unlike iOS; a USB phone's steps are bounded one `adb` call at a time.** A phone's
+   *  shell can hang, so its rotation reads and writes take `ROTATION_RESTORE_TIMEOUT_MS` and kill the child. An
+   *  emulator's calls are still unbounded — a hung `adb` there would hold this device's queue and the boot waiting
+   *  on it, and the boot awaits other `adb` calls with none (`normaliseOnBoot`). */
   private enqueueRotation(deviceId: string, step: () => Promise<void>): Promise<void> {
     const next = (this.rotations.get(deviceId) ?? Promise.resolve())
       .then(step)
@@ -3257,7 +3258,14 @@ export class AndroidAgent implements DeviceAgent, NetworkControlCapability {
           } else {
             if (isPhysicalDevice(live.deviceId) && !(await this.mayLockPhone(live, serial))) return
             const next = target ? target === 'landscape' : !live.landscape
-            await this.adb.setRotation(serial, next ? 3 : 0)
+            // A phone's write is bounded like its write-back, which queues behind it: a shell that hangs here would
+            // otherwise hold the shutdown's write-back and its answer.
+            if (isPhysicalDevice(live.deviceId)) {
+              await bounded(this.adb.setRotation(serial, next ? 3 : 0, ROTATION_RESTORE_TIMEOUT_MS), ROTATION_RESTORE_TIMEOUT_MS,
+                `locking ${live.deviceId}'s rotation`)
+            } else {
+              await this.adb.setRotation(serial, next ? 3 : 0)
+            }
             live.landscape = next
             this.lockWritten(live, serial)
           }

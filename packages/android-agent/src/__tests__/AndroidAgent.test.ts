@@ -745,10 +745,11 @@ describe('AndroidAgent', () => {
     })
 
     describe('its rotation lock (#1033)', () => {
+      // The `10_000` on the lock write is its bound (mutation: drop it — a hung shell holds the shutdown behind it).
       async function rotateThenShutDown(adb: AdbWrapper, physicalRotationMemory = inMemoryPhysicalRotation()) {
         const { browser, send, close } = await bootPhone(adb, physicalRotationMemory)
         send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
-        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3, 10_000))
         const done = waitForType(browser, 'device:shutdown-done')
         send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
         await done
@@ -777,7 +778,7 @@ describe('AndroidAgent', () => {
         const adb = mockPhoneAdb({ mode: 'free' })
         const { browser, send, close } = await bootPhone(adb)
         send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
-        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3, 10_000))
         vi.mocked(adb.getUserRotation).mockResolvedValue({ mode: 'lock', rotation: 3 })
         const again = waitForType(browser, 'device:ready')
         send({ type: 'device:boot', requestId: 'rq-again', payload: { deviceId: PHONE_ID } })
@@ -797,11 +798,11 @@ describe('AndroidAgent', () => {
         const adb = mockPhoneAdb({ mode: 'free' })
         const { agent, send, close } = await bootPhone(adb)
         send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
-        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3, 10_000))
         await agent.listDevices()
         await new Promise((r) => setTimeout(r, 20))
         expect(adb.freeRotation).not.toHaveBeenCalled()
-        expect(vi.mocked(adb.setRotation).mock.calls).toEqual([[PHONE_SERIAL, 3]])
+        expect(vi.mocked(adb.setRotation).mock.calls).toEqual([[PHONE_SERIAL, 3, 10_000]])
         close()
       })
 
@@ -857,7 +858,7 @@ describe('AndroidAgent', () => {
         const memory = inMemoryPhysicalRotation()
         const { send, close } = await bootPhone(adb, memory)
         send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
-        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3, 10_000))
         close()
         expect(now).toHaveBeenCalledWith(PHONE_SERIAL, { mode: 'free' }, 3_000)
         expect(memory.ids()).toEqual([])
@@ -977,7 +978,7 @@ describe('AndroidAgent', () => {
         const listed = vi.mocked(adb.listDevices).getMockImplementation()!
         const { agent, browser, send, close } = await bootPhone(adb)
         send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
-        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
+        await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3, 10_000))
         adb.clearSerial(PHONE_ID)
         vi.mocked(adb.listDevices).mockResolvedValue([])
         // Unplugged: adb reaches the serial, and the phone is not there to answer.
