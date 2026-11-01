@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A device says whether it is a simulator, an emulator or a physical device.** Agents may report an optional `kind` on each device, and the relay passes it on to the dashboard and clients. Nothing reports a physical device yet; this is groundwork for USB-connected phones (#152).
+
 ### Changed
 
 - **The warning for a token with no expiry is a notice box.** Choosing **No expiration** under Settings → Tokens used to add one line of amber text; it now shows a boxed notice with a title, in a warning colour that follows light and dark mode.
