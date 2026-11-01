@@ -158,6 +158,49 @@ describe('XCUITreeReader on a physical device', () => {
     }
   })
 
+  // Mutations: keep one failure for every phone (each phone's failure replaces the other's, so two failing phones
+  // rebuild on every write), or never forget a phone's failure once its build succeeds.
+  it('keeps each failing phone in its own backoff, and forgets the failure of a phone whose build succeeds', async () => {
+    let now = 1_000_000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const s = setup({ team: 'TEAM123', physical: ['udid-P', 'udid-Q'] })
+      tokens = s.tokens
+      s.native.build.mockRejectedValue(new Error('xcodebuild: error: The device is locked.'))
+      await expect(s.reader.read('udid-P', 'com.app')).rejects.toThrow(/device is locked/)
+      await expect(s.reader.read('udid-Q', 'com.app')).rejects.toThrow(/device is locked/)
+      now += 10_000
+      for (const udid of ['udid-P', 'udid-Q', 'udid-P', 'udid-Q']) {
+        await expect(s.reader.read(udid, 'com.app')).rejects.toThrow(/not built again for 60 s/)
+      }
+      expect(s.native.build).toHaveBeenCalledTimes(2)
+      now += 60_000
+      s.native.build.mockResolvedValue(undefined)
+      await s.reader.read('udid-P', 'com.app')
+      expect(s.native.build).toHaveBeenCalledTimes(3)
+      expect((s.reader as unknown as { deviceBuildFailures: Map<string, unknown> }).deviceBuildFailures.has('udid-P|TEAM123|')).toBe(false)
+      s.reader.stop()
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  // A phone that joined another phone's build did not run its own, so it is not held back by that build's failure.
+  // Mutation: record the failure for the phone that joined too — its own build then waits out a failure it did not run.
+  it('does not hold back a phone that only joined the build that failed', async () => {
+    const s = setup({ team: 'TEAM123', physical: ['udid-P', 'udid-Q'] })
+    tokens = s.tokens
+    s.native.build.mockRejectedValueOnce(new Error('xcodebuild: error: The device is locked.'))
+    const reads = await Promise.allSettled([s.reader.read('udid-P', 'com.app'), s.reader.read('udid-Q', 'com.app')])
+    expect(reads.map((r) => r.status)).toEqual(['rejected', 'rejected'])
+    expect(s.native.build).toHaveBeenCalledTimes(1)
+    await expect(s.reader.read('udid-P', 'com.app')).rejects.toThrow(/not built again for 60 s/)
+    await s.reader.read('udid-Q', 'com.app')
+    expect(s.native.build).toHaveBeenCalledTimes(2)
+    expect(s.native.build.mock.calls[1]![0]).toBe('platform=iOS,id=udid-Q')
+    s.reader.stop()
+  })
+
   // Mutation: compare the built stamp against the bare source stamp. A build signed by another team would then be
   // reused, and installing it fails with a provisioning error.
   it('rebuilds when the team changed, and reuses a build by the same team', async () => {

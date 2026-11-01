@@ -370,8 +370,9 @@ plugged in again, it gets a fresh session.
   focused) is `dispatch-failed`, and `input:type` answers only once the runner has. A refusal because the runner is
   not up says why its last start failed (`RunnerInputClient.lastError`). Its reason is `channel-unavailable`, which on
   a phone means that start failed, not that the channel is gone: each input tries the runner again, so a retry helps
-  once the cause is fixed, and the message says so (`channel-starting` would be silent in the dashboard). After a
-  failed device build, no build is tried again for that phone, team and prefix for 60 s. The runner needs `TAPFLOW_IOS_TEAM_ID`
+  once the cause is fixed (a failed build is retried after 60 s), and the message says so (`channel-starting` would
+  be silent in the dashboard). After a failed device build, no build is tried again for that phone, team and prefix
+  for 60 s; a phone that only joined another phone's build is not held back by its failure. The runner needs `TAPFLOW_IOS_TEAM_ID`
   (and, for a team that cannot register `dev.tapflow.*`, `TAPFLOW_IOS_BUNDLE_PREFIX`); its device build stamp
   records the devices it was built for, and a phone not among them rebuilds it.
 - **The first device build changes the team's Apple developer account.** It runs with `-allowProvisioningUpdates`,

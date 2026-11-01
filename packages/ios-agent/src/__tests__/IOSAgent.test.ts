@@ -4535,6 +4535,8 @@ describe('IOSAgent', () => {
       ctx.deliver({ type: 'input:touch:end', requestId: 'rq-tap', sessionId: ctx.phoneSession, payload: { x: 0.5, y: 0.5 } })
       await vi.waitFor(() => expect(inputErrors(ctx)).toHaveLength(1))
       expect(inputErrors(ctx)[0]).toMatchObject({ reason: 'channel-unavailable', message: expect.stringMatching(/did not start: set TAPFLOW_IOS_TEAM_ID/) })
+      // A build that failed is not run again at once, so the message says when a retry can help.
+      expect(inputErrors(ctx)[0]!.message).toMatch(/a failed build is retried after 60 s/)
       ctx.agent.disconnect()
     })
 
