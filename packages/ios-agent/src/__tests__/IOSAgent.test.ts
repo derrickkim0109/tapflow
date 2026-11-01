@@ -4025,6 +4025,38 @@ describe('IOSAgent', () => {
       return ctx
     }
 
+    // #1101: the relay drops the session of a phone that was unplugged (once nobody holds it), and the agent retires its
+    // state. Mutation: drop the physical branch in `applyDevices` — the phone's UI-test runner stays up, holding a
+    // tunnel to a phone that is gone; or `cleanupDeviceState` — its capture helper and input channel stay up too.
+    it('stops a phone\'s capture, input and runner when the relay drops it, and starts afresh when it returns', async () => {
+      let cancelled = 0
+      const capture = vi.fn((): CaptureStreamer => ({
+        start: () => new ReadableStream<StreamFrame>({ start() {}, cancel() { cancelled++ } }),
+        requestKeyframe: vi.fn(),
+        selectPanel: vi.fn(),
+      }))
+      const input = { start: vi.fn(), stop: vi.fn(), inputState: () => 'ready' as const } as unknown as InputChannel
+      const ctx = await connected({ capture, input: () => input })
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-phone', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:ready')).toBe(true))
+      const internal = ctx.agent as unknown as {
+        applyDevices(added: Array<{ deviceId: string; sessionId: string }>, removed: Array<{ deviceId: string; sessionId: string }>): void
+        uiTreeReader: { stopIfDevice(udid: string): void }
+      }
+      const stopRunner = vi.spyOn(internal.uiTreeReader, 'stopIfDevice')
+      internal.applyDevices([], [{ deviceId: PHONE.id, sessionId: ctx.phoneSession }])
+      await vi.waitFor(() => expect(cancelled).toBe(1))
+      expect(input.stop).toHaveBeenCalled()
+      expect(stopRunner).toHaveBeenCalledWith(PHONE.id)
+      expect([...(ctx.agent as unknown as Internals).deviceStates.values()].map((s) => s.deviceId)).not.toContain(PHONE.id)
+
+      // Plugged in again: a fresh state for its session (this relay never dropped it), and a boot starts a new capture.
+      internal.applyDevices([{ deviceId: PHONE.id, sessionId: ctx.phoneSession }], [])
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-again', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(capture).toHaveBeenCalledTimes(2))
+      ctx.agent.disconnect()
+    })
+
     // Mutation: drop `kind` from the register literal (or the `kind: 'simulator'` stamp in `listAllDevices`) — the
     // dashboard's USB badge and the relay's device kind then read nothing.
     it('registers the USB-connected device as physical and each simulator as a simulator', async () => {

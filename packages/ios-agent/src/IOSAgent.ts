@@ -854,7 +854,15 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       this.bumpBootSeq(state, 'shut-down')
       this.cleanupDeviceState(state)
       this.deviceStates.delete(sessionId)
-      if (![...this.deviceStates.values()].some((s) => s.deviceId === state.deviceId)) this.stopGuest(state.deviceId)
+      if ([...this.deviceStates.values()].some((s) => s.deviceId === state.deviceId)) continue
+      this.stopGuest(state.deviceId)
+      // A USB-connected device that was unplugged: `cleanupDeviceState` stopped its capture helper and input channel,
+      // and its UI-test runner goes too, as a shutdown stops it — a runner left behind would hold a tunnel to a phone
+      // that is gone. Plugged in again, it gets a new session and starts from nothing.
+      if (this.isPhysical(state.deviceId)) {
+        this.uiTreeReader.stopIfDevice(state.deviceId)
+        this.ownedDevices.delete(state.deviceId)
+      }
     }
     this.initDeviceStates(added.filter(({ sessionId }) => !this.deviceStates.has(sessionId)))
   }
