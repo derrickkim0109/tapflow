@@ -125,7 +125,7 @@ Connected straight to the relay's port on the Mac it runs on, the MCP server sta
 | Tool | Description |
 |------|-------------|
 | `list_builds` | List the apps and builds on the relay (where the `buildId` for `install_app` and `launch_app` comes from) |
-| `list_devices` | List connected simulators and emulators |
+| `list_devices` | List connected simulators, emulators and USB-connected phones |
 | `connect_device` | Join a session (required before controlling a device). Also returns `watchUrl`, a dashboard link for watching the device |
 | `disconnect_device` | End a session |
 | `boot_device` | Boot a simulator or emulator |
@@ -164,6 +164,8 @@ disconnect_device  → end the session, freeing the device for others
 
 ::: info Device already booted
 If `list_devices` returns `"status": "booted"` for a device, you can skip `boot_device`.
+
+Each device may carry a `kind`: `simulator`, `emulator` or `physical`. A `physical` device is an [Android phone connected over USB](/operate/android-usb-devices): it always reports `booted`, some features are refused on it, and it may be someone's own phone, so connect to one only when that is what you mean to test on.
 :::
 
 A `list_devices` response can also carry values set in the dashboard: `displayName` (a name an Admin gave the device), `hidden` (an Admin hid it from the list) and `favourite` (the token owner starred it). They are for the dashboard's display and don't affect which devices you can use. A hidden device is still listed and can be connected to, and you refer to a device by its `name`, not its `displayName`. See [Organize the device list](/testing/qa-session#organize-devices).

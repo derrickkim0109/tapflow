@@ -125,7 +125,7 @@ MCP를 지원하는 클라이언트라면 모두 tapflow를 사용할 수 있습
 | 도구 | 설명 |
 |------|------|
 | `list_builds` | 릴레이의 앱·빌드 목록 조회 (`install_app`·`launch_app`에 넘길 `buildId`의 출처) |
-| `list_devices` | 연결된 시뮬레이터·에뮬레이터 목록 조회 |
+| `list_devices` | 연결된 시뮬레이터·에뮬레이터·USB로 연결한 폰 목록 조회 |
 | `connect_device` | 세션 참여 (제어 전 필수). 기기를 지켜볼 수 있는 대시보드 링크 `watchUrl`을 함께 돌려줌 |
 | `disconnect_device` | 세션 종료 |
 | `boot_device` | 시뮬레이터·에뮬레이터 부팅 |
@@ -164,6 +164,8 @@ disconnect_device  → 세션 종료, 다른 사람이 기기를 쓸 수 있게 
 
 ::: info 시뮬레이터 이미 부팅된 경우
 `list_devices` 응답의 `status` 필드가 `"booted"`이면 `boot_device`를 생략할 수 있습니다.
+
+기기에는 `kind`가 붙을 수 있습니다. 값은 `simulator`, `emulator`, `physical` 중 하나입니다. `physical`은 [USB로 연결한 Android 폰](/ko/operate/android-usb-devices)입니다. 늘 `booted`로 보이고, 일부 기능은 거부되며, 누군가의 개인 폰일 수 있으니 그 폰에서 테스트하려는 경우에만 연결하세요.
 :::
 
 `list_devices` 응답에는 대시보드에서 정한 `displayName`(Admin이 붙인 이름), `hidden`(Admin이 목록에서 숨김), `favourite`(토큰 주인의 즐겨찾기)이 함께 올 수 있습니다. 대시보드 표시용 값이라 기기 선택에는 영향이 없습니다. 숨긴 기기도 목록에 있고 연결할 수 있으며, 기기를 가리킬 때는 `displayName`이 아니라 `name`을 씁니다. [기기 목록 정리](/ko/testing/qa-session#organize-devices)를 참고하세요.

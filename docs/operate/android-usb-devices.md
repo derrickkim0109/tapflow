@@ -46,13 +46,13 @@ These are refused because they are emulator-only or would leave the phone change
 
 - **Full reset**: it would erase the phone.
 - **Network control**: a session that ended offline would leave the phone offline.
-- **Clipboard**: not supported yet.
+- **Clipboard**: it is read and written through the emulator, which a phone does not have. Not supported yet.
 - **Fold and unfold**: fold a foldable phone by hand.
 - **Clearing app data**: only an app tapflow installed in this session can be cleared. A flow run's reset follows the same rule and reports any other app as failed instead of clearing it.
 
 A full phone is never given room by rolling back its system apps' updates. Video always comes over scrcpy, so `TAPFLOW_ANDROID_BACKEND=grpc` does not apply to a phone.
 
-A request that borrows a device by platform alone, as `tapflow flow run` and the MCP server make, never picks a phone. To run on a phone, name that device.
+Only `tapflow flow run --parallel` borrows devices by platform alone, and it never picks a phone. Without `--parallel`, `tapflow flow run` with no `--device` or `--session` uses the one booted device and skips phones. A phone is used when it is named: `tapflow flow run --device <name>` or `--session <id>`, or an MCP client that connects to it (`list_devices` lists phones, with `kind: "physical"`, and `connect_device` can join one).
 
 ### Installing an app {#install}
 
@@ -73,6 +73,6 @@ Rotation does not work on an older Android phone without the `wm user-rotation` 
 
 ## What is left on the phone {#left-on-phone}
 
-tapflow pushes the scrcpy server that streams the screen, and a file that reads the UI tree, to the phone's `/data/local/tmp`, and removes them when the session is shut down normally. If the phone is unplugged or the agent stops mid-session, they can stay until a later session on that phone is shut down normally. Their names differ from the scrcpy you may run yourself, so the two do not overwrite each other.
+tapflow pushes the scrcpy server that streams the screen, and a file that reads the UI tree, to the phone's `/data/local/tmp`, and removes them when the session is shut down normally, including any older version of the UI tree file. If the phone is unplugged or the agent stops mid-session, they can stay until a later session on that phone is shut down normally. Their names differ from the scrcpy you may run yourself, so the two do not overwrite each other.
 
 The phone's screen stays on while it streams. If the lock screen comes up, the PIN is typed in the viewer and goes through the relay. Apps that block screen capture show black.

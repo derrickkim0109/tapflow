@@ -287,7 +287,7 @@ export function registerTools(server: McpServer, client: TapflowClient): void {
 
   register(
     'list_devices',
-    { description: 'List all available simulators and emulators registered on the tapflow relay.' },
+    { description: 'List simulators, emulators and USB phones (kind: physical) on the tapflow relay.' },
     async () => {
       try {
         const sessions = await client.listDevices()

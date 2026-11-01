@@ -182,7 +182,7 @@ chmod 600 .tapflow/data/.env
 | `TAPFLOW_ANDROID_FPS` | `30` | Android 에뮬레이터 캡처 프레임율(gRPC 경로). |
 | `TAPFLOW_ANDROID_BACKEND` | *(자동)* | 에뮬레이터 백엔드 강제 — `grpc` 또는 `scrcpy`. 미설정 시 기기 종류로 자동 선택. USB로 연결한 폰은 늘 scrcpy를 씁니다. |
 | `TAPFLOW_ANDROID_USB_DEVICES` | *(꺼짐)* | `1`이면 USB로 연결한 Android 폰을 에뮬레이터 옆에 보여 줍니다. 목록에 오른 폰은 릴레이에 접속할 수 있는 누구에게나 열리므로 기본으로 꺼져 있습니다. [USB로 연결한 Android 폰](/ko/operate/android-usb-devices)을 참고하세요. |
-| `TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS` | 120초 + APK 1MB당 1초 | USB로 연결한 폰에 설치할 때 실패로 알리기까지 기다리는 시간. 폰이 자체 확인 창에서 설치를 붙잡고 있을 수 있습니다. `0`이면 제한하지 않습니다. |
+| `TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS` | 120초 + APK 1MB당 1초 | USB로 연결한 폰에 설치할 때 실패로 알리기까지 기다리는 시간. 폰이 자체 확인 창에서 설치를 붙잡고 있을 수 있습니다. 밀리초 단위 정수로 `2147483647`(약 24.8일)까지 받습니다. `0`이면 제한하지 않고, 그 밖의 값은 기본값을 씁니다. |
 | `TAPFLOW_ANDROID_GRPC_PORT` | `8554` | tapflow가 부팅하는 에뮬레이터에 gRPC 포트를 고를 때 시작하는 포트. 이 값부터 2씩 올려 가며 비어 있는 첫 포트를 씁니다. |
 | `TAPFLOW_AUDIO` | *(켜짐)* | `off`이면 기기 오디오 스트리밍을 끕니다. [오디오](/ko/testing/audio)를 참고하세요. |
 | `TAPFLOW_ALLOW_DISPLAY_SLEEP` | *(비어있음)* | 값을 설정하면 세션 중에도 호스트 디스플레이가 꺼질 수 있습니다. 시스템 절전은 계속 막습니다. [에이전트 설정](/ko/operate/agents#호스트-디스플레이와-절전)을 참고하세요. |
