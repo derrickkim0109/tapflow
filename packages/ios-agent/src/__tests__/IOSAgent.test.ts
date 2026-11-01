@@ -4144,6 +4144,28 @@ describe('IOSAgent', () => {
       ctx.agent.disconnect()
     })
 
+    // Mutation: only log a phone's capture failure, as before. The helper runs on the agent's Mac, so the tester sees
+    // a screen that never comes and no reason; the uncorrelated `device:boot-error` is what the dashboard shows.
+    it.each([
+      { name: 'a capture that will not be retried, at once', error: () => new CameraAccessDeniedError('[DeviceCaptureStreamer] camera access denied — allow Camera access'), message: /^Screen capture: camera access denied/ },
+      { name: 'a capture that keeps failing, once', error: () => new Error(`[DeviceCaptureStreamer] ${PHONE.id}: no screen capture device — unlock it`), message: /^Screen capture: no screen capture device/ },
+    ])('tells the session about $name', async ({ error, message }) => {
+      const capture = vi.fn((): CaptureStreamer => ({
+        start: () => new ReadableStream<StreamFrame>({ start(c) { c.error(error()) } }),
+        requestKeyframe: vi.fn(),
+        selectPanel: vi.fn(),
+      }))
+      const ctx = await connected({ capture })
+      ctx.deliver({ type: 'device:boot', requestId: 'rq-cap', sessionId: ctx.phoneSession, payload: { deviceId: PHONE.id } })
+      await vi.waitFor(() => expect(ctx.sent.some((m) => m.type === 'device:boot-error')).toBe(true))
+      await new Promise((r) => setTimeout(r, 700))
+      const reports = ctx.sent.filter((m) => m.type === 'device:boot-error') as Array<Sent & { requestId?: string }>
+      expect(reports).toHaveLength(1)
+      expect(reports[0]!.requestId).toBeUndefined()
+      expect(reports[0]!.message).toMatch(message)
+      ctx.agent.disconnect()
+    })
+
     // Mutation: remove either refusal in `bootPhysical` — a Full reset or a run reset would answer ready having done
     // none of what it promised.
     it.each([

@@ -8,22 +8,30 @@
 // responsible process; it connects back to a loopback TCP port the agent opened.
 //
 // Socket, helper → agent:
+//   [nonce]                             once, first: the --nonce argument as passed (ASCII hex). Any local
+//                                       process can reach the agent's loopback port; this is how the agent
+//                                       tells the helper it launched from whoever connected first.
 //   [status:u8]                         once: 0 = capture running, frames follow; otherwise the exit code
-//                                       below, after which the helper exits. `open` hides the child's exit
-//                                       status from the agent, so this byte is how a failure reaches it.
+//                                       below, then why as UTF-8 text, after which the helper exits. `open`
+//                                       hides the child's exit status and its stderr from the agent, so this
+//                                       is how a failure, and its reason, reach it.
 //   then the screencapture-helper framing:
 //     h264: [u32 BE len][flags:u8 (bit0 = IDR)][Annex-B]   (len counts the flags byte)
 //     jpeg: [u32 BE len][JPEG]
 // Socket, agent → helper: single bytes; 0x01 forces an IDR on the next H.264 frame.
 //
-// Args: <port> <udid> <fps> <h264|jpeg> [--max-size N] [--name <device name>]
+// Args: <port> <udid> <fps> <h264|jpeg> --nonce HEX [--max-size N] [--name <device name>] [--sole]
 //       --request-permission          prime the Camera prompt and exit (0 granted, 77 denied)
 //
 // The capture device's uniqueID is NOT the hardware UDID (measured on macOS 26 with an iPhone 16 Pro Max:
 // a random-looking UUID that matches neither the UDID nor CoreDevice's identifier, and no CoreMediaIO
 // property carries the UDID). So a device is matched by uniqueID == UDID first (dashes ignored, in case a
-// macOS version does use it), then by localizedName == --name (the device name devicectl reports), then,
-// if exactly one iOS screen device is attached, that one.
+// macOS version does use it), then by localizedName == --name (the device name devicectl reports) — and
+// only when exactly one device has that name: two phones left with the factory name "iPhone" would
+// otherwise both stream the first one, while each phone's input went to the right one. Two matches fail
+// (71) rather than guess. With no match, the one iOS screen device is used only when the agent says it
+// sees a single phone (--sole): a lone device whose name reads differently here is that phone, but with
+// two attached, the one that is not showing yet (locked) would be streamed as the other.
 
 import AVFoundation
 import CoreMediaIO
@@ -38,6 +46,7 @@ let EXIT_USAGE: Int32 = 64
 let EXIT_CONNECT: Int32 = 65
 let EXIT_NO_DEVICE: Int32 = 69
 let EXIT_SESSION: Int32 = 70
+let EXIT_AMBIGUOUS: Int32 = 71
 let EXIT_PERMISSION: Int32 = 77
 
 func log(_ s: String) { FileHandle.standardError.write(("device-capture: " + s + "\n").data(using: .utf8)!) }
@@ -71,12 +80,16 @@ if rawArgs.contains("--request-permission") {
 var positional: [String] = []
 var maxSize = 0
 var deviceName: String?
+var nonce = ""
+var sole = false
 do {
     var i = 0
     while i < rawArgs.count {
         let a = rawArgs[i]
         if a == "--max-size", i + 1 < rawArgs.count { maxSize = max(0, Int(rawArgs[i + 1]) ?? 0); i += 2; continue }
         if a == "--name", i + 1 < rawArgs.count { deviceName = rawArgs[i + 1]; i += 2; continue }
+        if a == "--nonce", i + 1 < rawArgs.count { nonce = rawArgs[i + 1]; i += 2; continue }
+        if a == "--sole" { sole = true; i += 1; continue }
         positional.append(a); i += 1
     }
 }
@@ -86,8 +99,8 @@ let port = positional.count == 4 ? UInt16(positional[0]) ?? 0 : 0
 let fps = positional.count == 4 ? Double(positional[2]) ?? 0 : 0
 let targetUDID = positional.count == 4 ? positional[1] : ""
 let useH264 = positional.count == 4 && positional[3] == "h264"
-if port == 0 || fps <= 0 || targetUDID.isEmpty || !(useH264 || positional[3] == "jpeg") {
-    log("usage: device-capture-helper <port> <udid> <fps> <h264|jpeg> [--max-size N] [--name NAME] | --request-permission")
+if port == 0 || fps <= 0 || targetUDID.isEmpty || nonce.isEmpty || !(useH264 || positional[3] == "jpeg") {
+    log("usage: device-capture-helper <port> <udid> <fps> <h264|jpeg> --nonce HEX [--max-size N] [--name NAME] [--sole] | --request-permission")
     exit(EXIT_USAGE)
 }
 
@@ -129,10 +142,13 @@ func send(_ data: Data) {
     }
 }
 
-/// Report a startup failure to the agent and exit with the same code.
+// Before anything else on the socket: the agent takes nothing from a connection that does not open with it.
+guard writeAll(Data(nonce.utf8)) else { log("could not send the nonce"); exit(EXIT_CONNECT) }
+
+/// Report a startup failure to the agent, with why, and exit with the same code.
 func fail(_ code: Int32, _ message: String) -> Never {
     log(message)
-    writeQueue.sync { _ = writeAll(Data([UInt8(code)])) }
+    writeQueue.sync { _ = writeAll(Data([UInt8(code)]) + Data(message.utf8)) }
     exit(code)
 }
 
@@ -335,21 +351,47 @@ do {
 
 func normalize(_ s: String) -> String { s.replacingOccurrences(of: "-", with: "").uppercased() }
 
-func findDevice() -> AVCaptureDevice? {
-    let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .muxed, position: .unspecified).devices
-    if let d = devices.first(where: { normalize($0.uniqueID) == normalize(targetUDID) }) { return d }
-    if let name = deviceName, let d = devices.first(where: { $0.localizedName == name }) { return d }
-    let ios = devices.filter { $0.modelID == "iOS Device" }
-    if deviceName == nil, ios.count == 1 { return ios[0] }
-    return nil
+enum Match {
+    /// `exact`: by uniqueID, which no other device can have. A match by name or by being the only one is final
+    /// only once the list has settled (below).
+    case found(AVCaptureDevice, exact: Bool)
+    /// More than one device has the name asked for: which is this phone cannot be told.
+    case ambiguous(Int)
+    case none
 }
 
-// The device list is populated asynchronously on the main run loop after the property is set — 1–2 s.
+func findDevice() -> Match {
+    let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .muxed, position: .unspecified).devices
+    if let d = devices.first(where: { normalize($0.uniqueID) == normalize(targetUDID) }) { return .found(d, exact: true) }
+    if let name = deviceName {
+        let named = devices.filter { $0.localizedName == name }
+        if named.count > 1 { return .ambiguous(named.count) }
+        if let d = named.first { return .found(d, exact: false) }
+    }
+    let ios = devices.filter { $0.modelID == "iOS Device" }
+    if (deviceName == nil || sole), ios.count == 1 { return .found(ios[0], exact: false) }
+    return .none
+}
+
+// The device list is populated asynchronously on the main run loop after the property is set — 1–2 s, and not
+// all at once: a second phone with the same name can appear after the first. So a match that is not exact is
+// taken only once the list has been there for `settle`, or the other phone would never be seen to make it ambiguous.
 var device: AVCaptureDevice?
 let deadline = Date().addingTimeInterval(10)
+let settle: TimeInterval = 2
+var firstSeen: Date?
 while device == nil && Date() < deadline {
-    device = findDevice()
-    if device == nil { RunLoop.main.run(until: Date().addingTimeInterval(0.25)) }
+    switch findDevice() {
+    case .found(let d, let exact):
+        let seen = firstSeen ?? Date()
+        firstSeen = seen
+        if exact || Date().timeIntervalSince(seen) >= settle { device = d }
+        else { RunLoop.main.run(until: Date().addingTimeInterval(0.25)) }
+    case .ambiguous(let count):
+        fail(EXIT_AMBIGUOUS, "\(count) attached iPhones are named \"\(deviceName ?? "")\", so which one is \(targetUDID) cannot be told")
+    case .none:
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+    }
 }
 guard let device else {
     let seen = AVCaptureDevice.DiscoverySession(deviceTypes: [.external], mediaType: .muxed, position: .unspecified).devices

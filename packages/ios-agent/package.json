@@ -39,6 +39,7 @@
   "files": [
     "dist",
     "bin",
+    "!bin/device-capture-helper.app",
     "src/device-capture-helper.swift",
     "xctest-runner/project.yml",
     "xctest-runner/TreeHost",

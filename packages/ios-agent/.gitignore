@@ -6,6 +6,7 @@
 bin/.audiotap.entitlements
 xctest-runner/build/
 # device-capture-helper bundle: built on first use from src/device-capture-helper.swift, which ships in the
-# package for that reason. Never committed or packed: the Camera grant is keyed on the signature, and an
-# ad-hoc signature from one maintainer's Mac is not something to hand every installer.
+# package for that reason, into ~/Library/Caches/tapflow. Earlier builds went here; never committed or packed
+# (package.json's `files` excludes it too): the Camera grant is keyed on the signature, and an ad-hoc
+# signature from one maintainer's Mac is not something to hand every installer.
 bin/device-capture-helper.app/
