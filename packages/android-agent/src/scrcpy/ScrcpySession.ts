@@ -54,6 +54,11 @@ export class ScrcpySession {
     this.socketName = `scrcpy_${this.scid}`
   }
 
+  /** The local port `adb forward` maps to this session's socket, once `start` set it up; undefined before. */
+  get forwardedPort(): number | undefined {
+    return this.port || undefined
+  }
+
   /** The `scid=` this session's server runs with: what tells it from any other scrcpy server on the device. */
   get id(): string {
     return this.scid

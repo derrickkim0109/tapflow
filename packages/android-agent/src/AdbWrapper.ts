@@ -28,6 +28,8 @@ export function encodeAdbInputText(text: string): string {
 }
 
 const NO_FILE = '__TAPFLOW_NO_FILE__'
+/** Every tree dump jar tapflow may have pushed (`tapflow-uidump-<hash>.jar`), expanded by the device's shell. */
+const UIDUMP_DEVICE_GLOB = '/data/local/tmp/tapflow-uidump-*.jar'
 
 /** Whether `deviceId` names a USB-connected device (`usb:<serial>`) rather than an AVD (`avd:<name>`). */
 export function isPhysicalDevice(deviceId: string): boolean {
@@ -113,8 +115,11 @@ export class AdbWrapper {
     this.usbDevices = options.usbDevices ?? usbDevicesEnabled()
   }
 
+  /** The adb serial of a device id. A `usb:` id names its own serial, so a phone is reachable even when the serial map
+   *  dropped it — a `listDevices` that ran during a cable blip, while the device list re-read (which does not sync the
+   *  map) still lists it. */
   getSerial(avdId: string): string | undefined {
-    return this.serialMap.get(avdId)
+    return this.serialMap.get(avdId) ?? (isPhysicalDevice(avdId) ? physicalSerial(avdId) : undefined)
   }
 
   setSerial(avdId: string, serial: string): void {
@@ -723,8 +728,9 @@ export class AdbWrapper {
   // `wm user-rotation lock` over legacy `settings put system user_rotation`: the latter is silently
   // ignored on newer Android (API 35+) — the display never rotates, only a rotation-suggestion appears.
   // wm user-rotation locks regardless of auto-rotate and works on API 34 through 37 alike.
-  async setRotation(serial: string, rotation: 0 | 1 | 2 | 3): Promise<void> {
-    await this.runner.exec('-s', serial, 'shell', 'wm', 'user-rotation', 'lock', String(rotation))
+  // `timeoutMs` kills the child once it runs past it (`execWithin`), for a phone whose shell can hang.
+  async setRotation(serial: string, rotation: 0 | 1 | 2 | 3, timeoutMs?: number): Promise<void> {
+    await this.rotationExec(timeoutMs, '-s', serial, 'shell', 'wm', 'user-rotation', 'lock', String(rotation))
   }
 
   /**
@@ -732,8 +738,8 @@ export class AdbWrapper {
    * quarter. Read with the same command family, so an image that lacks one lacks the other. The
    * output is `free` or `lock 3`, measured on API 34.
    */
-  async getUserRotation(serial: string): Promise<{ mode: 'free' } | { mode: 'lock'; rotation: 0 | 1 | 2 | 3 }> {
-    const out = (await this.runner.exec('-s', serial, 'shell', 'wm', 'user-rotation')).trim()
+  async getUserRotation(serial: string, timeoutMs?: number): Promise<{ mode: 'free' } | { mode: 'lock'; rotation: 0 | 1 | 2 | 3 }> {
+    const out = (await this.rotationExec(timeoutMs, '-s', serial, 'shell', 'wm', 'user-rotation')).trim()
     if (out === 'free') return { mode: 'free' }
     const lock = /^lock ([0-3])$/.exec(out)
     if (lock) return { mode: 'lock', rotation: Number(lock[1]) as 0 | 1 | 2 | 3 }
@@ -742,8 +748,12 @@ export class AdbWrapper {
   }
 
   /** Let Android rotate with the device again (`wm user-rotation free`): what an AVD comes with. */
-  async freeRotation(serial: string): Promise<void> {
-    await this.runner.exec('-s', serial, 'shell', 'wm', 'user-rotation', 'free')
+  async freeRotation(serial: string, timeoutMs?: number): Promise<void> {
+    await this.rotationExec(timeoutMs, '-s', serial, 'shell', 'wm', 'user-rotation', 'free')
+  }
+
+  private rotationExec(timeoutMs: number | undefined, ...args: string[]): Promise<string> {
+    return timeoutMs === undefined ? this.runner.exec(...args) : this.execWithin(timeoutMs, ...args)
   }
 
   /**
@@ -887,12 +897,20 @@ export class AdbWrapper {
     this.runner.execSyncWithin(timeoutMs, '-s', serial, 'shell', 'wm', 'user-rotation', ...args)
   }
 
+  /** Remove a port forward **synchronously**, for the agent's exit (`restoreRotationNow`'s reason). Throws when it could
+   *  not, or when the runner cannot block. */
+  removeForwardNow(serial: string, port: number, timeoutMs: number): void {
+    if (!this.runner.execSyncWithin) throw new PlatformError('this adb runner cannot run adb synchronously')
+    this.runner.execSyncWithin(timeoutMs, '-s', serial, 'forward', '--remove', `tcp:${port}`)
+  }
+
   /**
    * Remove what tapflow pushed to a USB-connected device's `/data/local/tmp` — the scrcpy server and the tree dump —
-   * once its session is over, so a phone is not left holding them. The tree dump is pushed again on its next use.
+   * once its session is over, so a phone is not left holding them. The tree dump is pushed again on its next use. Its
+   * name carries a hash, so every version is matched by the device shell's glob, including one an earlier agent pushed.
    */
   async removePushedFiles(serial: string, timeoutMs: number): Promise<void> {
-    const files = [SCRCPY_SERVER_DEVICE_PATH, ...(this.uidumpDevicePath ? [this.uidumpDevicePath] : [])]
+    const files = [SCRCPY_SERVER_DEVICE_PATH, UIDUMP_DEVICE_GLOB]
     this.uidumpPushed.delete(serial)
     await this.execWithin(timeoutMs, '-s', serial, 'shell', 'rm', '-f', ...files)
   }

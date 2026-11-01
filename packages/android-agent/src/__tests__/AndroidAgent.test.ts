@@ -759,7 +759,7 @@ describe('AndroidAgent', () => {
       it('gives an auto-rotating phone its auto-rotate back', async () => {
         const adb = mockPhoneAdb({ mode: 'free' })
         const close = await rotateThenShutDown(adb)
-        expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
+        expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000)
         close()
       })
 
@@ -768,7 +768,7 @@ describe('AndroidAgent', () => {
         const adb = mockPhoneAdb({ mode: 'lock', rotation: 1 })
         const close = await rotateThenShutDown(adb)
         expect(adb.freeRotation).not.toHaveBeenCalled()
-        expect(vi.mocked(adb.setRotation).mock.calls.at(-1)).toEqual([PHONE_SERIAL, 1])
+        expect(vi.mocked(adb.setRotation).mock.calls.at(-1)).toEqual([PHONE_SERIAL, 1, 10_000])
         close()
       })
 
@@ -787,7 +787,7 @@ describe('AndroidAgent', () => {
         const done = waitForType(browser, 'device:shutdown-done')
         send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
         await done
-        expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
+        expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000)
         close()
       })
 
@@ -813,7 +813,7 @@ describe('AndroidAgent', () => {
         memory.remember(PHONE_ID, { mode: 'free' })
         const agent = new AndroidAgent({ physicalRotationMemory: memory }, adb)
         await agent.connect(`ws://localhost:${port}`)
-        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL))
+        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000))
         expect(memory.ids()).toEqual([])
         agent.disconnect()
       })
@@ -843,7 +843,7 @@ describe('AndroidAgent', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
         try {
           const close = await rotateThenShutDown(adb, disk)
-          expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL)
+          expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000)
           close()
         } finally {
           warn.mockRestore()
@@ -899,6 +899,78 @@ describe('AndroidAgent', () => {
         }
       })
 
+      // Mutation: write the lock without checking one is remembered — a boot whose read failed remembered nothing, and
+      // the phone keeps tapflow's lock with nothing to put back.
+      it('does not lock a phone whose rotation lock it cannot read', async () => {
+        const adb = mockPhoneAdb()
+        vi.mocked(adb.getUserRotation).mockRejectedValue(new Error('Cannot read the rotation lock'))
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const { send, close } = await bootPhone(adb)
+          send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+          await vi.waitFor(() => expect(adb.getUserRotation).toHaveBeenCalledTimes(2))
+          await new Promise((r) => setTimeout(r, 20))
+          expect(adb.setRotation).not.toHaveBeenCalled()
+          close()
+        } finally {
+          warn.mockRestore()
+        }
+      })
+
+      // Mutation: skip the read before the write — the lock missed at boot is never remembered, and the shutdown has
+      // nothing to write back.
+      it('reads the lock a boot missed before writing one, and writes it back at shutdown', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        vi.mocked(adb.getUserRotation).mockRejectedValueOnce(new Error('timed out'))
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const close = await rotateThenShutDown(adb)
+          expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000)
+          close()
+        } finally {
+          warn.mockRestore()
+        }
+      })
+
+      // Mutation: drop the `booted` check — a rotate that lands after the shutdown wrote the lock back, or from a client
+      // that joined without booting, leaves a lock that no shutdown puts back.
+      it('does not lock a phone whose session is not booted', async () => {
+        const adb = mockPhoneAdb({ mode: 'free' })
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const joined = await openPhone(adb)
+          joined.send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+          await new Promise((r) => setTimeout(r, 20))
+          expect(adb.setRotation).not.toHaveBeenCalled()
+          joined.close()
+
+          const late = mockPhoneAdb({ mode: 'free' })
+          const { browser, send, close } = await bootPhone(late)
+          const done = waitForType(browser, 'device:shutdown-done')
+          send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+          await done
+          send({ type: 'input:rotate', payload: { orientation: 'landscape' } })
+          await new Promise((r) => setTimeout(r, 20))
+          expect(late.setRotation).not.toHaveBeenCalled()
+          close()
+        } finally {
+          warn.mockRestore()
+        }
+      })
+
+      // Mutation: leave the forward to `ScrcpySession.stop` — its `adb forward --remove` is never waited for, the CLI
+      // exits first and the forward stays in the adb server.
+      it('removes the stream\'s port forward synchronously when the agent disconnects', async () => {
+        const adb = mockPhoneAdb()
+        const removed = vi.spyOn(adb, 'removeForwardNow').mockImplementation(() => {})
+        vi.mocked(ScrcpySession).mockClear()
+        const { close } = await bootPhone(adb)
+        const session = vi.mocked(ScrcpySession).mock.results[0]!.value as { forwardedPort?: number }
+        session.forwardedPort = 27183
+        close()
+        expect(removed).toHaveBeenCalledWith(PHONE_SERIAL, 27183, 2_000)
+      })
+
       // Mutation: forget the remembered lock when the write could not be made — an unplugged phone never gets it back.
       it('puts it back when an unplugged phone is seen again', async () => {
         const adb = mockPhoneAdb({ mode: 'free' })
@@ -908,13 +980,15 @@ describe('AndroidAgent', () => {
         await vi.waitFor(() => expect(adb.setRotation).toHaveBeenCalledWith(PHONE_SERIAL, 3))
         adb.clearSerial(PHONE_ID)
         vi.mocked(adb.listDevices).mockResolvedValue([])
+        // Unplugged: adb reaches the serial, and the phone is not there to answer.
+        vi.mocked(adb.freeRotation).mockRejectedValueOnce(new Error(`device '${PHONE_SERIAL}' not found`))
         const done = waitForType(browser, 'device:shutdown-done')
         send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
         await done
-        expect(adb.freeRotation).not.toHaveBeenCalled()
+        expect(adb.freeRotation).toHaveBeenCalledTimes(1)
         vi.mocked(adb.listDevices).mockImplementation(async () => { adb.setSerial(PHONE_ID, PHONE_SERIAL); return listed() })
         await agent.listDevices()
-        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL))
+        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000))
         close()
       })
     })
@@ -965,6 +1039,41 @@ describe('AndroidAgent', () => {
         close()
       })
 
+      // Mutation: look the serial up in the serial map alone (`getSerial`) — a `listDevices` that ran during a cable blip
+      // dropped the phone there, and its shutdown leaves the scrcpy server and the tree dump on it.
+      it('cleans up a phone a listing dropped from the serial map while the re-read still lists it', async () => {
+        const adb = mockPhoneAdb()
+        const removed = vi.spyOn(adb, 'removePushedFiles').mockResolvedValue(undefined)
+        const { browser, send, close } = await bootPhone(adb)
+        adb.clearSerial(PHONE_ID)
+        const done = waitForType(browser, 'device:shutdown-done')
+        send({ type: 'device:shutdown', requestId: 'rq-off', payload: { deviceId: PHONE_ID } })
+        await done
+        expect(removed).toHaveBeenCalledWith(PHONE_SERIAL, 5_000)
+        close()
+      })
+
+      // Mutation: drop the forget from the relay-lost teardown — after the reconnect a new session could clear the data
+      // of a package an earlier session installed.
+      it('forgets what its sessions left when the relay connection is lost', async () => {
+        const adb = mockPhoneAdb()
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        const agent = new AndroidAgent({ physicalRotationMemory: inMemoryPhysicalRotation(), reconnectDelays: [60_000] }, adb)
+        try {
+          await agent.connect(`ws://localhost:${port}`)
+          const memory = agent as unknown as PhoneMemory
+          memory.ownedDevices.add(PHONE_ID)
+          memory.installedOnPhone.set(PHONE_ID, new Set(['com.example.app']))
+          internals(agent).ws!.terminate()
+          await vi.waitFor(() => expect(internals(agent).deviceStates.size).toBe(0))
+          expect(memory.ownedDevices.has(PHONE_ID)).toBe(false)
+          expect(memory.installedOnPhone.has(PHONE_ID)).toBe(false)
+        } finally {
+          agent.disconnect()
+          warn.mockRestore()
+        }
+      })
+
       // Mutation: drop the forget from `applyDevices` — plugged in again, the phone would still count as tapflow's and
       // `app:clear-state` would clear a package installed in a session that is long over.
       it('forgets what its sessions left when it leaves the list, and keeps a rotation lock it still owes', async () => {
@@ -1000,7 +1109,7 @@ describe('AndroidAgent', () => {
         await agent.connect(`ws://localhost:${port}`)
         expect(internals(agent).deviceStates.size).toBe(0)
         peek.mockResolvedValue(phone)
-        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL))
+        await vi.waitFor(() => expect(adb.freeRotation).toHaveBeenCalledWith(PHONE_SERIAL, 10_000))
         expect(memory.ids()).toEqual([])
         await vi.waitFor(() => expect([...internals(agent).deviceStates.values()]).toContainEqual(
           expect.objectContaining({ deviceId: PHONE_ID, booted: false }),
@@ -1017,7 +1126,7 @@ describe('AndroidAgent', () => {
         const { browser, send, close } = await bootPhone(adb)
         const error = waitForType<NetworkError>(browser, 'network:error')
         send({ type: 'network:set', requestId: 'rq-net', payload: { offline: true } })
-        expect((await error).message).toMatch(/Network control is not available on a USB-connected device/)
+        expect((await error).message).toMatch(/Network control is not available on a USB-connected device — a session that ended offline would leave the phone offline/)
         expect(write).not.toHaveBeenCalled()
         close()
       })
@@ -1028,7 +1137,7 @@ describe('AndroidAgent', () => {
         const error = waitForType(browser, 'clipboard:error')
         send({ type: 'clipboard:read', requestId: 'rq-clip' })
         const reply = await error
-        expect(reply['message']).toMatch(/clipboard is not available on a USB-connected device/)
+        expect(reply['message']).toMatch(/clipboard is not available on a USB-connected device yet — it is read and written through the emulator/)
         expect(reply['payload']).toMatchObject({ unsupported: true })
         close()
       })
@@ -1075,7 +1184,8 @@ describe('AndroidAgent', () => {
         close()
       })
 
-      // Mutation: a fixed bound — a large build on a slow cable is cut off and blamed on a prompt; or ignore the override.
+      // Mutation: a fixed bound — a large build on a slow cable is cut off and blamed on a prompt; or ignore the override;
+      // or take any finite number — 2^31 ms or a fraction fails every install.
       it('bounds an install by the APK\'s size, unless TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS says otherwise', async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-apk-'))
         const apk = path.join(dir, 'app.apk')
@@ -1089,6 +1199,14 @@ describe('AndroidAgent', () => {
           expect(bound(apk)).toBe(900_000)
           vi.stubEnv('TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS', '0')
           expect(bound(apk)).toBeUndefined()
+          // A value a timer cannot hold falls back to the default rather than failing every install: 2^31 ms overflows
+          // to 1 ms in `execFile`, and a fraction makes it throw.
+          for (const unusable of ['2147483648', '1e12', '1500.5', '-1', 'soon']) {
+            vi.stubEnv('TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS', unusable)
+            expect(bound(apk), unusable).toBe(120_000 + 300_000)
+          }
+          vi.stubEnv('TAPFLOW_ANDROID_USB_INSTALL_TIMEOUT_MS', '2147483647')
+          expect(bound(apk)).toBe(2_147_483_647)
         } finally {
           vi.unstubAllEnvs()
           fs.rmSync(dir, { recursive: true, force: true })
@@ -5471,20 +5589,22 @@ describe('reconcileScreen (the wiring, not the arithmetic)', () => {
 describe('standing a device up on boot', () => {
   const upright = async (lock: Awaited<ReturnType<AdbWrapper['getUserRotation']>> | Error) => {
     const adb = mockAdb(true)
-    if (lock instanceof Error) vi.spyOn(adb, 'getUserRotation').mockRejectedValue(lock)
-    else vi.spyOn(adb, 'getUserRotation').mockResolvedValue(lock)
+    const read = lock instanceof Error ? vi.spyOn(adb, 'getUserRotation').mockRejectedValue(lock)
+      : vi.spyOn(adb, 'getUserRotation').mockResolvedValue(lock)
     const set = vi.spyOn(adb, 'setRotation').mockResolvedValue(undefined)
     const agent = new AndroidAgent({}, adb)
     const outcome = internals(agent).uprightOnBoot('usb:emulator-5554', 'emulator-5554')
-    return { outcome, set }
+    return { outcome, set, read }
   }
 
   // Mutation: reset only 1 and 3. Upside down (2) is left by a fold carried across at 180, and on
-  // scrcpy it shows the picture inverted.
+  // scrcpy it shows the picture inverted. Or read and write without a bound — a phone whose shell hangs keeps the
+  // `adb shell` child.
   it.each([3, 2, 1] as const)('stands a device locked at %i back at 0', async (rotation) => {
-    const { outcome, set } = await upright({ mode: 'lock', rotation })
+    const { outcome, set, read } = await upright({ mode: 'lock', rotation })
     await outcome
-    expect(set).toHaveBeenCalledWith('emulator-5554', 0)
+    expect(read).toHaveBeenCalledWith('emulator-5554', 10_000)
+    expect(set).toHaveBeenCalledWith('emulator-5554', 0, 10_000)
   })
 
   // The recorded decision in `normaliseOnBoot`: a lock written onto an auto-rotating AVD takes

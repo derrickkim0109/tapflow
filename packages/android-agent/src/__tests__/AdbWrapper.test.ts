@@ -1064,7 +1064,7 @@ describe('listDevices — USB-connected devices (#152)', () => {
       id: `usb:${SERIAL}`, name: 'Galaxy Z Flip4', platform: 'android', status: 'booted',
       osVersion: 'Android 15', formFactor: 'phone', kind: 'physical',
     })
-    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBe(SERIAL)
+    expect((wrapper as unknown as { serialMap: Map<string, string> }).serialMap.get(`usb:${SERIAL}`)).toBe(SERIAL)
   })
 
   // Mutation: drop `kind: 'emulator'` from the AVD rows.
@@ -1186,7 +1186,7 @@ describe('listDevices — USB-connected devices (#152)', () => {
     expect(shellsFor(SERIAL)).toBe(1)
     rows.now = 'List of devices attached\n'
     expect((await wrapper.listDevices()).some((d) => d.kind === 'physical')).toBe(false)
-    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBeUndefined()
+    expect((wrapper as unknown as { serialMap: Map<string, string> }).serialMap.has(`usb:${SERIAL}`)).toBe(false)
     rows.now = `List of devices attached\n${SERIAL}\tdevice\n`
     await wrapper.listDevices()
     expect(shellsFor(SERIAL)).toBe(2)
@@ -1202,8 +1202,33 @@ describe('listDevices — USB-connected devices (#152)', () => {
     expect(peeked.find((d) => d.id === `usb:${SERIAL}`)).toMatchObject({ kind: 'physical', name: 'Galaxy Z Flip4', status: 'booted' })
     expect(peeked.find((d) => d.id === 'avd:Pixel_8_API_34')).toMatchObject({ kind: 'emulator' })
     expect(bounded.mock.calls.some((c) => c[2] === SERIAL && c[3] === 'shell')).toBe(true)
-    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBeUndefined()
+    expect((wrapper as unknown as { serialMap: Map<string, string> }).serialMap.has(`usb:${SERIAL}`)).toBe(false)
     expect(await wrapper.listDevices()).toEqual(peeked)
+  })
+
+  // Mutation: look the serial up in the serial map alone — a phone a `listDevices` dropped during a cable blip, while the
+  // re-read still lists it, cannot be installed on, rotated or shut down.
+  it('reaches a phone by its id when the serial map has dropped it, and an AVD only through the map', () => {
+    const wrapper = new AdbWrapper({ exec: vi.fn(), execBinary: vi.fn(), listAvds: vi.fn() }, { usbDevices: true })
+    expect(wrapper.getSerial(`usb:${SERIAL}`)).toBe(SERIAL)
+    expect(wrapper.getSerial('avd:Pixel_8_API_34')).toBeUndefined()
+  })
+
+  // Mutation: send a rotation read or write with a bound through plain `exec` — a phone whose shell hangs keeps an
+  // `adb shell` child per try, since only a bounded exec kills it.
+  it('runs a bounded rotation read and write through the exec that kills its child', async () => {
+    const exec = vi.fn().mockResolvedValue('free')
+    const execBounded = vi.fn().mockResolvedValue('free')
+    const wrapper = new AdbWrapper({ exec, execBounded, execBinary: vi.fn(), listAvds: vi.fn() })
+    await wrapper.getUserRotation(SERIAL, 10_000)
+    await wrapper.setRotation(SERIAL, 1, 10_000)
+    await wrapper.freeRotation(SERIAL, 10_000)
+    expect(execBounded.mock.calls).toEqual([
+      [10_000, '-s', SERIAL, 'shell', 'wm', 'user-rotation'],
+      [10_000, '-s', SERIAL, 'shell', 'wm', 'user-rotation', 'lock', '1'],
+      [10_000, '-s', SERIAL, 'shell', 'wm', 'user-rotation', 'free'],
+    ])
+    expect(exec).not.toHaveBeenCalled()
   })
 
   // Mutation: forget a phone's properties only in `listDevices` — a phone unplugged and plugged back while only the
@@ -1260,7 +1285,7 @@ describe('listDevices — USB devices off (the default)', () => {
       const wrapper = new AdbWrapper(runner, { usbDevices: usbDevicesEnabled({}) })
       const devices = await wrapper.listDevices()
       expect(devices.map((d) => d.id)).toEqual(['avd:Pixel_8_API_34'])
-      expect(wrapper.getSerial('usb:RFCX00ABCDE')).toBeUndefined()
+      expect((wrapper as unknown as { serialMap: Map<string, string> }).serialMap.has('usb:RFCX00ABCDE')).toBe(false)
       expect(exec.mock.calls.filter((c) => c[1] !== 'emulator-5554' && c[0] !== 'devices')).toEqual([])
       expect(warn).not.toHaveBeenCalled()
     } finally {
@@ -1301,8 +1326,18 @@ describe('a USB-connected device\'s install and clean-up (#152)', () => {
     expect(pushes()).toHaveLength(1)
     const jar = pushes()[0]![4] as string
     await wrapper.removePushedFiles('RFCX00ABCDE', 5_000)
-    expect(exec).toHaveBeenCalledWith('-s', 'RFCX00ABCDE', 'shell', 'rm', '-f', '/data/local/tmp/tapflow-scrcpy-server.jar', jar)
+    expect(jar).toMatch(/^\/data\/local\/tmp\/tapflow-uidump-[0-9a-f]{12}\.jar$/)
+    expect(exec).toHaveBeenCalledWith('-s', 'RFCX00ABCDE', 'shell', 'rm', '-f', '/data/local/tmp/tapflow-scrcpy-server.jar', '/data/local/tmp/tapflow-uidump-*.jar')
     await wrapper.dumpUiHierarchy('RFCX00ABCDE').catch(() => {})
     expect(pushes()).toHaveLength(2)
+  })
+
+  // Mutation: remove the tree dump only when this agent dumped — a jar an earlier agent pushed (under a name only it
+  // knew) stays on the phone.
+  it('removes a tree dump this agent never pushed, by the glob every version matches', async () => {
+    const exec = vi.fn().mockResolvedValue('')
+    const wrapper = new AdbWrapper({ exec, execBinary: vi.fn(), listAvds: vi.fn() })
+    await wrapper.removePushedFiles('RFCX00ABCDE', 5_000)
+    expect(exec).toHaveBeenCalledWith('-s', 'RFCX00ABCDE', 'shell', 'rm', '-f', '/data/local/tmp/tapflow-scrcpy-server.jar', '/data/local/tmp/tapflow-uidump-*.jar')
   })
 })
