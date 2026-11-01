@@ -125,7 +125,7 @@ MCP를 지원하는 클라이언트라면 모두 tapflow를 사용할 수 있습
 | 도구 | 설명 |
 |------|------|
 | `list_builds` | 릴레이의 앱·빌드 목록 조회 (`install_app`·`launch_app`에 넘길 `buildId`의 출처) |
-| `list_devices` | 연결된 시뮬레이터·에뮬레이터·USB로 연결한 폰 목록 조회 |
+| `list_devices` | 연결된 시뮬레이터·에뮬레이터·USB로 연결한 기기(Android 폰·iPhone) 목록 조회. 기기마다 `kind`를 함께 돌려줌 |
 | `connect_device` | 세션 참여 (제어 전 필수). 기기를 지켜볼 수 있는 대시보드 링크 `watchUrl`을 함께 돌려줌 |
 | `disconnect_device` | 세션 종료 |
 | `boot_device` | 시뮬레이터·에뮬레이터 부팅 |
