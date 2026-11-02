@@ -91,6 +91,12 @@ const ARCHIVE_READ_MAXBUFFER = 256 * 1024 * 1024 // 256 MB
 function findAppDirInZip(zipPath: string): string | null {
   const list = spawnSync('unzip', ['-l', zipPath], { encoding: 'utf8', maxBuffer: ARCHIVE_READ_MAXBUFFER })
   if (list.status !== 0) return null
+  // An .ipa keeps its app under Payload/. Matched on any entry inside it, not only the directory's own line, which
+  // an archiver is free to leave out.
+  if (buildFileKind(zipPath) === 'ipa') {
+    const ipa = /\d{2}:\d{2}\s+(Payload\/[^/\n]+\.app)\//m.exec(list.stdout as string)
+    return ipa ? ipa[1] : null
+  }
   // "  12345  2024-01-01 00:00:00  MyApp.app/"  형태를 매칭 (앱 이름에 공백 포함 가능)
   // HH:MM 시간 컬럼을 기준점으로 삼아 filename 컬럼만 캡처
   const re = /\d{2}:\d{2}\s+(\S[^/\n]*\.app)\/\s*$/m
@@ -607,18 +613,13 @@ export function handleUploadBuild(
     originalName = info.filename ?? ''
     const kind = buildFileKind(originalName)
 
-    if (kind === 'ipa') {
-      fileError = 'iOS simulator builds must be in .app.zip or .tar.gz format. Zip (or tar.gz, e.g. an EAS simulator build) the .app directory built for iphonesimulator and upload it.'
-      stream.resume()
-      return
-    }
     if (kind === 'aab') {
       fileError = 'Android emulator installs require an .apk. Build an .apk (not .aab) and upload it.'
       stream.resume()
       return
     }
     if (kind === 'unknown') {
-      fileError = 'Only .app.zip / .tar.gz (iOS) or .apk (Android) files allowed'
+      fileError = 'Only .app.zip / .tar.gz / .ipa (iOS) or .apk (Android) files allowed'
       stream.resume()
       return
     }
@@ -655,7 +656,7 @@ export function handleUploadBuild(
     }
 
     const kind = buildFileKind(originalName)
-    const isIos = kind === 'ios-zip' || kind === 'ios-tar'
+    const isIos = kind === 'ios-zip' || kind === 'ios-tar' || kind === 'ipa'
     // What the file is, not the caller's `platform` field: it decides which of the app's IDs the build's becomes.
     const platform: Platform = isIos ? 'ios' : 'android'
     const status = ['Backlog', 'In Progress', 'Done', 'Rejected'].includes(fields.status)
@@ -680,11 +681,15 @@ export function handleUploadBuild(
       const info = extractAppInfo(savedPath)
       if (info === null) {
         fs.unlinkSync(savedPath)
-        return json(res, 400, { error: 'No .app directory found in the archive. Upload a .app.zip or .tar.gz that contains a .app directory.' })
+        return json(res, 400, { error: kind === 'ipa'
+          ? 'No .app directory found under Payload/ in the .ipa. Upload the .ipa Xcode exports, or a .app.zip or .tar.gz.'
+          : 'No .app directory found in the archive. Upload a .app.zip or .tar.gz that contains a .app directory.' })
       }
 
       // lipo 슬라이스 검증 (macOS only; Linux에서는 null → skip)
-      const appDir = findAppDir(savedPath)
+      // Not for an .ipa: it is a device build by what it is, for a USB-connected iPhone, and the agent says so if one
+      // is opened on a simulator.
+      const appDir = kind === 'ipa' ? null : findAppDir(savedPath)
       if (appDir) {
         const sliceOk = hasSimulatorSlice(savedPath, appDir)
         if (sliceOk === false) {

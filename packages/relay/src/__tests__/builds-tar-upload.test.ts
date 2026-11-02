@@ -8,6 +8,7 @@ import { initDb, getDb, closeDb } from '../db'
 import { makePasswordHash } from '../api/auth'
 import { signJwt } from '../middleware/auth'
 import { makeAppTarGz, writeRawTarGz } from './helpers/tarFixture'
+import { writeZipFixture } from './helpers/zipFixture'
 import { assertArchiveTools } from './helpers/archivePrereqs'
 
 const XML_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
@@ -136,11 +137,31 @@ describe('POST /api/v1/builds — .tar.gz (EAS simulator) ingest', () => {
     expect(r.body.bundle_id).toBe('com.example.eas')
   })
 
-  // #4 — .ipa 거절, 안내에 .tar.gz 포함
-  it('rejects .ipa with guidance mentioning .tar.gz', async () => {
-    const r = await postTar(port, 'T4', 'app.ipa', Buffer.alloc(50, 0x41), cookie)
+  // #4 — .ipa: a device build for a USB-connected iPhone (#152), read from its Payload/. No directory entry for the
+  // .app, as an archiver may leave it out. Mutation: drop the Payload/ branch — the .app is not at the root, so 400.
+  it('accepts a device .ipa and reads its metadata from Payload/', async () => {
+    const ipa = writeZipFixture(path.join(fixtureDir, 'Device.ipa'), [
+      { name: 'Payload/Device App.app/Info.plist', data: XML_PLIST },
+      { name: 'Payload/Device App.app/Device App', data: Buffer.from([0xcf, 0xfa, 0xed, 0xfe]) },
+    ])
+    const r = await postTar(port, 'T4', 'Device.ipa', fs.readFileSync(ipa), cookie)
+    expect(r.status).toBe(201)
+    expect(r.body.bundle_id).toBe('com.example.eas')
+    expect(r.body.version_name).toBe('2.1.0')
+    expect(r.body.build_number).toBe('42')
+    expect(r.body.platform).toBe('ios')
+    expect(leftover()).toHaveLength(1)
+  })
+
+  it('rejects an .ipa whose app is not under Payload/ and leaves no build file', async () => {
+    const ipa = writeZipFixture(path.join(fixtureDir, 'Flat.ipa'), [
+      { name: 'Flat.app/' },
+      { name: 'Flat.app/Info.plist', data: XML_PLIST },
+    ])
+    const r = await postTar(port, 'T4b', 'Flat.ipa', fs.readFileSync(ipa), cookie)
     expect(r.status).toBe(400)
-    expect(r.body.error).toContain('.tar.gz')
+    expect(r.body.error).toMatch(/Payload\//)
+    expect(leftover()).toEqual([])
   })
 
   // #5 — .aab 거절

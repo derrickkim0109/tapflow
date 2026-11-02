@@ -3074,6 +3074,12 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
       // short transfer would then leave the simulator with the old app gone and no new one: a tester
       // loses the build they were using, to an install that never had a chance of finishing.
       if (this.isPhysical(udid)) return await this.installOnPhone(udid, source, tmpDir, bundleId)
+      // Before the uninstall, so the simulator keeps the app it had.
+      if (source.toLowerCase().endsWith('.ipa')) {
+        throw new ValidationError(
+          'An .ipa is a device build and cannot run on a simulator. Open it on a USB-connected iPhone, or upload a simulator build (.app.zip or .tar.gz)',
+        )
+      }
       if (bundleId) {
         await this.simctl.uninstallApp(udid, bundleId).catch(() => { /* 미설치 상태면 무시 */ })
       }

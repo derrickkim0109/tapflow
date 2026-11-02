@@ -562,6 +562,18 @@ describe('IOSAgent', () => {
       expect((simctl.installApp as ReturnType<typeof vi.fn>).mock.calls[0][1]).toMatch(/\/ZipApp\.app$/)
     })
 
+    // The relay takes an .ipa for a USB-connected iPhone (#152), so a simulator can be handed one too.
+    // Mutation: move the check below the uninstall — the simulator then loses the app it had.
+    it('refuses an .ipa on a simulator and keeps the app it had', async () => {
+      const simctl = mockSimctl()
+      const agent = new IOSAgent({}, simctl) as unknown as WithInstallBuild
+      const err = await agent.installBuild('dev-1', '/builds/Device.ipa', 'com.example.demo').catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ValidationError)
+      expect((err as Error).message).toMatch(/device build/)
+      expect(simctl.uninstallApp).not.toHaveBeenCalled()
+      expect(simctl.installApp).not.toHaveBeenCalled()
+    })
+
     it('installBuild rejects a tar.gz with no .app directory', async () => {
       const simctl = mockSimctl()
       const agent = new IOSAgent({}, simctl) as unknown as WithInstallBuild
