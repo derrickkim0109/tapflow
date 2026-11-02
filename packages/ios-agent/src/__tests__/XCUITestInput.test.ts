@@ -184,6 +184,9 @@ describe('XCUITestInput', () => {
       expect(input.sendKey(0x04)).toBe(false)
       expect(input.typeText('hello')).toBe(false)
       expect(runner.request).not.toHaveBeenCalled()
+      // Not unsupported: the agent would tell the caller never to retry, while the next write after the runner
+      // starts goes through.
+      expect(input.unsupportedReason()).toBeNull()
     })
 
     // Mutation: split typeText into a request per character. A sentence would then be dozens of round trips.
@@ -240,14 +243,6 @@ describe('XCUITestInput', () => {
       expect(input.pressLegacyButton(1)).toBe(false)
       expect(input.unsupportedReason()).toMatch(/^The side button/)
       expect(input.pressLegacyButton(0)).toBe(true)
-      expect(input.unsupportedReason()).toBeNull()
-    })
-
-    // Mutation: refuse a write that only found the runner down as unsupported. The agent would tell the caller never
-    // to retry, while the next write after the runner starts goes through.
-    it('does not call a write refused for a runner that is not up unsupported', () => {
-      const { input } = make({ state: 'unavailable' })
-      expect(input.sendKey(0x04)).toBe(false)
       expect(input.unsupportedReason()).toBeNull()
     })
   })

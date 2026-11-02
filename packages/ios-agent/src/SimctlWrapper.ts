@@ -123,7 +123,7 @@ const PLUTIL_TIMEOUT_MS = 5_000
 
 /** A plist as JSON, the way `plutil` converts it. Injectable so tests never read the host's device types. */
 export type PlistReader = (path: string) => Promise<unknown>
-const defaultPlistReader: PlistReader = async (path) =>
+export const defaultPlistReader: PlistReader = async (path) =>
   JSON.parse((await execFileAsync('plutil', ['-convert', 'json', '-o', '-', path], { timeout: PLUTIL_TIMEOUT_MS })).stdout)
 
 export class SimctlWrapper {

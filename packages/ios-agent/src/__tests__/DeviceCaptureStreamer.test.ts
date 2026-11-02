@@ -184,29 +184,6 @@ describe('DeviceCaptureStreamer', () => {
     expect(server.close).toHaveBeenCalled()
   })
 
-  // Mutation: stop() that releases the socket but leaves the stream open — the reader pumping it would
-  // block forever.
-  it('stop() ends the stream and releases the helper', async () => {
-    const { deps, connect } = harness()
-    const s = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, deps)
-    const reader = s.start().getReader()
-    await vi.advanceTimersByTimeAsync(0)
-    const sock = connect()
-    sock.emit('data', Buffer.from([0x00]))
-    s.stop()
-    expect(await reader.read()).toEqual({ done: true, value: undefined })
-    expect(sock.destroy).toHaveBeenCalled()
-
-    // Before the helper connects there is no socket whose close would end the stream on its own.
-    const early = harness()
-    const s2 = new DeviceCaptureStreamer('udid', 30, 'h264', 0, null, early.deps)
-    const reader2 = s2.start().getReader()
-    await vi.advanceTimersByTimeAsync(0)
-    s2.stop()
-    expect(await reader2.read()).toEqual({ done: true, value: undefined })
-    expect(early.server.close).toHaveBeenCalled()
-  })
-
   // Mutation: take the first connection for the helper again (drop the nonce check). Any local process that reached the
   // loopback port first would stream its own frames to the tester, and the real helper would be turned away.
   it('closes a connection that does not open with the nonce, and still takes the helper after it', async () => {

@@ -24,7 +24,6 @@
 // Socket, agent → helper: single bytes; 0x01 forces an IDR on the next H.264 frame.
 //
 // Args: <port> <udid> <fps> <h264|jpeg> --nonce-file PATH [--max-size N] [--name <device name>] [--sole]
-//       --request-permission          prime the Camera prompt and exit (0 granted, 77 denied)
 //
 // The capture device's uniqueID is NOT the hardware UDID (measured on macOS 26 with an iPhone 16 Pro Max:
 // a random-looking UUID that matches neither the UDID nor CoreDevice's identifier, and no CoreMediaIO
@@ -72,11 +71,6 @@ func ensureCameraAccess() -> Bool {
 }
 
 let rawArgs = Array(CommandLine.arguments.dropFirst())
-if rawArgs.contains("--request-permission") {
-    let ok = ensureCameraAccess()
-    log("camera access \(ok ? "granted" : "denied")")
-    exit(ok ? EXIT_OK : EXIT_PERMISSION)
-}
 
 // MARK: - Args
 
@@ -109,7 +103,7 @@ let fps = positional.count == 4 ? Double(positional[2]) ?? 0 : 0
 let targetUDID = positional.count == 4 ? positional[1] : ""
 let useH264 = positional.count == 4 && positional[3] == "h264"
 if port == 0 || fps <= 0 || targetUDID.isEmpty || nonce.isEmpty || !(useH264 || positional[3] == "jpeg") {
-    log("usage: device-capture-helper <port> <udid> <fps> <h264|jpeg> --nonce-file PATH [--max-size N] [--name NAME] [--sole] | --request-permission")
+    log("usage: device-capture-helper <port> <udid> <fps> <h264|jpeg> --nonce-file PATH [--max-size N] [--name NAME] [--sole]")
     exit(EXIT_USAGE)
 }
 

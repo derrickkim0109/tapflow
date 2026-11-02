@@ -5,6 +5,7 @@ import { createLogger, PlatformError, type Device } from '@tapflowio/agent-core'
 import type { LaunchOptions } from '@tapflowio/protocol'
 import { hasLaunchOptions } from '@tapflowio/protocol/launch'
 import { iosLaunchArgv } from './launchArgs.js'
+import { defaultPlistReader, type PlistReader } from './SimctlWrapper.js'
 
 const logger = createLogger('ios-agent:devicectl')
 const execFileAsync = promisify(execFile)
@@ -22,12 +23,6 @@ const defaultExec: XcrunExec = async (args, timeoutMs) =>
 
 // Copying a build onto a phone over USB takes as long as its size needs; a hung transfer still has to end.
 const INSTALL_TIMEOUT_MS = 600_000
-
-/** A plist as JSON, the way `plutil` converts it. */
-export type PlistReader = (path: string) => Promise<unknown>
-
-const defaultPlistReader: PlistReader = async (path) =>
-  JSON.parse((await execFileAsync('plutil', ['-convert', 'json', '-o', '-', path], { timeout: 5_000 })).stdout)
 
 /** What a built `.app` says about itself. `platform` is `unknown` when its Info.plist names neither. */
 export interface AppBundleInfo {

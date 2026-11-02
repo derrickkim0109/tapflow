@@ -244,7 +244,6 @@ function statusError(code: number, udid: string, detail: string): PlatformError 
  */
 export class DeviceCaptureStreamer {
   private sock: HelperSocket | null = null
-  private teardown: (() => void) | null = null
 
   constructor(
     private readonly udid: string,
@@ -308,7 +307,6 @@ export class DeviceCaptureStreamer {
           release()
           controller.close()
         }
-        this.teardown = end
 
         // The helper's, once it has proven it is: everything after the nonce.
         const attach = (sock: HelperSocket, first: Buffer) => {
@@ -401,11 +399,5 @@ export class DeviceCaptureStreamer {
       },
       cancel: () => { done = true; release() },
     })
-  }
-
-  /** Ends the frame stream and closes the socket, which makes the helper exit, and the server. */
-  stop(): void {
-    this.teardown?.()
-    this.teardown = null
   }
 }
