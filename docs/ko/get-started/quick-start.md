@@ -14,7 +14,7 @@ Mac 한 대에 tapflow를 설치하고 준비한 빌드를 올려 브라우저�
 - **Node.js 22 이상**
 - **Mac 관리자 암호**: `tapflow setup`이 Homebrew·JDK 설치와 Xcode 초기 설정에서 sudo 암호를 묻습니다.
 - **Apple 계정**: App Store에서 받든 Apple 개발자 사이트에서 받든 Xcode를 내려받으려면 Apple 계정으로 로그인해야 합니다.
-- **테스트할 빌드**: iOS는 시뮬레이터용 `.app.zip` 또는 `.tar.gz`/`.tgz`, Android는 `.apk`입니다. 실제 기기용 `.ipa`는 올릴 수 없습니다. Android APK에는 `arm64-v8a` ABI가 들어 있어야 Apple Silicon 에뮬레이터에 설치됩니다. 빌드가 없다면 앱 개발자에게 시뮬레이터·에뮬레이터용 빌드를 요청하세요. CI에서 빌드를 만들어 올리는 방법은 [CI에서 빌드 올리기](/ko/operate/ci-distribution)에 있습니다.
+- **테스트할 빌드**: iOS는 시뮬레이터용 `.app.zip` 또는 `.tar.gz`/`.tgz`, Android는 `.apk`입니다. 실제 기기용 `.ipa`는 [USB로 연결한 iPhone](/ko/operate/usb-iphone)에만 설치됩니다. Android APK에는 `arm64-v8a` ABI가 들어 있어야 Apple Silicon 에뮬레이터에 설치됩니다. 빌드가 없다면 앱 개발자에게 시뮬레이터·에뮬레이터용 빌드를 요청하세요. CI에서 빌드를 만들어 올리는 방법은 [CI에서 빌드 올리기](/ko/operate/ci-distribution)에 있습니다.
 - **걸리는 시간**: 대부분 `tapflow setup`의 다운로드 시간입니다. Xcode, 시뮬레이터 런타임, Android SDK와 시스템 이미지는 용량이 커서 처음 받을 때는 네트워크 속도에 따라 오래 걸립니다. 이미 설치되어 있으면 setup은 확인만 하고 넘어갑니다.
 :::
 

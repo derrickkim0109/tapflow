@@ -13,7 +13,7 @@ Fixes for a build upload that fails, or an uploaded build that lands on the wron
 
 | Cause | Fix |
 |-------|-----|
-| `.ipa` file uploaded | `.ipa` is for real devices. Build with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder. |
+| `.ipa` without its app under `Payload/` | An `.ipa` must hold `Payload/MyApp.app`, as Xcode exports it. It is a device build: it installs on a [USB-connected iPhone](/operate/usb-iphone), not on a simulator. |
 | `.app` not at the zip root | Extracting the zip must produce `MyApp.app` directly — not inside a subfolder. |
 | Device-only slices | Confirm it is a simulator build. `lipo -info MyApp.app/MyApp` must include `x86_64` or `arm64` (simulator). |
 

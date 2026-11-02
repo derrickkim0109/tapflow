@@ -13,7 +13,7 @@ description: iOS 업로드 오류(.ipa와 .app.zip), Apple Silicon의 INSTALL_FA
 
 | 원인 | 해결 방법 |
 |------|-----------|
-| `.ipa` 파일 업로드 | `.ipa`는 실제 기기용입니다. `xcodebuild -sdk iphonesimulator`로 빌드 후 `.app` 폴더를 zip으로 압축하세요 |
+| `Payload/` 아래에 앱이 없는 `.ipa` | `.ipa`에는 Xcode가 내보낸 것처럼 `Payload/MyApp.app`이 있어야 합니다. 실제 기기용 빌드라서 [USB로 연결한 iPhone](/ko/operate/usb-iphone)에 설치되고, 시뮬레이터에는 설치되지 않습니다 |
 | `.app`이 ZIP 루트에 없음 | 압축 해제 시 `MyApp.app`이 바로 나와야 합니다. 상위 폴더로 감싸면 파싱에 실패합니다 |
 | 실기기용 슬라이스만 포함 | 시뮬레이터용 빌드인지 확인합니다. `lipo -info MyApp.app/MyApp` 출력에 `x86_64` 또는 `arm64`(시뮬레이터)가 있어야 합니다 |
 

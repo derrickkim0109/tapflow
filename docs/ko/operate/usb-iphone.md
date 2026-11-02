@@ -5,7 +5,7 @@ description: 에이전트 맥에 USB로 연결한 iPhone을 시뮬레이터처�
 
 # USB로 연결한 iPhone
 
-에이전트 맥에 USB로 연결한 iPhone은 QA 페이지 Mac 선택 화면의 **Connect Physical Device** 에 나옵니다. 모든 Mac 에 꽂힌 폰이 여기에 모입니다. 여기서 열면 화면이 브라우저로 미러링되고, 탭·드래그·길게 누르기·타이핑을 iPhone으로 보낼 수 있습니다. 아직 실험 기능입니다. 실제 iPhone에서 확인한 것은 미러링·탭·드래그·타이핑(tapflow로 연 앱과 홈 화면에서 연 앱 모두), 폰에 이미 있는 앱의 실행, zip 으로 묶은 iphoneos `.app` 의 설치와 실행입니다. `.ipa` 는 확인하지 않았습니다. iPad도 목록에 나오지만 시도해 본 적은 없습니다.
+에이전트 맥에 USB로 연결한 iPhone은 QA 페이지 Mac 선택 화면의 **Connect Physical Device** 에 나옵니다. 모든 Mac 에 꽂힌 폰이 여기에 모입니다. 여기서 열면 화면이 브라우저로 미러링되고, 탭·드래그·길게 누르기·타이핑을 iPhone으로 보낼 수 있습니다. 아직 실험 기능입니다. 실제 iPhone에서 확인한 것은 미러링·탭·드래그·타이핑(tapflow로 연 앱과 홈 화면에서 연 앱 모두), 폰에 이미 있는 앱의 실행, `.ipa` 와 zip 으로 묶은 iphoneos `.app` 의 설치와 실행입니다. iPad도 목록에 나오지만 시도해 본 적은 없습니다.
 
 ## iPhone 준비
 
@@ -46,7 +46,7 @@ macOS는 USB로 연결한 iPhone의 화면을 카메라 장치로 다룹니다. 
 
 ## 빌드 설치
 
-iPhone에는 기기용 빌드만 설치할 수 있습니다. Firebase App Distribution에 올리는 `.ipa`나 ad-hoc·개발용으로 내보낸 `.ipa`, 또는 iphoneos용 `.app`을 zip이나 tar로 묶어 올립니다.
+iPhone에는 기기용 빌드만 설치할 수 있습니다. Firebase App Distribution에 올리는 `.ipa`나 ad-hoc·개발용으로 내보낸 `.ipa`, 또는 iphoneos용 `.app`을 zip이나 tar로 묶어 올립니다. 시뮬레이터 빌드처럼 App Center에 올리면 됩니다. `.ipa`는 시뮬레이터에서 실행할 수 없어서 시뮬레이터로 열면 거부됩니다.
 
 - **설치는 iPhone에 있던 앱을 지우지 않고 그 위에 덮어씁니다.** 앱의 데이터와 로그인 상태가 남습니다. 시뮬레이터와 달리 깨끗한 상태에서 시작하지 않습니다.
 - 설치가 거절되면(프로파일에 이 iPhone이 없음, 인증서 만료 등) iPhone의 기존 앱은 그대로 남습니다.

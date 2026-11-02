@@ -368,7 +368,7 @@ Authorization: Bearer tflw_pat_<token>  (또는 세션 쿠키)
 
 | 필드 | 필수 | 설명 |
 |------|------|------|
-| `file` | 필수 | 빌드 산출물. iOS는 `.app.zip` 또는 `.tar.gz`/`.tgz`(시뮬레이터 빌드), Android는 `.apk`입니다. 최대 크기는 기본 500MB이며 `TAPFLOW_MAX_BUILD_BYTES`로 바꿀 수 있습니다. `.ipa`·`.aab`는 거부됩니다. |
+| `file` | 필수 | 빌드 산출물. iOS는 `.app.zip` 또는 `.tar.gz`/`.tgz`(시뮬레이터 빌드)나 `.ipa`(USB로 연결한 iPhone용 기기 빌드), Android는 `.apk`입니다. 최대 크기는 기본 500MB이며 `TAPFLOW_MAX_BUILD_BYTES`로 바꿀 수 있습니다. `.aab`는 거부됩니다. |
 | `status` | 선택 | 초기 리뷰 상태로 `Backlog`, `In Progress`, `Done`, `Rejected` 중 하나입니다. 생략하면 미설정으로 둡니다. |
 | `label` | 선택 | App Center에서 빌드를 식별하는 자유 텍스트 레이블입니다(예: 브랜치명이나 `rc-1`). 응답에는 `version_label`로 나옵니다. 빌드 파일에 앱 이름이 없을 때 앱 이름으로 쓰지 않습니다(그때는 파일 이름). |
 | `version_name` | 선택 | 빌드 파일의 버전 대신 쓸 값입니다. 빌드를 보여 주고 묶는 데 쓰이고 파일은 바뀌지 않습니다. 빈 값이면 파일의 값을 씁니다. |
@@ -377,7 +377,7 @@ Authorization: Bearer tflw_pat_<token>  (또는 세션 쿠키)
 | `app_id` | 선택 | 기존 앱에 연결합니다. 그 앱에 해당 플랫폼의 bundle ID가 없고 다른 앱도 그 ID를 쓰지 않으면, 빌드의 bundle ID가 그 앱에 추가됩니다. 그렇지 않으면 빌드는 자기 bundle ID의 앱으로 갑니다. 병합으로 삭제된 앱의 `app_id`를 보내도 bundle ID로 앱을 찾아 연결합니다. 생략하면 bundle ID로 앱이 정해집니다. |
 
 ::: warning iOS 빌드 주의사항
-`.ipa` 파일은 지원하지 않습니다. `.app.zip`을 올리거나, 클라우드 시뮬레이터 빌드가 만드는 `.tar.gz`/`.tgz`를 올리세요. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드한 `.app` 폴더를 zip으로 압축하면 됩니다.
+`.ipa`는 USB로 연결한 iPhone에만 설치되고, 시뮬레이터로 열면 실패합니다. 시뮬레이터에는 `.app.zip`을 올리거나, 클라우드 시뮬레이터 빌드가 만드는 `.tar.gz`/`.tgz`를 올리세요. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드한 `.app` 폴더를 zip으로 압축하면 됩니다.
 :::
 
 `label`, `version_name`, `build_number`는 앞뒤 공백을 지우고 저장합니다. 100자를 넘는 `label`은 100자로 자릅니다. 100자를 넘는 `version_name`이나 `build_number`는 `400`을 받습니다.

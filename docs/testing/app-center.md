@@ -37,8 +37,8 @@ When nothing matches, the list shows **No matching builds**.
 5. To use a version or build number other than the build file's, open **Override version** and fill in **Version** or **Build number**. A field left empty uses the file's value.
 6. Press **Upload**. A **Build uploaded** notice appears and the build joins the list.
 
-::: warning iOS `.ipa` files are not supported
-`.ipa` is the format for real devices. tapflow accepts `.app.zip` and `.tar.gz`/`.tgz` for simulators. If an upload fails, see [Builds & uploads troubleshooting](/troubleshooting/builds#ios-build-upload-errors).
+::: warning iOS `.ipa` files are for a USB-connected iPhone
+`.ipa` is the format for real devices: tapflow installs one on a [USB-connected iPhone](/operate/usb-iphone), not on a simulator. For a simulator, upload `.app.zip` or `.tar.gz`/`.tgz`. If an upload fails, see [Builds & uploads troubleshooting](/troubleshooting/builds#ios-build-upload-errors).
 :::
 
 An uploaded build is linked to an app by its bundle ID. If no app has that bundle ID, a new one is created. Uploading while an app is selected links the build to that app. If the app has no bundle ID on that platform yet, the build's ID is added to it, so an app whose iOS and Android IDs differ can still be one app. If another app already holds the build's ID, or the selected app has a different ID on that platform, the build goes to the app for its own bundle ID.

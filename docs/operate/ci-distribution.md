@@ -92,7 +92,7 @@ curl -X POST https://your-relay/api/v1/builds \
 ```
 
 ::: warning iOS builds
-`.ipa` files are not supported. For a simulator build, upload `.app.zip` or `.tar.gz`/`.tgz`. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder; a `.tar.gz`/`.tgz` is what a cloud simulator build produces.
+An `.ipa` installs only on a [USB-connected iPhone](/operate/usb-iphone). For a simulator build, upload `.app.zip` or `.tar.gz`/`.tgz`. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder; a `.tar.gz`/`.tgz` is what a cloud simulator build produces.
 :::
 
 ## 3. Post build metadata (optional)

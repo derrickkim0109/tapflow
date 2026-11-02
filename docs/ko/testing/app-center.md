@@ -37,8 +37,8 @@ App Center는 tapflow 대시보드 안의 빌드 목록 화면입니다. Microso
 5. 빌드 파일의 버전이나 빌드 번호 대신 다른 값을 쓰려면 **Override version**을 펼쳐 **Version**이나 **Build number**를 적습니다. 비워 둔 칸은 빌드 파일의 값을 씁니다.
 6. **Upload**를 누릅니다. 올라가면 **Build uploaded** 알림이 뜨고 목록에 빌드가 추가됩니다.
 
-::: warning iOS `.ipa` 파일은 지원하지 않습니다
-`.ipa`는 실제 기기용 포맷입니다. tapflow는 시뮬레이터용 `.app.zip`과 `.tar.gz`/`.tgz`를 받습니다. 업로드 오류가 나면 [빌드와 업로드 문제 해결](/ko/troubleshooting/builds#ios-빌드-업로드-오류)을 참고하세요.
+::: warning iOS `.ipa` 파일은 USB로 연결한 iPhone용입니다
+`.ipa`는 실제 기기용 포맷이라 [USB로 연결한 iPhone](/ko/operate/usb-iphone)에 설치되고, 시뮬레이터에는 설치되지 않습니다. 시뮬레이터에는 `.app.zip`이나 `.tar.gz`/`.tgz`를 올리세요. 업로드 오류가 나면 [빌드와 업로드 문제 해결](/ko/troubleshooting/builds#ios-빌드-업로드-오류)을 참고하세요.
 :::
 
 업로드한 빌드는 bundle ID를 기준으로 앱에 연결됩니다. 같은 bundle ID의 앱이 없으면 새 앱이 만들어집니다. 앱을 고른 상태에서 올리면 그 앱에 연결됩니다. 그 앱에 해당 플랫폼의 bundle ID가 아직 없으면 빌드의 bundle ID가 앱에 추가됩니다. 그래서 iOS와 Android의 bundle ID가 다른 앱도 하나로 모을 수 있습니다. 빌드의 bundle ID를 다른 앱이 이미 쓰고 있거나 고른 앱에 그 플랫폼의 bundle ID가 따로 있으면, 빌드는 자기 bundle ID의 앱으로 갑니다.

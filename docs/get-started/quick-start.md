@@ -14,7 +14,7 @@ This page takes you from installing tapflow on one Mac to tapping your own build
 - **Node.js 22 or later**
 - **The Mac's administrator password**: `tapflow setup` asks for your sudo password when it installs Homebrew and the JDK, and while it finishes setting up Xcode.
 - **An Apple account**: you sign in with one to download Xcode, from the App Store or from Apple's developer site.
-- **A build to test**: a simulator `.app.zip` or `.tar.gz`/`.tgz` for iOS, an `.apk` for Android. A device `.ipa` cannot be uploaded. An Android APK needs the `arm64-v8a` ABI to install on an Apple Silicon emulator. If you have no build yet, ask your app's developers for a simulator or emulator build; [Upload from CI](/operate/ci-distribution) shows how CI can produce and upload one.
+- **A build to test**: a simulator `.app.zip` or `.tar.gz`/`.tgz` for iOS, an `.apk` for Android. A device `.ipa` installs only on a [USB-connected iPhone](/operate/usb-iphone). An Android APK needs the `arm64-v8a` ABI to install on an Apple Silicon emulator. If you have no build yet, ask your app's developers for a simulator or emulator build; [Upload from CI](/operate/ci-distribution) shows how CI can produce and upload one.
 - **Time**: most of it is `tapflow setup` downloading. Xcode, the simulator runtime, the Android SDK and its system image are large, so a first download takes as long as your network needs. When they are already installed, setup only checks them.
 :::
 

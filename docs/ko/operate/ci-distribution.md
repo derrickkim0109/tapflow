@@ -92,7 +92,7 @@ curl -X POST https://your-relay/api/v1/builds \
 ```
 
 ::: warning iOS 빌드
-`.ipa` 파일은 지원하지 않습니다. 시뮬레이터 빌드는 `.app.zip` 또는 `.tar.gz`/`.tgz`를 올립니다. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드해 `.app` 폴더를 zip으로 압축하고, `.tar.gz`/`.tgz`는 클라우드 시뮬레이터 빌드가 만드는 아카이브입니다.
+`.ipa`는 [USB로 연결한 iPhone](/ko/operate/usb-iphone)에만 설치됩니다. 시뮬레이터 빌드는 `.app.zip` 또는 `.tar.gz`/`.tgz`를 올립니다. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드해 `.app` 폴더를 zip으로 압축하고, `.tar.gz`/`.tgz`는 클라우드 시뮬레이터 빌드가 만드는 아카이브입니다.
 :::
 
 ## 3. 빌드 메타데이터 첨부 (선택)

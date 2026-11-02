@@ -5,7 +5,7 @@ description: Get an iPhone plugged into the agent Mac by USB ready to open from 
 
 # USB-connected iPhones
 
-An iPhone plugged into the agent Mac by USB is offered under **Connect Physical Device** on the QA page's Mac screen, which lists the phones on every Mac. Open it there to mirror its screen in the browser and send it taps, drags, long presses and typing. It is still experimental: mirroring, taps, drags, typing (into an app opened from tapflow or from the home screen) launching the copy already on the phone, and installing and launching a zipped iphoneos `.app` were tried on a real iPhone; an `.ipa` was not. An iPad is listed too but has not been tried.
+An iPhone plugged into the agent Mac by USB is offered under **Connect Physical Device** on the QA page's Mac screen, which lists the phones on every Mac. Open it there to mirror its screen in the browser and send it taps, drags, long presses and typing. It is still experimental: mirroring, taps, drags, typing (into an app opened from tapflow or from the home screen), launching the copy already on the phone, and installing and launching an `.ipa` and a zipped iphoneos `.app` were tried on a real iPhone. An iPad is listed too but has not been tried.
 
 ## Prepare the iPhone
 
@@ -46,7 +46,7 @@ When the capture fails, the reason shows in the device status on the dashboard. 
 
 ## Install a build
 
-A phone takes only a device build: the `.ipa` you upload to Firebase App Distribution or export for ad-hoc or development, or an iphoneos `.app` zipped or tarred.
+A phone takes only a device build: the `.ipa` you upload to Firebase App Distribution or export for ad-hoc or development, or an iphoneos `.app` zipped or tarred. Upload it in App Center as you would a simulator build. An `.ipa` cannot run on a simulator, so opening one there is refused.
 
 - **An install goes over the app already on the phone, without removing it first.** The app's data and sign-in stay. Unlike a simulator, it does not start from a clean state.
 - If the phone refuses the install (a profile without this phone, an expired certificate), the app it had stays.

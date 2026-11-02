@@ -368,7 +368,7 @@ Only `file` is required; every other field is optional.
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `file` | Yes | The build artifact. iOS: `.app.zip` or `.tar.gz` / `.tgz` (a simulator build); Android: `.apk`. Max 500 MB by default (`TAPFLOW_MAX_BUILD_BYTES` changes it). `.ipa` and `.aab` are rejected. |
+| `file` | Yes | The build artifact. iOS: `.app.zip` or `.tar.gz` / `.tgz` (a simulator build), or `.ipa` (a device build, for a USB-connected iPhone); Android: `.apk`. Max 500 MB by default (`TAPFLOW_MAX_BUILD_BYTES` changes it). `.aab` is rejected. |
 | `status` | No | Initial review status — one of `Backlog`, `In Progress`, `Done`, `Rejected`. Omit to leave it unset. |
 | `label` | No | Free-text label to identify the build in App Center (e.g. a branch name or `rc-1`). Returned as `version_label`. Not used as the app's name when the build file has none (the file name is). |
 | `version_name` | No | A version to use instead of the build file's. It is used to show and group the build; the file is not changed. Empty uses the file's value. |
@@ -377,7 +377,7 @@ Only `file` is required; every other field is optional.
 | `app_id` | No | Attach to an existing app. If that app has no bundle ID on the build's platform and no other app holds the build's ID, the ID is added to the app. Otherwise the build goes to the app for its bundle ID. An upload naming an app a merge removed is routed by its bundle ID instead. When omitted, the bundle ID decides the app. |
 
 ::: warning iOS builds
-`.ipa` files are not supported. Upload `.app.zip`, or the `.tar.gz` / `.tgz` a cloud simulator build produces. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder.
+An `.ipa` installs only on a USB-connected iPhone; opening one on a simulator fails. For a simulator, upload `.app.zip`, or the `.tar.gz` / `.tgz` a cloud simulator build produces. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder.
 :::
 
 `label`, `version_name` and `build_number` are trimmed. A `label` longer than 100 characters is cut to 100; a longer `version_name` or `build_number` gets `400`.
