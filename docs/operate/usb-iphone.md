@@ -5,7 +5,7 @@ description: Get an iPhone plugged into the agent Mac by USB ready to open from 
 
 # USB-connected iPhones
 
-An iPhone plugged into the agent Mac by USB is listed next to the simulators with a **USB** badge. Open it from the dashboard to mirror its screen in the browser and send it taps, drags, long presses and typing. It is still experimental: mirroring, taps, drags, typing (into an app opened from tapflow or from the home screen) and launching the copy already on the phone were tried on a real iPhone; installing a device build (.ipa) was not tried on hardware. An iPad is listed too but has not been tried.
+An iPhone plugged into the agent Mac by USB is offered under **Connect Physical Device** on the QA page's Mac screen, which lists the phones on every Mac. Open it there to mirror its screen in the browser and send it taps, drags, long presses and typing. It is still experimental: mirroring, taps, drags, typing (into an app opened from tapflow or from the home screen) and launching the copy already on the phone were tried on a real iPhone; installing a device build (.ipa) was not tried on hardware. An iPad is listed too but has not been tried.
 
 ## Prepare the iPhone
 
@@ -64,7 +64,7 @@ These are refused on a phone, and the dashboard does not show their controls:
 
 A drag is played after you let go, as a straight line from where it started to where it ended. The home and volume buttons are sent to the phone; the volume buttons have not been tried on hardware.
 
-A phone boots nothing on the Mac, so its session is not refused when the Mac is short of memory or CPU. In the device list it sits under its iOS version with the simulators, reads **Connected** rather than Booted, and can be starred, renamed or hidden like any other device. When the Mac is overloaded, its card still opens for its phones, and only the simulators are greyed out.
+A phone boots nothing on the Mac, so its session is not refused when the Mac is short of memory or CPU. Under **Connect Physical Device** it is listed with its iOS version and the Mac it is on, and reads **Connected** while it is free; it is not in the Mac's own device list, which holds the simulators. A phone on an overloaded Mac can still be opened from there, while that Mac's card stays closed.
 
 ## Related
 
