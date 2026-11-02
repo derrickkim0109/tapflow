@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useRelay } from '@/hooks/useRelay'
 import type { DeviceSummary, BrowserInbound, SessionInfo } from '@/lib/types'
-import type { FormFactor } from '@tapflowio/protocol'
+import type { DeviceKind, FormFactor } from '@tapflowio/protocol'
 
 /**
  * `onListed` runs on every device listing, in the message handler: what a page decides from a listing (#1087's
@@ -22,6 +22,8 @@ export function useAgentSession(os: string, onListed?: (sessions: SessionInfo[])
   // reconnecting, so reading it live would blank the value — and flip an iPad's volume tooltips back —
   // for as long as the agent is away. A listing without one never clears it.
   const [activeFormFactor, setActiveFormFactor] = useState<FormFactor | undefined>(undefined)
+  // From the pick alone, unlike the form factor: a device's kind never changes, so a later listing has nothing to add.
+  const [activeKind, setActiveKind] = useState<DeviceKind | undefined>(undefined)
   const [booting, setBooting] = useState(false)
   const [status, setStatus] = useState('')
 
@@ -78,6 +80,7 @@ export function useAgentSession(os: string, onListed?: (sessions: SessionInfo[])
   const startDevice = useCallback((d: DeviceSummary, opts: { resume?: boolean } = {}) => {
     setResumed(opts.resume === true)
     setActiveFormFactor(d.formFactor)
+    setActiveKind(d.kind)
     setDeviceId(d.id)
     setBooting(true)
     setStatus('Booting…')
@@ -133,6 +136,7 @@ export function useAgentSession(os: string, onListed?: (sessions: SessionInfo[])
   return {
     sessions,
     activeFormFactor,
+    activeKind,
     selectedAgent,
     setSelectedAgent,
     activeSessionId,

@@ -347,6 +347,15 @@ describe('AndroidViewer — a frame ahead of its description (#845)', () => {
     stubCanvasContext()
   })
 
+  // The issue's words for a phone on USB (#152). Mutation: say them for an emulator too, or drop them.
+  it('says a plugged-in phone is connected until its stream starts', () => {
+    const v = renderViewer(0)
+    expect(screen.getByText('Waiting for stream…')).toBeInTheDocument()
+    v.rerenderWith({ physical: true })
+    expect(screen.getByText(/Connected to physical device\.\s+Waiting for device…/)).toBeInTheDocument()
+    expect(screen.queryByText('Waiting for stream…')).toBeNull()
+  })
+
   it('hides a frame the description has not caught up with, and shows it once the description moves on', () => {
     const v = renderViewer(0)
     readyToCompose()

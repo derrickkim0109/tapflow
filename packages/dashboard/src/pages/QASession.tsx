@@ -14,6 +14,7 @@ import { DeviceCardActions } from '@/components/device/DeviceCardActions';
 import { shownName } from '@/lib/deviceGroups';
 import { DeviceViewer } from '@/components/DeviceViewer';
 import { SessionPanel } from '@/components/SessionPanel';
+import { PhysicalDevicePicker } from '@/components/device/PhysicalDevicePicker';
 import {
   Select,
   SelectContent,
@@ -112,7 +113,7 @@ function QASessionPage() {
 
   const os = build?.platform ?? 'ios';
   const {
-    sessions, activeFormFactor, selectedAgent, setSelectedAgent,
+    sessions, activeFormFactor, activeKind, selectedAgent, setSelectedAgent,
     activeSessionId, deviceId, booting, status,
     connected, agentGroups,
     startDevice, resetDevice, handleBack, handleBackToMacs, handleSessionEnded,
@@ -157,7 +158,7 @@ function QASessionPage() {
   // `replace`, so Back in the browser leaves the page rather than stepping through the devices tried.
   const beginDevice = useCallback((d: DeviceSummary, resume: boolean) => {
     // A reset is for a fresh start. A resume keeps what is there — that is what the tester came back for.
-    if (!resume) consumeResetMode();
+    if (!resume) consumeResetMode(d.kind !== 'physical');
     startDevice(d, { resume });
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
@@ -355,6 +356,7 @@ function QASessionPage() {
                 deviceId={deviceId}
                 formFactor={selectedDevice?.formFactor ?? activeFormFactor}
                 platform={os}
+                kind={activeKind}
                 buildId={build?.id}
                 resume={resumed}
                 resetMode={resumed ? 'app-only' : appliedResetMode}
@@ -551,7 +553,24 @@ function QASessionPage() {
             </div>
           ) : (
             <div className="flex flex-col gap-5">
-              <h1 className="text-xl font-semibold tracking-tight">Select Mac</h1>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h1 className="text-xl font-semibold tracking-tight">Select Mac</h1>
+                <PhysicalDevicePicker
+                  sessions={agentGroups} os={os} disabled={booting || !connected}
+                  onPick={(agentName, d, opener) => {
+                    setSelectedAgent(agentName);
+                    // What a simulator's card does with the same device: resume the tester's own session, ask before
+                    // taking over someone else's, or start one.
+                    if (d.waiting?.yours && d.resumable) {
+                      stopResuming();
+                      beginDevice(d, true);
+                    } else if (d.waiting) {
+                      takeOverCardRef.current = opener;
+                      setTakeOver(d);
+                    } else handleStartDevice(d);
+                  }}
+                />
+              </div>
 
               {agentGroups.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
@@ -562,7 +581,8 @@ function QASessionPage() {
                   {agentGroups.map((s: SessionInfo) => {
                     const res = s.resources
                     const isStale = res ? Date.now() - res.reportedAt > RESOURCE_STALE_MS : false // eslint-disable-line react-hooks/purity
-                    const deviceCount = s.devices.filter((d) => d.platform === os).length
+                    // Its simulators or emulators: its phones are offered by Connect Physical Device instead.
+                    const deviceCount = s.devices.filter((d) => d.platform === os && d.kind !== 'physical').length
                     const cpuPercent = res?.cpuPercent ?? 0
                     const memPercent = res ? (res.memUsedMB / res.memTotalMB) * 100 : 0
                     // The dot and bars show the readings; whether the Mac takes a new session is the relay's call, which

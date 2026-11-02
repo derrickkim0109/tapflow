@@ -40,6 +40,10 @@ TAPFLOW_ANDROID_USB_DEVICES=1 tapflow agent start
 
 무선 디버깅으로 연결한 폰(`ip:port`)은 아직 목록에 나오지 않습니다.
 
+## 폰 열기 {#open}
+
+QA 페이지에서 빌드를 고른 뒤 Mac 선택 화면의 **Connect Physical Device** 를 누릅니다. 모든 Mac 에 꽂힌 폰이 어느 Mac 에 있는지와 함께 나오고, 하나를 고르면 그 폰으로 세션이 열립니다. Mac 의 기기 목록에는 에뮬레이터만 나옵니다. 폰의 화면이 오기 전까지 기기 자리에 **Connected to physical device. Waiting for device…** 가 표시됩니다.
+
 ## 폰에서 쓸 수 없는 기능 {#refused}
 
 아래 기능은 에뮬레이터 전용이거나 세션이 끝난 뒤에도 폰을 바꿔 놓기 때문에 거부합니다. 요청하면 그 기능의 오류 메시지로 이유를 알려 줍니다.

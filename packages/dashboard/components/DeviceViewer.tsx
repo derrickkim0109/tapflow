@@ -3,7 +3,7 @@
 import { skeletonSize } from '@/lib/deviceSkeleton';
 import { framelessChrome } from '@/lib/framelessChrome';
 
-import type { BootRefusalReason, BrowserToRelay, FormFactor, SessionTerminatedReason } from '@tapflowio/protocol'
+import type { BootRefusalReason, BrowserToRelay, DeviceKind, FormFactor, SessionTerminatedReason } from '@tapflowio/protocol'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useRelay } from '@/hooks/useRelay';
 import { usePerfMode } from '@/hooks/usePerfMode';
@@ -32,6 +32,9 @@ interface Props {
   formFactor?: FormFactor;
   /** The platform being tested, known before the chrome is — the skeleton turns a tablet by it. */
   platform?: string;
+  /** From the device list. A `physical` device (a phone on USB, iOS or Android) gets no control only a
+   *  simulator or emulator can serve: the agent refuses those on a phone, so offering them is a button that fails. */
+  kind?: DeviceKind;
   buildId?: number;
   resetMode?: 'app-only' | 'full-erase';
   /** This mount is the tester coming back to their own session (#1087): keep the installed app from the first install
@@ -47,7 +50,7 @@ interface Props {
   onSessionEnded?: (reason: SessionTerminatedReason | 'busy-elsewhere' | 'mac-overloaded') => void;
 }
 
-export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios', buildId, resetMode, resume = false, onRecordingUploaded, onSessionEnded }: Props) {
+export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios', kind, buildId, resetMode, resume = false, onRecordingUploaded, onSessionEnded }: Props) {
   const sendRef = useRef<(msg: BrowserToRelay) => void>(() => {});
   // One reset per mount; see the boot handler below.
   const resetSentRef = useRef(false);
@@ -115,6 +118,11 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
   const [installed, setInstalled] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
+  // Whether `bootError` is a stream that failed mid-session (an uncorrelated `device:boot-error`: Android's dead
+  // stream, an iOS phone's screen capture) rather than a boot. Such a stream can come back — a phone unlocked, a cable
+  // plugged in again — and the first frame after it clears the report. The ref is what the frame path reads.
+  const [streamFailed, setStreamFailed] = useState(false);
+  const streamFailedRef = useRef(false);
   // Set while the relay holds this viewer's boot behind another on the same Mac; cleared by anything that
   // ends the wait — the boot starting, finishing or failing.
   const [bootWaiting, setBootWaiting] = useState<BootRefusalReason | null>(null);
@@ -339,6 +347,8 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       rebindRef.current = { pending: 0, appInstalled: false };
       setBootWaiting(null);
       setBootError(msg.message);
+      streamFailedRef.current = msg.requestId === undefined;
+      setStreamFailed(msg.requestId === undefined);
     }
     // Only for the boot this viewer is waiting on: a reconnect re-sends its boot, and the relay answers the one it
     // replaced as well as the new one.
@@ -570,6 +580,12 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
     if (!(envelope && envelope.codec === CODEC_H264)) {
       envelopeQueueRef.current.push(envelope);
     }
+    // A picture again: the stream that was reported dead has come back.
+    if (streamFailedRef.current) {
+      streamFailedRef.current = false;
+      setStreamFailed(false);
+      setBootError(null);
+    }
     const payload = envelope ? data.slice(HEADER_SIZE) : data;
     const meta = envelope
       ? { codec: envelope.codec, keyframe: envelope.keyframe, capturedAt: envelope.capturedAt, relayedAt: envelope.relayedAt }
@@ -724,15 +740,22 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
   }, [bootError, agentAway]);
 
 
+  const physical = kind === 'physical';
+  // A stream failure does not outrank an install in progress or its failure: the status card says one thing, and
+  // those are about what the tester asked for. A boot failure still does — nothing is installed on a device that
+  // never came up.
+  const shownBootError = streamFailed && (installing || installError) ? null : bootError;
   const commonProps = {
     sessionId, buildId, send, openUrl, launchApp, connected, joined,
-    deviceReady, installing, installed, installError, bootError, bootWaiting, servicesOff,
+    deviceReady, installing, installed, installError, bootError: shownBootError, bootWaiting, servicesOff,
     launching,
     binaryFrameHandlerRef,
     clipboardHandlerRef,
-    clipboardSupported: agentCapabilities.includes('clipboard'),
+    // The agent advertises its capabilities once for all its devices, and a phone has neither of these.
+    clipboardSupported: !physical && agentCapabilities.includes('clipboard'),
     networkHandlerRef,
-    networkSupported: agentCapabilities.includes('network-control'),
+    networkSupported: !physical && agentCapabilities.includes('network-control'),
+    physical,
     onRecordingUploaded,
     swKeyboardVisible, swKeyboardPending, onKbdToggle,
     rebootPending, onReboot: reboot,
@@ -787,7 +810,7 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
           </div>
           <SimulatorInfoCard
             joined={joined} fps={0} connected={connected}
-            deviceReady={deviceReady} bootError={bootError} bootWaiting={bootWaiting} servicesOff={servicesOff}
+            deviceReady={deviceReady} bootError={shownBootError} bootWaiting={bootWaiting} servicesOff={servicesOff}
             installing={installing} installError={installError}
             decoderUnsupported={false}
             keyboardActive={false} agentAway={agentAway}

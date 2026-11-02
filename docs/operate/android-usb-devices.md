@@ -40,6 +40,10 @@ When a phone cannot be used, the agent prints why, once. It prints again when th
 
 A phone connected over wireless debugging (`ip:port`) is not listed yet.
 
+## Open a phone {#open}
+
+On the QA page, after picking a build, press **Connect Physical Device** on the Mac screen. It lists the phones plugged into every Mac, each with the Mac it is on; pick one to open a session on it. A Mac's own device list keeps its emulators only. Until the phone's stream starts, the screen reads **Connected to physical device. Waiting for device…**
+
 ## What a phone refuses {#refused}
 
 These are refused because they are emulator-only or would leave the phone changed after the session. Asking for one returns that feature's error with the reason.

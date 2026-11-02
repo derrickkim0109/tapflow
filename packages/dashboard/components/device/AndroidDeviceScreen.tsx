@@ -15,6 +15,8 @@ interface AndroidDeviceScreenProps {
   surfaceHandlers?: SurfaceHandlers;
   /** Drawn over the screen — the live cursor and the pinch hints. */
   overlay?: ReactNode;
+  /** A phone on USB: until its stream starts the label says it is connected and waiting for the phone (#152). */
+  physical?: boolean;
 }
 
 /**
@@ -22,7 +24,7 @@ interface AndroidDeviceScreenProps {
  * the skeleton and the waiting label. `AndroidViewer` wraps it with the controls; a watch-only page
  * renders it as it is, so a change to how the device looks lands in one place.
  */
-export function AndroidDeviceScreen({ screen, deviceReady, posturePending, surfaceHandlers, overlay }: AndroidDeviceScreenProps) {
+export function AndroidDeviceScreen({ screen, deviceReady, posturePending, surfaceHandlers, overlay, physical = false }: AndroidDeviceScreenProps) {
   const {
     surfaceHostRef, containerRef, decoderUnsupported,
     containerW, containerH, screenRadius, frameMatchesScreen, pictureVisible, canvasStyle, spinDeg, spinAnimates,
@@ -62,8 +64,8 @@ export function AndroidDeviceScreen({ screen, deviceReady, posturePending, surfa
             )}
             {!pictureVisible && deviceReady && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.875rem' }}>
-                  {posturePending || !frameMatchesScreen ? 'Changing posture…' : 'Waiting for stream…'}
+                <span className="whitespace-pre text-center" style={{ color: 'rgba(255,255,255,0.6)', fontSize: '0.875rem' }}>
+                  {posturePending || !frameMatchesScreen ? 'Changing posture…' : physical ? 'Connected to physical device.\nWaiting for device…' : 'Waiting for stream…'}
                 </span>
               </div>
             )}

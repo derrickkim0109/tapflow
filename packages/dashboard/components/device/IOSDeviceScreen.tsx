@@ -41,6 +41,8 @@ interface IOSDeviceScreenProps {
   areaOverlay?: ReactNode;
   /** A fold this viewer asked for, still in flight — `usePostureControl().folding`. The screen says so. */
   folding?: FoldDirection | null;
+  /** A phone on USB: before its first frame the screen says it is connected and waiting for the phone (#152). */
+  physical?: boolean;
 }
 
 /**
@@ -50,7 +52,7 @@ interface IOSDeviceScreenProps {
  */
 export function IOSDeviceScreen({
   screen, chrome, formFactor, turn, joined, fps,
-  containerHandlers, buttons, overlay, areaOverlay, folding = null,
+  containerHandlers, buttons, overlay, areaOverlay, folding = null, physical = false,
 }: IOSDeviceScreenProps) {
   const { canvasRef, containerRef, screenAreaRef, canvasReady, stalled } = screen;
   const { displayW, displayH, screenBox } = iosScreenLayout(chrome);
@@ -77,7 +79,7 @@ export function IOSDeviceScreen({
   // A fold takes the Duo 4–6 s, both panels dark for part of it; the screen says so the way it says it is
   // waiting for a frame, rather than looking stuck. It wins over the frame wait, which a fold causes.
   const waiting = folding ? (folding === 'fold' ? 'Folding...' : 'Unfolding...')
-    : joined && fps === 0 && (!canvasReady || stalled) ? (canvasReady ? 'Waiting for next frame...' : 'Waiting for first frame...')
+    : joined && fps === 0 && (!canvasReady || stalled) ? (canvasReady ? 'Waiting for next frame...' : physical ? 'Connected to physical device.\nWaiting for device...' : 'Waiting for first frame...')
     : null;
   const motion = spin.animate ? 'motion-safe:duration-300 motion-safe:ease-in-out' : '';
 
@@ -127,7 +129,7 @@ export function IOSDeviceScreen({
             {canvasReady && <div aria-hidden="true" className="absolute inset-0 bg-black/60 bg-screen-shimmer bg-[length:200%_100%] animate-screen-shimmer motion-reduce:animate-none" />}
             {/* Turned back by the device's turn: the overlay sits on the screen and turns with it, and the
                 words have to stand upright for whoever is reading them. */}
-            <span className="relative text-sm text-white whitespace-nowrap" style={{ transform: `rotate(${-turn}deg)` }}>{waiting}</span>
+            <span className="relative text-center text-sm text-white whitespace-pre" style={{ transform: `rotate(${-turn}deg)` }}>{waiting}</span>
           </div>
         )}
         {chrome.buttons.map((btn, i) => {

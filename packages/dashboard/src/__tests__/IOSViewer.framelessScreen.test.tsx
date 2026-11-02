@@ -118,6 +118,17 @@ describe('IOSViewer — waiting for a frame', () => {
     expect(waiting(view.container).textContent).toBe('Waiting for next frame...')
   })
 
+  // The issue's words for a phone on USB, which may sit dark until it is unlocked (#152). Mutation: say it for every
+  // device, or drop it — a simulator would claim a phone, or the phone's wait would read like a simulator's.
+  it('says a plugged-in device is connected while it waits for the first frame', () => {
+    vi.useFakeTimers()
+    const view = render(<IOSViewer {...props(REAL)} physical />)
+    expect(waiting(view.container).textContent).toBe('Connected to physical device.\nWaiting for device...')
+    act(() => { captured.onResize?.({ width: 1206, height: 2622 }) })
+    act(() => { vi.advanceTimersByTime(3000) })
+    expect(waiting(view.container).textContent).toBe('Waiting for next frame...')
+  })
+
   // The dim is placed and rounded by the box it sits in, which is the screen's own geometry.
   it('sits in a box with the screen\'s place and corners, clipping what is inside', () => {
     const view = render(<IOSViewer {...props(REAL)} />)

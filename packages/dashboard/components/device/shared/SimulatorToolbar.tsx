@@ -41,7 +41,8 @@ interface SimulatorToolbarProps {
   onScreenshot: () => void;
   onRecordToggle: () => void;
   recordState: 'idle' | 'recording' | 'uploading' | 'done';
-  onRotate: () => void;
+  /** Absent hides Rotate: a USB phone turns only in someone's hand, so there is nothing to send. */
+  onRotate?: () => void;
   /** Foldable postures, ordered most closed → most open by the protocol's contract. The control
    *  renders only when there is more than one to choose between, so a device with a single fixed
    *  screen shows nothing and no platform check is needed to decide that. */
@@ -52,7 +53,8 @@ interface SimulatorToolbarProps {
     pending: boolean;
     onSelect: (id: string) => void;
   };
-  onDeepLink: () => void;
+  /** Absent hides the deeplink button: the agent cannot open a URL on a USB phone. */
+  onDeepLink?: () => void;
   /**
    * Platform buttons that move around the app or the OS — home, back, recent apps. Rendered in the
    * **Navigation** group. See `packages/dashboard/AGENTS.md` → "Where a new device button goes".
@@ -406,15 +408,17 @@ export function SimulatorToolbar({
           {launchSlot}
           {navigationSlot}
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            {/* A deeplink is "go to this screen", which is why it is here and not with the tools. */}
-            <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Open a deeplink" onClick={onDeepLink}>
-              <Link2 className="h-4 w-4" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="left"><ShortcutTooltip label="Deeplink" keys={['⌘', 'K']} /></TooltipContent>
-        </Tooltip>
+          {onDeepLink && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                {/* A deeplink is "go to this screen", which is why it is here and not with the tools. */}
+                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Open a deeplink" onClick={onDeepLink}>
+                  <Link2 className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="left"><ShortcutTooltip label="Deeplink" keys={['⌘', 'K']} /></TooltipContent>
+            </Tooltip>
+          )}
 
         </div>
 
@@ -424,14 +428,16 @@ export function SimulatorToolbar({
         <div role="group" aria-label="Device" className="flex flex-col items-center gap-0.5">
           {deviceSlot}
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Rotate the device" onClick={onRotate}>
-              <RotateCw className="h-4 w-4" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="left"><ShortcutTooltip label="Rotate" keys={['⌘', '⇧', 'O']} /></TooltipContent>
-        </Tooltip>
+          {onRotate && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Rotate the device" onClick={onRotate}>
+                  <RotateCw className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="left"><ShortcutTooltip label="Rotate" keys={['⌘', '⇧', 'O']} /></TooltipContent>
+            </Tooltip>
+          )}
 
         {/* The outcome of a fold is otherwise conveyed only by pixels — the spinner swapping back
             and the picture returning — so it is announced, as reboot, recording and network already
