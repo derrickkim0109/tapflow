@@ -3111,6 +3111,11 @@ export class IOSAgent implements DeviceAgent, NetworkControlCapability, Posturab
     const appPath = archived ? await this.extractApp(source, tmpDir) : source
     const info = await this.devicectl.appBundleInfo(appPath)
     const id = bundleId ?? info.bundleId
+    // **Named here, not only at launch.** Typing on a phone finds the focused field in the app the runner is told
+    // about: the private list of active apps it falls back to comes back empty on a device, so an app the tester
+    // opened from the home screen — rather than through tapflow's launch — was never found and every key was refused.
+    // The runner only uses the name while that app is in front, so naming it before it runs costs nothing.
+    if (id) this.lastBundleIds.set(udid, id)
     if (info.platform !== 'simulator') {
       try {
         await this.devicectl.installApp(udid, appPath)

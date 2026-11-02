@@ -4330,6 +4330,7 @@ describe('IOSAgent', () => {
         expect(devicectl.installApp).toHaveBeenCalledWith(PHONE.id, expect.stringMatching(/Payload\/Example\.app$/))
         expect(devicectl.uninstallApp).not.toHaveBeenCalled()
         expect(ctx.simctl.installApp).not.toHaveBeenCalled()
+        expect((ctx.agent as unknown as { lastBundleIds: Map<string, string> }).lastBundleIds.get(PHONE.id)).toBe('com.example.app')
         ctx.agent.disconnect()
       })
 
@@ -4370,6 +4371,9 @@ describe('IOSAgent', () => {
         expect(devicectl.installedApp).toHaveBeenCalledWith(PHONE.id, 'com.example.app')
         expect(devicectl.installApp).not.toHaveBeenCalled()
         expect(devicectl.uninstallApp).not.toHaveBeenCalled()
+        // Mutation: name the app only at launch. Opened from the home screen instead, it was never found and every key
+        // typed into it was refused — the runner's list of active apps comes back empty on a phone.
+        expect((ctx.agent as unknown as { lastBundleIds: Map<string, string> }).lastBundleIds.get(PHONE.id)).toBe('com.example.app')
         ctx.agent.disconnect()
       })
 

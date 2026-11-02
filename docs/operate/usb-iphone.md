@@ -5,7 +5,7 @@ description: Get an iPhone plugged into the agent Mac by USB ready to open from 
 
 # USB-connected iPhones
 
-An iPhone plugged into the agent Mac by USB is listed next to the simulators with a **USB** badge. Open it from the dashboard to mirror its screen in the browser and send it taps, drags, long presses and typing. It is still experimental: mirroring and taps were tried on a real iPhone; drags, typing, install and launch were not tried on hardware. An iPad is listed too but has not been tried.
+An iPhone plugged into the agent Mac by USB is listed next to the simulators with a **USB** badge. Open it from the dashboard to mirror its screen in the browser and send it taps, drags, long presses and typing. It is still experimental: mirroring, taps, drags, typing (into an app opened from tapflow or from the home screen) and launching the copy already on the phone were tried on a real iPhone; installing a device build (.ipa) was not tried on hardware. An iPad is listed too but has not been tried.
 
 ## Prepare the iPhone
 
