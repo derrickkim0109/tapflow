@@ -158,6 +158,13 @@ function ownershipRefusal(session: Session): string {
   return session.browserSocket ? 'session held by another client' : 'session not joined'
 }
 
+/** Whether this session's device runs on its agent's Mac, so the Mac's CPU and memory are what it spends. A USB phone
+ *  boots nothing there, so the resource gate protects nothing by refusing it. An absent `kind` reads as a simulator
+ *  or emulator: an agent that predates the field reports only those. */
+function runsOnMac(session: Session): boolean {
+  return session.deviceKind !== 'physical'
+}
+
 function sameBuild(a: InstalledBuild, b: InstalledBuild): boolean {
   return a.buildId === b.buildId && a.filePath === b.filePath
 }
@@ -2247,14 +2254,19 @@ export class RelayServer {
    * What a person picking one of this agent's devices would meet, summarised for the Mac card. The same reading
    * `handleSessionStart` applies, with its memory exemption: a person rejoining a device the relay has up
    * (`readySent`) is not held to memory, so memory alone blocks the Mac only when there is no such device.
+   *
+   * A USB phone is never refused for the Mac's load (`runsOnMac`), so it is never in `memoryRefuses`. `overloaded`
+   * keeps its meaning — no simulator or emulator join here would be let in — and is judged on those devices alone;
+   * a viewer that lists the Mac's phones keeps them open itself.
    */
   private macAdmission(group: Session[]): MacAdmission {
     const load = this.resourceLoad(group[0]!)
     const memOver = load?.memOver ?? false
+    const onMac = group.filter(runsOnMac)
     return {
       booting: this.bootGate.isBooting(hostKeyOf(group[0]!)),
-      overloaded: (load?.cpuOver ?? false) || (memOver && !group.some((s) => s.readySent)),
-      memoryRefuses: memOver ? group.filter((s) => !s.readySent).map((s) => s.deviceId) : [],
+      overloaded: (load?.cpuOver ?? false) || (memOver && !onMac.some((s) => s.readySent)),
+      memoryRefuses: memOver ? onMac.filter((s) => !s.readySent).map((s) => s.deviceId) : [],
     }
   }
 
@@ -2923,8 +2935,11 @@ export class RelayServer {
     // a full Mac. An AI client keeps the memory half: its boot warms the UI-tree runner, which does cost
     // memory on a device already up. The CPU half applies to every join — a join usually starts a stream, and a
     // stream's encoding is the load #107 is about.
+    //
+    // Neither half applies to a USB phone (`runsOnMac`): it boots nothing on the Mac, so a loaded Mac is no reason
+    // to keep a person or a run off it.
     const agentAway = session.agentSocket.readyState !== WebSocket.OPEN
-    const load = this.resourceLoad(session)
+    const load = runsOnMac(session) ? this.resourceLoad(session) : null
     if (load) {
       const memSpent = session.readySent && !isAiClientKind(msg.clientKind)
       if (load.cpuOver || (load.memOver && !memSpent)) {
