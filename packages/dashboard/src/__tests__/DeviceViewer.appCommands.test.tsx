@@ -23,7 +23,7 @@ vi.mock('@/lib/decoders/pickDecoder', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/decoders/pickDecoder')>()),
   canDecodeH264: () => false,
 }))
-vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }))
 
 const { toast } = await import('sonner')
 const { DeviceViewer } = await import('@/components/DeviceViewer')
@@ -169,5 +169,24 @@ describe('DeviceViewer only acts on app-command replies it asked for', () => {
     live(7)
     act(() => { deliver!({ type: 'app:install-done', sessionId: 'mine' } as BrowserInbound) })
     expect(screen.getByText(/Installing/)).toBeInTheDocument()
+  })
+
+  // A simulator build sent to a USB phone cannot go on it, so the agent uses the copy already there and says so.
+  // Mutation: drop the `msg.warning` toast — the tester tests a build they did not pick and nothing tells them.
+  it('passes on an install warning, and the install still counts as done', () => {
+    vi.mocked(toast.warning).mockClear()
+    live(7)
+    const warning = 'This is a simulator build, so the copy already on the iPhone is used.'
+    act(() => { deliver!({ type: 'app:install-done', sessionId: 'mine', requestId: sentId('app:install'), warning }) })
+    expect(toast.warning).toHaveBeenCalledWith(expect.any(String), { description: warning })
+    expect(screen.queryByText(/Installing/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Launch app' })).toBeInTheDocument()
+  })
+
+  it('warns about nothing on an ordinary install', () => {
+    vi.mocked(toast.warning).mockClear()
+    live(7)
+    act(() => { deliver!({ type: 'app:install-done', sessionId: 'mine', requestId: sentId('app:install') }) })
+    expect(toast.warning).not.toHaveBeenCalled()
   })
 })

@@ -495,6 +495,8 @@ export function DeviceViewer({ sessionId, deviceId, formFactor, platform = 'ios'
       if (msg.type === 'app:install-done') {
         setInstalled(true);
         keepInstalledRef.current = true;
+        // Still done — an app is there to launch — but not the build that was picked, and nothing else on screen says so.
+        if (msg.warning) toast.warning('A different build is on this device', { description: msg.warning });
       } else setInstallError(msg.message);
     }
     if (msg.type === 'app:launch-done' || msg.type === 'app:launch-error') {
