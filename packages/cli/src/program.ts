@@ -20,6 +20,8 @@ import { cmdStatus } from './commands/status.js'
 import { cmdLogs } from './commands/logs.js'
 import { cmdFlowRun, tagsArg, type FlowRunOptions, type TagsArg } from './commands/flow-run.js'
 import { cmdMigrate, cmdMigrateDataDir, cmdMigrateNetFilter } from './commands/migrate.js'
+// `tapflow maestro` runs a Maestro flow with the Maestro CLI itself (packages/cli/src/maestro/README.md).
+import { registerMaestroCommand } from './maestro/register.js'
 
 /**
  * The whole command surface, built without parsing anything.
@@ -193,6 +195,8 @@ export function createCli(): CAC {
       console.error(`Unknown subcommand: migrate ${subcommand}`)
       process.exit(1)
     })
+
+  registerMaestroCommand(cli)
 
   cli.help()
   cli.version(version)

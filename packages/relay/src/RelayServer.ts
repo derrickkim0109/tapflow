@@ -114,6 +114,7 @@ import { handleUpdateProfile } from './api/profile.js'
 import { handleUploadRecording, handleListRecordings, handleDownloadRecording, purgeExpiredRecordings } from './api/recordings.js'
 import { handleEndVideo, handleOpenVideo, handleVideoChunk, handleVideoData, handleVideoIndex, purgeRunVideos, releaseStaleVideoReservations, runVideosDirFor, videoSummaries } from './api/runVideos.js'
 import { abandonRunsOf, handleCreateRun, handleFinishRun, handleReportDevice, handleStartFlow, handleGetFlowScreenshot, handleGetRun, handleListRuns, handleReportFlow, handleUploadFlowScreenshot, purgeExpiredRuns, runScreenshotsDirFor, type RunHolders } from './api/runs.js'
+import { registerMaestroRunArtifacts } from './maestro/runArtifacts.js'
 import { handleListAgents, handleGetAgentResources } from './api/agents.js'
 
 const MIME_TYPES: Record<string, string> = {
@@ -626,6 +627,8 @@ export class RelayServer {
     this.router.post('/api/v1/runs/:id/flows/:idx/start', handleStartFlow)
     this.router.post('/api/v1/runs/:id/flows/:idx/screenshot', (req, res, params) => handleUploadFlowScreenshot(req, res, params, this.runScreenshotsDir))
     this.router.get('/api/v1/runs/:id/flows/:idx/screenshot', (req, res, params) => handleGetFlowScreenshot(req, res, params, this.runScreenshotsDir))
+    // files a `tapflow maestro` run attaches (screenshots, Maestro's log)
+    registerMaestroRunArtifacts(this.router, this.runScreenshotsDir)
     // a flow's video (A4) — uploaded by the runner while the flow runs, kept by the retention policy
     this.runVideosDir = runVideosDirFor(u)
     this.router.post('/api/v1/runs/:id/flows/:idx/video/open', (req, res, params) => handleOpenVideo(req, res, params, this.runVideosDir))

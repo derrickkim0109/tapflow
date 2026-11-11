@@ -15,6 +15,7 @@ import {
 } from '@/lib/runs'
 import type { RunDetail as Run, RunDevice, RunFlow, RunStep, ServiceTier } from '@/lib/types'
 import { RunVideo } from '@/components/runs/RunVideo'
+import { MaestroRunArtifacts } from '@/components/maestro/MaestroRunArtifacts'
 
 /**
  * One run: what each flow did, why it failed, and — while it is running — a link to watch it. The watch link is
@@ -118,6 +119,7 @@ function RunBody({ run }: { run: Run }) {
       <ol className="flex flex-col gap-3" aria-label="Flows">
         {run.flows.map((flow) => <FlowItem key={flow.idx} runId={run.id} flow={flow} />)}
       </ol>
+      <MaestroRunArtifacts runId={run.id} running={run.status === 'running'} />
     </>
   )
 }
