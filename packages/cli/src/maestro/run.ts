@@ -46,6 +46,36 @@ export function findMaestro(env: NodeJS.ProcessEnv = process.env, exists: (p: st
   return onPath('maestro', env, exists) ?? (exists(installed) ? installed : null)
 }
 
+/** Where `findAdb` looks, in order, for the error that says it found none. */
+export const ADB_PLACES = ['$ADB_PATH', '$ANDROID_HOME/platform-tools', '$ANDROID_SDK_ROOT/platform-tools', '~/Library/Android/sdk/platform-tools', 'PATH'] as const
+
+/** A regular file this process may run — a folder named `adb` or a half-installed one without the x bit is skipped. */
+export function isExecutableFile(p: string): boolean {
+  try {
+    if (!fs.statSync(p).isFile()) return false
+    fs.accessSync(p, fs.constants.X_OK)
+    return true
+  } catch { return false }
+}
+
+/**
+ * `adb`, looked for in the order the Android agent looks (`android-agent/src/sdk.ts` `getAdbPath`): `ADB_PATH`, the
+ * SDK the environment names, where Android Studio installs it, then PATH. The same order matters: two adb binaries of
+ * different versions on one Mac kill each other's adb server, dropping the agent's forwards mid-session. And a build
+ * machine's login shell (PM2, a CI runner) often has no SDK on PATH at all — without the SDK places, a plugged-in phone
+ * would read as "no Android phone is ready".
+ */
+export function findAdb(env: NodeJS.ProcessEnv = process.env, usable: (p: string) => boolean = isExecutableFile): string | null {
+  if (env.ADB_PATH) return env.ADB_PATH
+  const sdks = [env.ANDROID_HOME, env.ANDROID_SDK_ROOT, path.join(env.HOME ?? os.homedir(), 'Library', 'Android', 'sdk')]
+  for (const sdk of sdks) {
+    if (!sdk) continue
+    const adb = path.join(sdk, 'platform-tools', 'adb')
+    if (usable(adb)) return adb
+  }
+  return onPath('adb', env, usable)
+}
+
 /** Why a run could not start on this phone, in words for the person running the command. */
 export class DeviceUnavailable extends Error {}
 
@@ -70,10 +100,10 @@ export function portHolderVerdict(args: string, port: number, udid: string): 'ou
  * run — Maestro's own first step then says what is wrong, in its words. A port it may not free does.
  */
 export async function prepareDevice(
-  device: MaestroDevice, appId: string, deps: RunDeps, driverHostPort = DEFAULT_DRIVER_HOST_PORT, signal?: AbortSignal,
+  device: MaestroDevice, appId: string, deps: RunDeps, driverHostPort = DEFAULT_DRIVER_HOST_PORT, signal?: AbortSignal, adbBin = 'adb',
 ): Promise<void> {
   if (device.platform === 'android') {
-    await deps.exec('adb', ['-s', device.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP'], 10_000)
+    await deps.exec(adbBin, ['-s', device.serial, 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP'], 10_000)
       .catch((e: Error) => deps.say(`could not wake ${device.serial}: ${e.message}`))
     return
   }

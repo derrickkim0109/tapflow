@@ -1,5 +1,6 @@
 // `tapflow maestro` — the Maestro command line and the values
 // a flow reads. Pure, so every rule below is a unit test rather than a run on a phone.
+import path from 'node:path'
 import type { MaestroDevice } from './device.js'
 
 /**
@@ -107,9 +108,15 @@ export function maestroArgv(input: MaestroArgvInput): string[] {
  * quarter of the Mac's memory), and the driver five minutes to start: a physical iPhone's first start after a
  * reboot measured over two. Values the caller already set win.
  */
-export function maestroProcessEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function maestroProcessEnv(base: NodeJS.ProcessEnv, adbBin?: string | null): NodeJS.ProcessEnv {
+  // The adb found outside PATH goes on Maestro's PATH too, so Maestro's own Android driver finds the same one.
+  const adbDir = adbBin && path.isAbsolute(adbBin) ? path.dirname(adbBin) : undefined
+  const PATH = adbDir && !(base.PATH ?? '').split(path.delimiter).includes(adbDir)
+    ? [adbDir, base.PATH].filter(Boolean).join(path.delimiter)
+    : base.PATH
   return {
     ...base,
+    ...(PATH !== undefined ? { PATH } : {}),
     MAESTRO_OPTS: base.MAESTRO_OPTS ?? '-Xmx1g',
     MAESTRO_DRIVER_STARTUP_TIMEOUT: base.MAESTRO_DRIVER_STARTUP_TIMEOUT ?? '300000',
     // Maestro asks to send analytics on first run and waits for an answer nobody is there to give.
