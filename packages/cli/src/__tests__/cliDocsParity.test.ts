@@ -59,6 +59,7 @@ function codeSurface(cli: CAC): { invocations: Set<string>; flags: Surface; glob
   const invocations = new Set<string>()
   const flags: Surface = new Map()
   for (const cmd of cli.commands) {
+    if (cmd.name === 'maestro') continue // fork extension: documented in packages/cli/src/maestro/README.md
     // An alias would be an invocation the doc could never be asked for. None exist; if one is added,
     // this walk has to learn it rather than skip it.
     if (cmd.aliasNames.length > 0) throw new Error(`${cmd.name}: aliases are not walked — extend cliDocsParity`)
