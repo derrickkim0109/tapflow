@@ -27,6 +27,11 @@ TEST_PHONE=0100000000 TEST_PIN=000000 tapflow maestro flows/login.yaml --device 
 
 ## Before Maestro starts
 
+- adb is looked for in the order the Android agent uses: `$ADB_PATH`, `$ANDROID_HOME/platform-tools`,
+  `$ANDROID_SDK_ROOT/platform-tools`, `~/Library/Android/sdk/platform-tools`, then PATH. A different order could pick
+  another adb version, and two adb versions on one Mac kill each other's server. A login shell under PM2 or a CI runner
+  often has no SDK on PATH. The adb found is also put first on Maestro's PATH. When none is found and the id matches no
+  device, the error says `adb not found`.
 - Android: the screen is woken, or screenshots come out black and taps land on the lock screen.
 - iPhone: `iproxy` (`brew install libimobiledevice`) is required. If an `iproxy` left by an earlier run *for this same
   phone* holds the driver port `22087`, it is ended. If an `iproxy` for another iPhone holds it, or any other program,

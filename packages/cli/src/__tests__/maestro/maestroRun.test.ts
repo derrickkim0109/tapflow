@@ -7,7 +7,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { cmdMaestro, type CommandDeps } from '../../maestro/command'
-import { DeviceUnavailable, portHolderVerdict, prepareDevice, runMaestroProcess, type RunDeps } from '../../maestro/run'
+import { DeviceUnavailable, findAdb, portHolderVerdict, prepareDevice, runMaestroProcess, type RunDeps } from '../../maestro/run'
+import { maestroProcessEnv } from '../../maestro/plan'
 import type { IosCandidate, MaestroDevice } from '../../maestro/device'
 
 const UDID = '00008140-0001111111111111'
@@ -23,7 +24,7 @@ class FakeChild extends EventEmitter {
   exitCode: number | null = null
   signalCode: NodeJS.Signals | null = null
   killed: (string | number | undefined)[] = []
-  constructor(readonly cmd: string, readonly args: string[]) { super() }
+  constructor(readonly cmd: string, readonly args: string[], readonly env?: NodeJS.ProcessEnv) { super() }
   kill(sig?: string | number) {
     this.killed.push(sig ?? 'SIGTERM')
     if (this.exitCode === null && this.signalCode === null) setImmediate(() => this.close(null, (sig as NodeJS.Signals) ?? 'SIGTERM'))
@@ -55,8 +56,8 @@ function harness(): Harness {
     deps: undefined as unknown as RunDeps,
   }
   h.deps = {
-    spawn: (cmd, args) => {
-      const c = new FakeChild(cmd, args)
+    spawn: (cmd, args, opts) => {
+      const c = new FakeChild(cmd, args, opts.env)
       h.spawned.push(c)
       if (cmd !== 'iproxy') h.maestro(c)
       return c as unknown as ChildProcess
@@ -105,13 +106,54 @@ describe('the iOS driver port', () => {
     }
   })
 
-  it('wakes an Android phone and touches no port', async () => {
+  it('wakes an Android phone with the adb it was given, and touches no port', async () => {
     const h = harness()
     const adb: string[][] = []
-    h.exec.adb = (a) => { adb.push(a); return '' }
+    h.exec['/sdk/platform-tools/adb'] = (a) => { adb.push(a); return '' }
     h.exec.lsof = () => { throw new Error('not for android') }
-    await prepareDevice(android, 'app', h.deps)
+    await prepareDevice(android, 'app', h.deps, undefined, undefined, '/sdk/platform-tools/adb')
     expect(adb).toEqual([['-s', 'SERIAL0001', 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP']])
+  })
+})
+
+describe('finding adb off PATH', () => {
+  const at = (...files: string[]) => (p: string) => files.includes(p)
+
+  it('looks in the order the Android agent does — ADB_PATH, the SDK, Android Studio\'s place, then PATH', () => {
+    // Same order as the agent, or two adb versions on one Mac kill each other's server.
+    expect(findAdb({ PATH: '/u/bin', HOME: '/h', ADB_PATH: '/x/adb', ANDROID_HOME: '/a' }, at('/a/platform-tools/adb'))).toBe('/x/adb')
+    expect(findAdb({ PATH: '/u/bin', HOME: '/h', ANDROID_HOME: '/a' }, at('/u/bin/adb', '/a/platform-tools/adb'))).toBe('/a/platform-tools/adb')
+    expect(findAdb({ PATH: '/u/bin', HOME: '/h' }, at('/u/bin/adb', '/h/Library/Android/sdk/platform-tools/adb'))).toBe('/h/Library/Android/sdk/platform-tools/adb')
+    expect(findAdb({ PATH: '/u/bin', HOME: '/h' }, at('/u/bin/adb'))).toBe('/u/bin/adb')
+    expect(findAdb({ PATH: '', HOME: '/h', ANDROID_SDK_ROOT: '/r' }, at('/r/platform-tools/adb'))).toBe('/r/platform-tools/adb')
+    // The build machine: a login shell with no SDK on PATH and no ANDROID_HOME .
+    expect(findAdb({ PATH: '/usr/bin:/bin', HOME: '/Users/ci' }, at('/Users/ci/Library/Android/sdk/platform-tools/adb')))
+      .toBe('/Users/ci/Library/Android/sdk/platform-tools/adb')
+    expect(findAdb({ PATH: '/usr/bin', HOME: '/h' }, at())).toBeNull()
+  })
+
+  it('puts the found adb\'s folder on Maestro\'s PATH, once', () => {
+    expect(maestroProcessEnv({ PATH: '/usr/bin' }, '/h/Library/Android/sdk/platform-tools/adb').PATH).toBe('/h/Library/Android/sdk/platform-tools:/usr/bin')
+    expect(maestroProcessEnv({ PATH: '/sdk/pt:/usr/bin' }, '/sdk/pt/adb').PATH).toBe('/sdk/pt:/usr/bin')
+    expect(maestroProcessEnv({ PATH: '/usr/bin' }, null).PATH).toBe('/usr/bin')
+    // No PATH, or an empty one: only the adb folder — never an empty entry, which would mean the working folder.
+    expect(maestroProcessEnv({}, '/sdk/pt/adb').PATH).toBe('/sdk/pt')
+    expect(maestroProcessEnv({ PATH: '' }, '/sdk/pt/adb').PATH).toBe('/sdk/pt')
+    expect('PATH' in maestroProcessEnv({}, null)).toBe(false)
+  })
+
+  it('skips a folder named adb and an adb it may not run', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'maestro-adb-'))
+    const folder = path.join(dir, 'a', 'platform-tools', 'adb')
+    fs.mkdirSync(folder, { recursive: true })
+    const noX = path.join(dir, 'b', 'platform-tools', 'adb')
+    fs.mkdirSync(path.dirname(noX), { recursive: true })
+    fs.writeFileSync(noX, '#!/bin/sh\n', { mode: 0o644 })
+    const ok = path.join(dir, 'c', 'platform-tools', 'adb')
+    fs.mkdirSync(path.dirname(ok), { recursive: true })
+    fs.writeFileSync(ok, '#!/bin/sh\n', { mode: 0o755 })
+    expect(findAdb({ HOME: dir, ANDROID_HOME: path.join(dir, 'a'), ANDROID_SDK_ROOT: path.join(dir, 'b'), PATH: path.join(dir, 'c', 'platform-tools') })).toBe(ok)
+    fs.rmSync(dir, { recursive: true })
   })
 })
 
@@ -181,6 +223,7 @@ describe('tapflow maestro — exit codes', () => {
     let handler: (() => void) | undefined
     return {
       ...h.deps,
+      findAdb: () => '/sdk/platform-tools/adb',
       readyDevices: () => ({ adb: ['SERIAL0001'], ios: [readyIphone] }),
       findMaestro: () => '/bin/maestro',
       hasProgram: () => true,
@@ -211,6 +254,36 @@ describe('tapflow maestro — exit codes', () => {
     h.exec.ps = () => `iproxy 22087 22087 -u ${OTHER}`
     expect(await run(cmdDeps(h), UDID)).toBe(2)
     expect(h.spawned).toEqual([])
+  })
+
+  it('says adb is missing when it is, rather than only that the phone is not ready', async () => {
+    const h = harness()
+    const said: string[] = h.said
+    let askedWith: string | null | undefined
+    const deps = cmdDeps(h, { findAdb: () => null, readyDevices: (adb) => { askedWith = adb; return { adb: [], ios: [] } } })
+    expect(await run(deps)).toBe(2)
+    expect(askedWith).toBeNull()
+    expect(said.join('\n')).toMatch(/adb not found — looked in \$ADB_PATH, \$ANDROID_HOME\/platform-tools, .*, PATH\./)
+  })
+
+  it('reads devices, wakes the phone and runs Maestro with the adb it found', async () => {
+    const h = harness()
+    let askedWith: string | null | undefined
+    const woke: string[][] = []
+    h.exec['/sdk/platform-tools/adb'] = (a) => { woke.push(a); return '' }
+    const deps = cmdDeps(h, { readyDevices: (adb) => { askedWith = adb; return { adb: ['SERIAL0001'], ios: [] } } })
+    expect(await run(deps)).toBe(0)
+    expect(askedWith).toBe('/sdk/platform-tools/adb')
+    expect(woke).toEqual([['-s', 'SERIAL0001', 'shell', 'input', 'keyevent', 'KEYCODE_WAKEUP']])
+    expect(h.spawned[0].env?.PATH?.startsWith('/sdk/platform-tools')).toBe(true)
+  })
+
+  it('does not blame adb when the id named an iPhone that is not ready', async () => {
+    const h = harness()
+    const deps = cmdDeps(h, { findAdb: () => null, readyDevices: () => ({ adb: [], ios: [{ ...readyIphone, ready: false, notReady: 'is not in Developer Mode' }] }) })
+    expect(await run(deps, UDID)).toBe(2)
+    expect(h.said.join('\n')).toMatch(/Developer Mode/)
+    expect(h.said.join('\n')).not.toMatch(/adb not found/)
   })
 
   it('2, not 1, for an error nobody planned for', async () => {

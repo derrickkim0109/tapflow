@@ -17,7 +17,7 @@ import { ciContext } from '../lib/ci.js'
 import { DeviceNotFound, parseAdbDevices, parseDevicectlDevices, pickDevice, type IosCandidate, type MaestroDevice } from './device.js'
 import { BadEnvArg, flowEnv, flowName, maestroArgv, maestroProcessEnv, redactor, secretValues } from './plan.js'
 import {
-  collectArtifacts, DeviceUnavailable, findMaestro, onPath, prepareDevice, pruneRunFolders, readCommandsLog, realDeps,
+  ADB_PLACES, collectArtifacts, DeviceUnavailable, findAdb, findMaestro, onPath, prepareDevice, pruneRunFolders, readCommandsLog, realDeps,
   runMaestroProcess, type Artifact, type RunDeps,
 } from './run.js'
 import { failureKindOf, failureSummary, stepsFromCommands } from './steps.js'
@@ -37,7 +37,9 @@ export interface MaestroOptions {
 
 /** What the command reads from the machine, injectable so the whole run can be tested without a phone. */
 export interface CommandDeps extends RunDeps {
-  readyDevices: () => { adb: string[]; ios: IosCandidate[] }
+  /** `adb`, wherever `findAdb` finds it, or null. */
+  findAdb: () => string | null
+  readyDevices: (adbBin: string | null) => { adb: string[]; ios: IosCandidate[] }
   findMaestro: () => string | null
   /** Whether a helper program is on PATH (iproxy). */
   hasProgram: (name: string) => boolean
@@ -62,10 +64,10 @@ function httpBaseOf(relayUrl: string): string {
 }
 
 /** The ready phones, read the way the agents read them. A host without adb or Xcode simply has none of that kind. */
-function readyDevices(): { adb: string[]; ios: IosCandidate[] } {
+function readyDevices(adbBin: string | null): { adb: string[]; ios: IosCandidate[] } {
   let adb: string[] = []
   try {
-    adb = parseAdbDevices(execFileSync('adb', ['devices'], { encoding: 'utf8', stdio: 'pipe', timeout: 10_000 }))
+    if (adbBin) adb = parseAdbDevices(execFileSync(adbBin, ['devices'], { encoding: 'utf8', stdio: 'pipe', timeout: 10_000 }))
   } catch { /* no adb */ }
   let ios: IosCandidate[] = []
   const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tapflow-devicectl-')), 'devices.json')
@@ -80,6 +82,7 @@ function readyDevices(): { adb: string[]; ios: IosCandidate[] } {
 
 export const realCommandDeps: CommandDeps = {
   ...realDeps,
+  findAdb: () => findAdb(),
   readyDevices,
   findMaestro: () => findMaestro(),
   hasProgram: (name) => onPath(name) !== null,
@@ -161,12 +164,16 @@ export async function cmdMaestro(flowArg: string | undefined, opts: MaestroOptio
     try { yaml = fs.readFileSync(flowFile, 'utf8') } catch (e) { envFail(`cannot read ${flowFile}: ${(e as Error).message}`) }
     if (!opts.device) envFail('--device <id> is required: an adb serial (or usb:<serial>) or an iPhone\'s UDID. It is never picked for you')
 
-    const ready = deps.readyDevices()
+    const adbBin = deps.findAdb()
+    const ready = deps.readyDevices(adbBin)
     let device: MaestroDevice
     try {
       device = pickDevice(String(opts.device), ready.adb, ready.ios)
     } catch (e) {
-      if (e instanceof DeviceNotFound) envFail(e.message)
+      // Without adb no Android phone can be seen at all: say that — but only when the id matched no phone, not when
+      // it named an iPhone that is not ready, where adb has nothing to do with it.
+      const noSuchId = e instanceof DeviceNotFound && e.message.startsWith('no ready device')
+      if (e instanceof DeviceNotFound) envFail(adbBin || !noSuchId ? e.message : `${e.message}\nadb not found — looked in ${ADB_PLACES.join(', ')}. Set ANDROID_HOME or put platform-tools on PATH`)
       throw e
     }
     const maestroBin = deps.findMaestro() ?? envFail('maestro not found — install it (curl -Ls https://get.maestro.mobile.dev | bash) or set TAPFLOW_MAESTRO_BIN')
@@ -223,7 +230,7 @@ export async function cmdMaestro(flowArg: string | undefined, opts: MaestroOptio
     deps.say(`▶ ${name} on ${device.name} (${device.platform}) → ${outputDir}`)
     const startedAt = Date.now()
     try {
-      await prepareDevice(device, env.APP_ID, deps, undefined, abort.signal)
+      await prepareDevice(device, env.APP_ID, deps, undefined, abort.signal, adbBin ?? 'adb')
     } catch (e) {
       if (e instanceof DeviceUnavailable) envFail(e.message)
       throw e
@@ -231,7 +238,7 @@ export async function cmdMaestro(flowArg: string | undefined, opts: MaestroOptio
     const result = await runMaestroProcess({
       maestroBin,
       argv: maestroArgv({ device, flowFile, debugDir, env, ...(teamId ? { appleTeamId: teamId } : {}) }),
-      env: maestroProcessEnv(process.env),
+      env: maestroProcessEnv(process.env, adbBin),
       cwd: outputDir,
       logFile: path.join(outputDir, 'maestro.log'),
       device,
