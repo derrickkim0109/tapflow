@@ -16,7 +16,7 @@ description: "tapflow REST API 전체 레퍼런스(/api/v1): 인증, 초대, 비
 | PAT scope | 엔드포인트 |
 |-----------|-----------|
 | `builds:write` | `POST /builds`, `GET /builds`, `GET /builds/:id`, `POST /comments`, 웹훅 엔드포인트 전체, 실행 기록 쓰기(`POST /runs` 아래) |
-| `view` | `GET /apps`, `GET /runs` 아래, `GET /sessions/:sessionId/screenshot`, `GET /sessions/:sessionId/ui-tree`, `/uploads/` 아래 파일(`/api/v1/`이 아닌 릴레이 루트 경로), 원격에서 여는 기기 세션 WebSocket |
+| `view` | `GET /apps`, `GET /runs` 아래, `GET /sessions/:sessionId/screenshot`, `GET /sessions/:sessionId/ui-tree`, `POST /sessions/:sessionId/reach`, `/uploads/` 아래 파일(`/api/v1/`이 아닌 릴레이 루트 경로), 원격에서 여는 기기 세션 WebSocket |
 | `agent` | 원격 에이전트의 WebSocket 연결. 토큰을 발급한 팀원이 Admin인 동안에만 받습니다 |
 
 **역할.** PAT로 호출해도 토큰 주인의 현재 역할이 적용됩니다. Viewer는 읽기 전용이라 빌드 업로드·수정·삭제 예약, 앱 생성·수정·삭제, 웹훅 엔드포인트 전체, 실행 기록 쓰기에서 `403`을 받습니다. 빌드 조회와 댓글 작성은 Viewer도 할 수 있습니다. 역할을 확인하는 엔드포인트는 요청마다 역할을 다시 읽으므로 역할을 바꾸면 다시 로그인하거나 토큰을 새로 만들지 않아도 바로 적용됩니다.
@@ -117,11 +117,12 @@ Body (JSON):
   "email": "admin@example.com",
   "displayName": "Admin",
   "avatarUrl": "/uploads/avatars/user-1.png",
-  "role": "Admin"
+  "role": "Admin",
+  "flowCapture": true
 }
 ```
 
-`avatarUrl`은 프로필 이미지가 없으면 `null`입니다.
+`avatarUrl`은 프로필 이미지가 없으면 `null`입니다. `flowCapture`는 이 사용자의 QA 단계를 릴레이가 기억하는지 여부입니다([`PATCH /api/v1/me/preferences`](#patch-api-v1-me-preferences)).
 
 
 ### `POST /api/v1/auth/change-password`
@@ -252,7 +253,9 @@ Body (JSON):
       "id": 7,
       "name": "My App",
       "bundle_id_key": "com.example.app",
-      "platform": "ios",
+      "bundle_ids": { "ios": "com.example.app", "android": "com.example.android" },
+      "build_platforms": ["android", "ios"],
+      "platform": "both",
       "created_at": "2025-05-01T00:00:00.000Z",
       "latest_build_id": 42,
       "version_name": "1.2.3",
@@ -264,10 +267,12 @@ Body (JSON):
 }
 ```
 
+`bundle_ids`는 플랫폼별 bundle ID입니다. 그 플랫폼에 ID가 없으면 `null`입니다. `bundle_id_key`는 예전 클라이언트를 위해 남겨 둔 값입니다. 두 ID가 다르면 iOS 쪽을 담습니다. `build_platforms`는 빌드가 있는 플랫폼입니다.
+
 
 ### `POST /api/v1/apps`
 
-앱을 수동으로 생성합니다. **Admin, Developer, QA** 권한이 필요합니다. Viewer는 `403`을 받습니다. 같은 `bundle_id_key`인 앱이 이미 있으면 플랫폼과 관계없이 `409`를 받습니다. iOS와 Android 양쪽에서 쓰는 앱은 `both`로 한 번만 만드세요.
+앱을 수동으로 생성합니다. **Admin, Developer, QA** 권한이 필요합니다. Viewer는 `403`을 받습니다. 같은 `bundle_id_key`인 앱이 이미 있으면 플랫폼과 관계없이 `409`를 받습니다. iOS와 Android에서 같은 bundle ID를 쓰는 앱은 `both`로 한 번만 만드세요. 플랫폼마다 bundle ID가 다르면 한쪽 플랫폼으로 만든 뒤, 다른 플랫폼 빌드를 `app_id`를 지정해 올리세요. 그 빌드의 bundle ID가 앱에 추가됩니다. `__unknown__`은 예약된 값이라 `400`을 받습니다.
 
 ```
 Body (JSON):
@@ -310,6 +315,45 @@ Body (JSON):
 ```
 
 
+### `POST /api/v1/apps/:id/merge`
+
+다른 앱의 한 플랫폼을 이 앱으로 옮깁니다. 그 플랫폼의 bundle ID와 빌드가 함께 옮겨집니다. 빌드에 딸린 댓글·녹화·실행 기록도 따라옵니다. 옮긴 뒤 원래 앱에 남은 것이 없으면 원래 앱은 삭제됩니다. 앱 이름은 이 앱의 이름을 그대로 씁니다. 되돌리려면 [`POST /api/v1/apps/:id/split`](#post-api-v1-apps-id-split)로 그 플랫폼을 다시 떼어 냅니다. 삭제된 앱의 이름은 돌아오지 않습니다. **Admin, Developer, QA** 권한이 필요합니다.
+
+```
+Body (JSON):
+  fromAppId  number        필수  옮겨 올 앱
+  platform   ios|android   필수  옮길 플랫폼
+```
+
+**응답 `200`**
+
+```json
+{ "ok": true, "appId": 7, "removedAppId": 9 }
+```
+
+`removedAppId`는 원래 앱이 삭제됐을 때만 있습니다. 옮기는 플랫폼에 bundle ID가 있는데 이 앱에도 그 플랫폼의 bundle ID가 이미 있으면 `409`를 받습니다. 원래 앱이 두 플랫폼에 같은 ID를 쓰거나, 다른 플랫폼의 bundle ID를 가진 빌드가 있어 한 플랫폼만 떼어 낼 수 없을 때도 `409`를 받습니다. 앱이 없으면 `404`를 받습니다. 같은 앱끼리, 원래 앱에 그 플랫폼이 없을 때, 두 앱 중 하나가 bundle ID를 읽지 못한 빌드를 모아 둔 앱(`__unknown__`)일 때는 `400`을 받습니다.
+
+### `POST /api/v1/apps/:id/split`
+
+이 앱의 한 플랫폼을 새 앱으로 옮깁니다. 병합의 반대입니다. 그 플랫폼의 bundle ID와 빌드가 함께 옮겨집니다. 빌드에 딸린 댓글·녹화·실행 기록도 따라갑니다. 새 앱은 목록 맨 위에 나옵니다. **Admin, Developer, QA** 권한이 필요합니다.
+
+```
+Body (JSON):
+  platform   ios|android   필수  옮길 플랫폼
+  name       string        필수  새 앱 이름
+```
+
+**응답 `200`**
+
+```json
+{ "ok": true, "appId": 12 }
+```
+
+`appId`는 새 앱입니다. 이 앱에는 다른 플랫폼이 남아야 하므로 플랫폼이 하나뿐인 앱은 `400`을 받습니다. 이 앱이 두 플랫폼에 같은 bundle ID를 쓰거나 다른 플랫폼의 bundle ID를 가진 빌드가 있으면 `409`를 받습니다. 앱이 없으면 `404`를 받습니다. 이름이 비었을 때, 이 앱에 그 플랫폼이 없을 때, bundle ID를 읽지 못한 빌드를 모아 둔 앱(`__unknown__`)일 때는 `400`을 받습니다.
+
+이 앱의 `app_id`로 올린 업로드라도 옮긴 bundle ID를 가졌으면 새 앱으로 갑니다. bundle ID를 읽지 못한 빌드는 `app_id`를 따라갑니다. 그래서 옮긴 플랫폼에 bundle ID가 없었다면 CI의 `app_id`를 새 앱으로 바꾸세요.
+
+
 ## 빌드 (Builds)
 
 ### `POST /api/v1/builds`
@@ -327,13 +371,17 @@ Authorization: Bearer tflw_pat_<token>  (또는 세션 쿠키)
 |------|------|------|
 | `file` | 필수 | 빌드 산출물. iOS는 `.app.zip` 또는 `.tar.gz`/`.tgz`(시뮬레이터 빌드), Android는 `.apk`입니다. 최대 크기는 기본 500MB이며 `TAPFLOW_MAX_BUILD_BYTES`로 바꿀 수 있습니다. `.ipa`·`.aab`는 거부됩니다. |
 | `status` | 선택 | 초기 리뷰 상태로 `Backlog`, `In Progress`, `Done`, `Rejected` 중 하나입니다. 생략하면 미설정으로 둡니다. |
-| `label` | 선택 | App Center에서 빌드를 식별하는 자유 텍스트 레이블입니다(예: 브랜치명이나 `rc-1`). |
-| `platform` | 선택 | `ios` 또는 `android`입니다. 생략하면 파일 형식에서 자동으로 정해집니다. |
-| `app_id` | 선택 | 기존 앱에 명시적으로 연결합니다. 보통은 bundle ID로 앱이 자동 결정됩니다. |
+| `label` | 선택 | App Center에서 빌드를 식별하는 자유 텍스트 레이블입니다(예: 브랜치명이나 `rc-1`). 응답에는 `version_label`로 나옵니다. 빌드 파일에 앱 이름이 없을 때 앱 이름으로 쓰지 않습니다(그때는 파일 이름). |
+| `version_name` | 선택 | 빌드 파일의 버전 대신 쓸 값입니다. 빌드를 보여 주고 묶는 데 쓰이고 파일은 바뀌지 않습니다. 빈 값이면 파일의 값을 씁니다. |
+| `build_number` | 선택 | 빌드 파일의 빌드 번호 대신 쓸 값입니다. 규칙은 `version_name`과 같습니다. |
+| `platform` | 선택 | 무시됩니다. 플랫폼은 파일 형식으로 정해집니다. |
+| `app_id` | 선택 | 기존 앱에 연결합니다. 그 앱에 해당 플랫폼의 bundle ID가 없고 다른 앱도 그 ID를 쓰지 않으면, 빌드의 bundle ID가 그 앱에 추가됩니다. 그렇지 않으면 빌드는 자기 bundle ID의 앱으로 갑니다. 병합으로 삭제된 앱의 `app_id`를 보내도 bundle ID로 앱을 찾아 연결합니다. 생략하면 bundle ID로 앱이 정해집니다. |
 
 ::: warning iOS 빌드 주의사항
 `.ipa` 파일은 지원하지 않습니다. `.app.zip`을 올리거나, 클라우드 시뮬레이터 빌드가 만드는 `.tar.gz`/`.tgz`를 올리세요. `.app.zip`은 `xcodebuild -sdk iphonesimulator`로 빌드한 `.app` 폴더를 zip으로 압축하면 됩니다.
 :::
+
+`label`, `version_name`, `build_number`는 앞뒤 공백을 지우고 저장합니다. 100자를 넘는 `label`은 100자로 자릅니다. 100자를 넘는 `version_name`이나 `build_number`는 `400`을 받습니다.
 
 **응답 `201`**
 
@@ -344,12 +392,16 @@ Authorization: Bearer tflw_pat_<token>  (또는 세션 쿠키)
   "name": "My App",
   "version_name": "1.2.3",
   "build_number": "89",
+  "binary": { "version_name": "1.2.3", "build_number": "89" },
+  "version_label": "rc-1",
   "bundle_id": "com.example.app",
   "status_label": "In Progress",
   "platform": "ios",
   "uploaded_at": "2025-05-15T12:00:00.000Z"
 }
 ```
+
+`version_name`과 `build_number`는 지금 쓰이는 값입니다. 덮어쓴 값이 있으면 그 값입니다. `binary`는 빌드 파일에서 읽은 값입니다. 두 값이 다르면 그 값을 사람이 바꾼 빌드입니다. 빌드 목록과 단건 조회 응답도 같습니다.
 
 
 ### `GET /api/v1/builds`
@@ -360,7 +412,7 @@ Authorization: Bearer tflw_pat_<token>  (또는 세션 쿠키)
 Query:
   page      number               페이지 번호 (기본값: 0)
   limit     number               페이지 크기 (기본값: 20, 최대: 100)
-  q         string               버전명으로 검색
+  q         string               버전명이나 레이블(version_label)로 검색
   platform  ios|android          플랫폼 필터
   status    Backlog|In Progress|Done|Rejected  상태 필터
   app_id    number               특정 앱의 빌드만 조회
@@ -391,6 +443,7 @@ Query:
   "name": "My App",
   "version_name": "1.2.3",
   "build_number": "89",
+  "binary": { "version_name": "1.2.3", "build_number": "89" },
   "version_label": "rc-1",
   "status_label": "In Progress",
   "platform": "ios",
@@ -406,13 +459,17 @@ Query:
 
 ### `PATCH /api/v1/builds/:id`
 
-빌드의 상태 또는 레이블을 수정합니다. Viewer는 `403`을 받습니다.
+빌드의 상태, 레이블, 버전, 빌드 번호를 수정합니다. Viewer는 `403`을 받습니다.
 
 ```
 Body (JSON):
   status_label  Backlog|In Progress|Done|Rejected|null  선택
   version_label string|null                              선택
+  version_name  string|null                              선택  빈 값이나 null이면 빌드 파일의 값으로
+  build_number  string|null                              선택  빈 값이나 null이면 빌드 파일의 값으로
 ```
+
+텍스트 필드는 앞뒤 공백을 지우고 저장하며 최대 100자입니다. 넘거나 텍스트가 아니면 `400`을 받습니다. 빈 `version_label`은 레이블을 지웁니다. 빌드 파일과 같은 버전이나 빌드 번호를 보내면 덮어쓰지 않은 것으로 저장합니다.
 
 **응답 `200`**
 
@@ -694,6 +751,26 @@ File:
 ```json
 { "ok": true }
 ```
+
+
+### `PATCH /api/v1/me/preferences`
+
+현재 로그인한 사용자의 개인 설정을 바꿉니다. 세션 쿠키로만 호출할 수 있으며 Viewer를 포함한 모든 역할이 쓸 수 있습니다.
+
+```
+Body (JSON):
+  flowCapture  boolean  필수
+```
+
+`flowCapture`가 `true`이면 사용자가 대시보드에서 한 탭, 스와이프, 입력을 릴레이가 세션 동안 메모리에 기억합니다. 입력 중인 텍스트 칸의 내용 전체도 읽어서 무엇을 입력했는지 기록합니다. 화면 키보드의 위치도 읽어서 키를 누른 탭을 앱을 누른 탭으로 착각하지 않게 합니다. iOS에서는 둘 다 테스트 중인 앱 안에서 읽습니다. 앱이 비밀번호 칸으로 표시한 칸은 값을 읽지 않습니다. 다만 그 칸에 친 키와 붙여 넣은 텍스트는 다른 입력처럼 세션 동안 메모리에 남습니다. Capture flow는 이를 Match와 Verify에서 기기에 다시 입력할 때만 쓰고 플로우 파일에는 이름만 남깁니다. 비밀번호 보기 버튼 등으로 평문으로 보이는 비밀번호는 일반 칸이라 값을 읽고 텍스트로 내보냅니다. 기록하는 동안에는 비밀번호를 가려 두거나 Edit에서 그 단계를 빼세요. 비밀번호가 아닌 칸 중 읽지 못한 입력은 US 키보드 기준으로 누른 키로 기록하므로 기기에 실제로 입력된 글자와 다를 수 있습니다. 이런 단계는 Capture flow에서 **fragile**로 표시됩니다. 기본값은 `true`입니다. `false`로 바꾸면 이미 기억한 내용도 바로 버립니다.
+
+**응답 `200`**
+
+```json
+{ "flowCapture": false }
+```
+
+값이 boolean이 아니면 `400`을 반환합니다.
 
 
 ## 설정 (Settings) {#settings}
@@ -1047,6 +1124,51 @@ Query:
 데이터는 1분마다 샘플링되며 30일간 보관됩니다.
 
 
+## 기기 설정 (Device settings) {#device-settings}
+
+QA 세션 기기 목록에 적용되는 설정입니다. 릴레이에 저장되고 Mac의 기기는 바뀌지 않습니다. 기기는 `agent`와 `deviceId`로 가리킵니다. `agent`는 기기 목록(`agents:listed`)의 `agentKey`이고, `deviceId`는 그 기기의 `id`(iOS는 UDID, Android는 `avd:<AVD 이름>`)입니다. [기기 목록 정리](/ko/testing/qa-session#organize-devices)를 참고하세요.
+
+### `PUT /api/v1/device-prefs`
+
+기기를 숨기거나 이름을 붙입니다. 팀원 모두의 목록에 적용됩니다. **Admin** 권한이 필요합니다. 다른 역할은 `403`을 받습니다.
+
+```
+Body (JSON):
+  agent        string          필수
+  deviceId     string          필수
+  hidden       boolean         선택  빼면 지금 값을 유지
+  displayName  string | null   선택  빼면 지금 값을 유지. 빈 문자열이나 null이면 원래 이름으로 (최대 100자)
+```
+
+**응답 `200`**
+
+```json
+{ "ok": true, "hidden": true, "displayName": "Release phone" }
+```
+
+숨김도 이름도 없는 상태가 되면 저장된 설정을 지웁니다. 기기 목록은 숨긴 기기도 빼지 않고 `hidden: true`로 알려 줍니다. 그래서 MCP 클라이언트와 자동 실행은 숨긴 기기를 계속 쓸 수 있습니다.
+
+### `PUT /api/v1/device-favourites`
+
+기기를 내 즐겨찾기에 넣습니다. 즐겨찾기는 사람마다 따로 저장됩니다. 세션 쿠키나 `view` scope의 PAT로 호출하며 역할은 상관없습니다. 이미 즐겨찾기인 기기에 다시 호출해도 `200`입니다.
+
+```
+Body (JSON):
+  agent     string  필수
+  deviceId  string  필수
+```
+
+**응답 `200`**
+
+```json
+{ "ok": true }
+```
+
+### `DELETE /api/v1/device-favourites`
+
+기기를 내 즐겨찾기에서 뺍니다. Body와 응답은 `PUT`과 같습니다.
+
+
 ## 세션 (Sessions)
 
 `sessionId`는 MCP 서버의 `list_devices` 결과에서 확인합니다. 두 엔드포인트 모두 세션 쿠키나 `view` scope의 PAT로 호출합니다.
@@ -1081,11 +1203,87 @@ Query:
       "frame": { "x": 0.1, "y": 0.8, "width": 0.8, "height": 0.06 },
       "enabled": true
     }
-  ]
+  ],
+  "interfaceTurn": 90
 }
 ```
 
-`frame`은 화면 크기에 대한 0–1 비율입니다. 오류 상태 코드는 스크린샷과 같으며 시간 초과는 15초입니다.
+`frame`은 화면 크기에 대한 0–1 비율이며 앱이 그려진 방향의 화면을 기준으로 합니다. 오류 상태 코드는 스크린샷과 같으며 시간 초과는 15초입니다.
+
+`interfaceTurn`은 기기의 세로 화면을 시계 방향으로 몇 도 돌려야 앱 화면이 똑바로 서는지 나타냅니다(`0`, `90`, `180`, `270`). 에이전트가 앱의 방향을 읽을 수 있을 때만 들어 있으며 현재는 iOS만 보냅니다. 값이 없으면 방향 정보가 없다는 뜻입니다.
+
+입력 칸(`role: "input"`)에는 `secure`가 함께 옵니다. 비밀번호처럼 입력한 글자를 가리는 칸이면 `true`, 아니면 `false`입니다. 입력 칸이 아니어도 글자를 가린다고 알려 온 요소에는 `secure: true`가 붙습니다. 입력 칸인데 `secure`가 없으면 에이전트가 판단하지 못했다는 뜻이므로 비밀번호 칸으로 다루세요. 지금 입력을 받는 칸에는 `focused: true`가 붙습니다.
+
+켜진 스위치나 체크박스에는 `checked: true`가, 선택된 탭·세그먼트·행에는 `selected: true`가 붙습니다. 그렇지 않으면 둘 다 없고 이 값을 읽지 않는 에이전트도 보내지 않습니다.
+
+### `POST /api/v1/sessions/:sessionId/reach`
+
+`ui-tree`에서 읽은 요소마다 그 요소를 누르려는 터치가 어디에 닿는지 묻습니다. 플로우는 요소의 중심 대신 여기서 받은 지점을 누릅니다. 중심은 탭 바나 떠 있는 버튼, 반투명 막에 덮일 수 있기 때문입니다.
+
+**요청**
+
+```json
+{ "targets": [{ "role": "cell", "label": "Row 13", "frame": { "x": 0, "y": 0.86, "width": 1, "height": 0.06 } }] }
+```
+
+각 대상은 `ui-tree`가 돌려준 요소 그대로입니다. `role`, `label`, `frame`과 있으면 `identifier`를 넣습니다. 대상은 64개, 본문은 64KB까지입니다.
+
+**응답 `200`**
+
+```json
+{ "results": [{ "state": "reachable", "point": [0.1, 0.9], "atCentre": false, "frame": { "x": 0, "y": 0.86, "width": 1, "height": 0.03 } }] }
+```
+
+대상마다 결과가 하나씩 같은 순서로 옵니다.
+
+| `state` | 의미 |
+|---|---|
+| `reachable` | `point`를 누르면 그 요소에 닿습니다. `point`는 터치를 보내는 공간 기준 0–1입니다. iOS는 앱이 돌아간 화면이 아니라 기기의 세로 화면이고 Android는 `ui-tree`의 frame처럼 Android가 그리는 화면입니다. `atCentre`는 그 지점이 요소의 중심인지 알려 줍니다. |
+| `occluded` | 터치를 받는 다른 요소가 전부 덮고 있습니다. 알 수 있으면 `by`에 그 요소를 적습니다. |
+| `offscreen` | 요소가 화면 밖에 있습니다. |
+| `missing` | 읽은 자리에 그 요소가 없습니다. `candidates`는 근처 요소 수입니다. 트리를 다시 읽으세요. |
+| `unknown` | 기기가 판정하지 못합니다. `reason`에 이유가 있습니다. 이 엔드포인트 이전의 에이전트는 모든 대상에 이렇게 답합니다. |
+
+본문이 잘못되면 `400`, 64KB를 넘으면 `413`, 세션이 없으면 `404`, 기기가 꺼져 있으면 `409`, 에이전트가 오프라인이면 `502`, 15초에 대상마다 0.3초를 더한 시간이 지나면 `504`를 반환합니다.
+
+
+## Flow Capture
+
+대시보드가 테스트한 내용을 플로우로 저장할 때 쓰는 엔드포인트입니다. 대시보드용이라 릴리스 사이에 바뀔 수 있습니다. 세션 쿠키로만 호출할 수 있고 PAT는 `401`을 받습니다. 기억한 단계에는 입력한 글자가 들어 있어서 그 단계의 주인인 사용자에게만 응답합니다. 다른 사용자에게는 `404`를 반환합니다.
+
+### `POST /api/v1/sessions/:sessionId/capture/snapshot`
+
+지금까지 기억한 단계를 고정한 사본을 만들어 반환합니다. 다시 호출하면 사본을 새로 만듭니다. 기억한 단계가 없으면 `404`를 반환합니다.
+
+### `GET /api/v1/sessions/:sessionId/capture/snapshot`
+
+마지막으로 만든 사본을 반환합니다. 사본이 없으면 `404`를 반환합니다.
+
+### `DELETE /api/v1/sessions/:sessionId/capture/snapshot`
+
+사본을 버립니다. 사본이 없으면 `404`를 반환합니다.
+
+### `PUT /api/v1/sessions/:sessionId/capture/thumbnails/:requestId`
+
+입력이 시작될 때의 화면 그림을 남깁니다. 이미 기억된 입력에만 16KB 이하 JPEG를 한 번 보낼 수 있습니다. 대시보드가 입력을 보낸 뒤 보냅니다. 남기면 `201`, 남기지 않으면 `200`과 `{ "kept": false, "reason": … }`(`exists`, 키보드 읽기로 화면 키보드 밖임이 확인되지 않은 터치나 연속 입력 중간의 키면 `keyboard`, 글자를 친 뒤 2초 안에 시작했고 그 칸이 보안 칸이 아니라고 확인되지 않은 입력이면 `typed`, `full`)를 돌려줍니다. 이 세션에 내 기록이 없으면 `404`, 그 `requestId`의 입력이 아직 기억되지 않았거나 기다리는 키보드 읽기나 칸 읽기가 돌아오기 전이면 `409`(잠시 뒤 다시 보내면 됩니다), 본문이 더 크면 `413`, JPEG가 아니면 `415`를 돌려줍니다.
+
+### `GET /api/v1/sessions/:sessionId/capture/snapshot/thumbnails/:requestId`
+
+복사본에 든 단계의 그림을 `image/jpeg`로 돌려줍니다. 그림이 있는 단계는 복사본의 `thumbnails`에 나옵니다. 없으면 `404`를 돌려줍니다.
+
+### `PUT /api/v1/sessions/:sessionId/capture/pause`
+
+기억을 잠시 멈춥니다. 대시보드가 기억한 단계를 기기에서 재생하는 동안 그 입력이 사람의 입력으로 기억되지 않게 하려고 씁니다. 멈춤은 응답의 `ttlMs`(30초)가 지나면 저절로 풀리며 다시 호출하면 연장됩니다. 기억한 단계가 없으면 `404`를 반환합니다. 재생 중에 이 응답을 받으면 기억이 이미 끝난 것이므로 재생을 멈춰야 합니다.
+
+**응답 `200`**
+
+```json
+{ "ok": true, "ttlMs": 30000 }
+```
+
+### `DELETE /api/v1/sessions/:sessionId/capture/pause`
+
+멈춤을 바로 풉니다. 멈춰 있지 않으면 `404`를 반환합니다.
 
 
 ## 릴레이 (Relay)
@@ -1098,14 +1296,18 @@ Query:
 
 ```json
 {
-  "lanHost": "192.168.0.10",
+  "lanHost": null,
   "port": 4000,
-  "publicBaseUrl": "https://tap.example.com",
-  "agentRelayUrl": "wss://tap.example.com"
+  "publicBaseUrl": null,
+  "agentRelayUrl": null,
+  "publicUrlWarning": "container-without-public-url",
+  "agentUrlWarning": "container-without-relay-url"
 }
 ```
 
 값을 정할 수 없는 항목은 `null`입니다. 컨테이너 안에서 실행하면 `lanHost`는 항상 `null`입니다.
+
+`publicUrlWarning`은 릴레이가 컨테이너 안에서 실행되는데 팀원 링크에 쓸 공개 URL이 없을 때만 들어갑니다. `agentUrlWarning`은 컨테이너 안에서 실행되는데 에이전트용 `TAPFLOW_RELAY_URL`이 없을 때만 들어갑니다. 조건에 맞지 않는 필드는 응답에 들어가지 않습니다.
 
 
 ## 로그 (Logs)

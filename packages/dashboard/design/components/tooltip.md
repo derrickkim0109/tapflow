@@ -42,7 +42,7 @@ every side and only its position and the direction of its slide change.
 
 | Side | Call sites | Where |
 |-------|-----------:|-------|
-| `top` | 5 | The default. Full reset switch and an overloaded Mac (QA session), the build row's deletion button, the gap and step marks on the run video's timeline |
+| `top` | 6 | The default. Full reset switch and an overloaded Mac (QA session), the build row's **Edited** badge, the gap and step marks on the run video's timeline, a bundle ID row that cannot move in arrange mode (Settings → Apps), shown on the row itself, which has no handle |
 | `left` | 12 | Every device toolbar button (the toolbar sits to the right of the device) |
 | `right` | 1 | `SidebarMenuButton`'s `tooltip`, which shows only while the sidebar is collapsed to icons, and never on a phone. AppSidebar passes it on all three nav groups |
 | `bottom` | 0 | Not used |
@@ -55,7 +55,7 @@ Radix flips a tooltip to the opposite side when there is no room.
 
 | Value | Looks like | Call sites | Where |
 |-------|------------|-----------:|-------|
-| `text` | One line of 11px text | 12 | Names (`Launch app`, `Schedule deletion`), names with a state (`Unfold: … — changing`, `Restarting the device`), a reason (`This Mac is currently overloaded. Try again later.`), times on the video timeline |
+| `text` | One line of 11px text | 13 | Names (`Launch app`), the build file's values on an **Edited** badge (`From the build file: 1.0 (12)`), names with a state (`Unfold: … — changing`, `Restarting the device`), a reason (`This Mac is currently overloaded. Try again later.`, why a bundle ID row cannot move in arrange mode), times on the video timeline |
 | `shortcut` | The label, then 12px, then the keys as `Kbd` chips 4px apart | 6 | Toolbar: Deeplink ⌘K, Rotate ⌘⇧O, Screenshot ⌘S, Start / Stop recording ⌘⇧Y; iOS: Home ⌘⇧U, Software keyboard ⌘⇧K |
 
 Call-site counts are a snapshot (2026-10-18): each row is a `TooltipContent` written in code, and the toolbar's
@@ -101,6 +101,5 @@ tooltip with no delay. Moving the pointer onto the tooltip keeps it open.
 
 ## Figma
 
-A single component **Tooltip** (`83:432`) in the `Design System` page, with no variants, and deliberately no
-`side` axis (see Placement). The `shortcut` content and the inverted `Kbd` are not in it; adding `content` is one of
-the items for the Figma sync.
+A single component **Tooltip** (`1:2418`) on the `Overlays` page of tapflow-design-system, with no variants, and
+deliberately no `side` axis (see Placement). The `shortcut` content and the inverted `Kbd` are not in it yet.

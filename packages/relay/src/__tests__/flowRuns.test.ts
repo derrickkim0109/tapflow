@@ -77,7 +77,7 @@ describe('flow run records', () => {
     shotsDir = path.join(uploadsDir, '../run-screenshots')
     const db = getDb()
     db.exec('DELETE FROM flow_runs; DELETE FROM recordings; DELETE FROM builds; DELETE FROM apps')
-    db.prepare(`INSERT INTO apps (id, name, bundle_id_key, platform) VALUES (1, 'Coffee', 'com.example.coffee', 'ios')`).run()
+    db.prepare(`INSERT INTO apps (id, name, platform) VALUES (1, 'Coffee', 'ios')`).run()
     const file = path.join(uploadsDir, 'builds', 'coffee.zip')
     fs.writeFileSync(file, 'zip')
     buildId = Number(db.prepare(`
@@ -372,6 +372,23 @@ describe('flow run records', () => {
     const id = await create()
     await call('POST', `/api/v1/runs/${id}/flows/0`, bearer(PAT_CI), { status: 'skipped', skipReason: 'tag-filter', durationMs: 0, steps: [] })
     expect((await call('POST', `/api/v1/runs/${id}/flows/0/screenshot`, bearer(PAT_CI), PNG)).status).toBe(409)
+  })
+
+  // #1125: whether a touch was checked to land on its element is kept with the step, a note only for one that was not.
+  it('keeps a step\'s reach and effect, the note only when unchecked, and drops a value it does not know', async () => {
+    const id = await create()
+    const steps = [
+      { index: 0, name: 'tapOn("Row 13")', status: 'passed', durationMs: 5, reach: 'unchecked', reachNote: 'old agent' },
+      { index: 1, name: 'tapOn("Save")', status: 'passed', durationMs: 5, reach: 'verified', reachNote: 'ignored' },
+      { index: 2, name: 'tapOn("Done")', status: 'passed', durationMs: 5, reach: 'guessed', effect: 'maybe' },
+      { index: 3, name: 'tapOn("Pay")', status: 'passed', durationMs: 5, reach: 'verified', effect: 'confirmed' },
+    ]
+    expect((await call('POST', `/api/v1/runs/${id}/flows/0`, bearer(PAT_CI), { status: 'passed', durationMs: 20, steps })).status).toBe(200)
+    const r = await call('GET', `/api/v1/runs/${id}`, bearer(PAT_VIEW))
+    const stored = r.body.flows[0].steps as Record<string, unknown>[]
+    expect(stored.map((s) => [s.reach, s.reachNote, s.effect])).toEqual([
+      ['unchecked', 'old agent', undefined], ['verified', undefined, undefined], [undefined, undefined, undefined], ['verified', undefined, 'confirmed'],
+    ])
   })
 
   // B2: a failed tapOn's suggestions are stored whole or not at all — a cut line is a different selector.

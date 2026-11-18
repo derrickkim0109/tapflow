@@ -9,6 +9,9 @@ import { useBreadcrumb } from '@/hooks/useBreadcrumb';
 import { useBuildLoader } from '@/hooks/useBuildLoader';
 import { useAgentSession } from '@/hooks/useAgentSession';
 import { useDeviceSelector } from '@/hooks/useDeviceSelector';
+import { useAuth } from '@/hooks/useAuth';
+import { DeviceCardActions } from '@/components/device/DeviceCardActions';
+import { shownName } from '@/lib/deviceGroups';
 import { DeviceViewer } from '@/components/DeviceViewer';
 import { SessionPanel } from '@/components/SessionPanel';
 import {
@@ -117,16 +120,18 @@ function QASessionPage() {
   } = useAgentSession(os, (listed) => onListedRef.current(listed));
 
   const selectedSession = agentGroups.find((s) => s.agentName === selectedAgent);
+  const me = useAuth().user;
+  const isAdmin = me?.role === 'Admin';
   const {
     osVersions, osVersion, setOsVersion,
-    deviceSearch, setDeviceSearch, versionedDevices,
+    deviceSearch, setDeviceSearch, versionedDevices, deviceGroups, hiddenCount, showHidden, setShowHidden,
     resetMode, setResetMode, appliedResetMode, consumeResetMode, fullResetSupported,
-  } = useDeviceSelector(selectedSession, os);
+  } = useDeviceSelector(selectedSession, os, isAdmin);
 
   const allDevices = sessions.flatMap((s) => s.devices);
   const selectedDevice = allDevices.find((d) => d.id === deviceId);
   const deviceLabel = selectedDevice
-    ? `${selectedDevice.name}${selectedDevice.osVersion ? ` · ${selectedDevice.osVersion}` : ''}`
+    ? `${shownName(selectedDevice)}${selectedDevice.osVersion ? ` · ${selectedDevice.osVersion}` : ''}`
     : '';
 
   // The list under the viewer reads the recordings query; an upload makes it stale.
@@ -356,6 +361,7 @@ function QASessionPage() {
                 resetMode={resumed ? 'app-only' : appliedResetMode}
                 onRecordingUploaded={handleRecordingUploaded}
                 onSessionEnded={onSessionEnded}
+                capturingSteps={me?.flowCapture}
               />
             </div>
           ) : selectedAgent ? (
@@ -390,6 +396,15 @@ function QASessionPage() {
                       ))}
                     </SelectContent>
                   </Select>
+                )}
+                {/* Only an Admin can hide a device, so only an Admin is offered them back (#1085). */}
+                {isAdmin && hiddenCount > 0 && (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Switch id="show-hidden" checked={showHidden} onCheckedChange={setShowHidden} />
+                    <Label htmlFor="show-hidden" className="text-sm cursor-pointer whitespace-nowrap">
+                      Show hidden ({hiddenCount})
+                    </Label>
+                  </div>
                 )}
                 {/* Absent rather than disabled where nothing acts on it (#447). A disabled control
                     owes the user a reason, and the only channel here is the tooltip — which does
@@ -435,8 +450,17 @@ function QASessionPage() {
                   {connected ? 'No devices available for this OS.' : 'Connecting to relay…'}
                 </p>
               ) : (
+                // One grid for every group, headings included, so a card starred into Favourites moves within the
+                // same parent rather than remounting, and keeps the focus its star had (#1085).
                 <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-2">
-                  {versionedDevices.map((d: DeviceSummary) => {
+                  {deviceGroups.flatMap((group, groupIndex) => [
+                    ...(group.title ? [
+                      <h2 key={`heading:${group.key}`}
+                        className={cn('col-span-full text-sm font-medium text-muted-foreground', groupIndex > 0 && 'mt-3')}>
+                        {group.title}
+                      </h2>,
+                    ] : []),
+                    ...group.devices.map((d: DeviceSummary) => {
                     const isBooted = d.status === 'booted'
                     const isBusy = d.busy
                     // On a Mac short of memory the relay lets a person rejoin only a device it brought up itself; the
@@ -462,7 +486,6 @@ function QASessionPage() {
                     const cardDisabled = isBusy || needsMemory || booting || !connected
                     const card = (
                       <button
-                        key={d.id}
                         disabled={cardDisabled}
                         onClick={(e) => {
                           if (yours && d.resumable) {
@@ -474,17 +497,30 @@ function QASessionPage() {
                           } else handleStartDevice(d);
                         }}
                         className={cn(
-                          'flex flex-col gap-3 rounded-lg border p-3 text-left transition-colors min-h-[100px]',
+                          // 105px: the height a card reaches with the Hidden badge on its status line, so a hidden card does not
+                          // stretch its row (#1085).
+                          'flex h-full w-full flex-col gap-3 rounded-lg border p-3 pr-20 text-left transition-colors min-h-[105px]',
                           'hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50',
+                          d.hidden && 'border-dashed',
                         )}
                       >
-                        <span className="text-sm font-medium leading-tight">{d.name}</span>
+                        <span className="flex flex-col gap-0.5">
+                          <span className="text-sm font-medium leading-tight">{shownName(d)}</span>
+                          {/* The device's own name, which is what automation and the logs call it. */}
+                          {d.displayName && <span className="text-xs text-muted-foreground">{d.name}</span>}
+                        </span>
                         {d.osVersion && (
                           <span className="font-mono text-xs text-muted-foreground">{d.osVersion}</span>
                         )}
-                        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                          <span className={cn('inline-block h-1.5 w-1.5 rounded-full', statusDot)} />
-                          {statusLabel}
+                        {/* Hidden is a state of the device, so it sits on the status line rather than on a line of its own.
+                            The line is always the badge's height (15px text, 2px padding and 1px border each side), so the
+                            status does not shift between a hidden card and the one beside it. */}
+                        <span className="flex min-h-[21px] items-center gap-3">
+                          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                            <span className={cn('inline-block h-1.5 w-1.5 rounded-full', statusDot)} />
+                            {statusLabel}
+                          </span>
+                          {d.hidden && <Badge variant="outline" className="text-[10px] leading-[15px]">Hidden</Badge>}
                         </span>
                         {/* A run's `--service-tier slim` survives until the device restarts; say so before it is picked. */}
                         {isBooted && typeof d.serviceTier === 'object' && d.serviceTier.name === 'slim' && (
@@ -494,16 +530,22 @@ function QASessionPage() {
                     )
                     // The card names the person; who exactly, by email, is on hover and focus. A disabled button gets
                     // neither, and its label then says who is driving it rather than whom it waits for.
-                    if (!othersWait || cardDisabled) return card
                     return (
-                      <TooltipProvider key={d.id}>
-                        <Tooltip>
-                          <TooltipTrigger asChild>{card}</TooltipTrigger>
-                          <TooltipContent>{othersWait.user}</TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
+                      <div key={d.id} className="relative">
+                        {!othersWait || cardDisabled ? card : (
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>{card}</TooltipTrigger>
+                              <TooltipContent>{othersWait.user}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        )}
+                        <DeviceCardActions device={d} agentKey={selectedSession?.agentKey} isAdmin={isAdmin}
+                          refresh={() => send({ type: 'agents:list' })} hidingLeaves={!showHidden} onLeaving={focusList} />
+                      </div>
                     )
-                  })}
+                  }),
+                  ])}
                 </div>
               )}
 

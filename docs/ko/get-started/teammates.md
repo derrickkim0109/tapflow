@@ -42,7 +42,7 @@ description: 팀에서 tapflow 초대 링크를 받은 팀원을 위한 안내�
 ## 3. 빌드 테스트 {#test-a-build}
 
 1. App Center 왼쪽 **Apps** 목록에서 테스트할 앱을 고릅니다. 처음 열면 목록의 첫 번째 앱이 선택되어 있으니 앱이 여러 개라면 먼저 확인하세요.
-2. 테스트할 빌드를 찾습니다. **Search version…** 검색창과 상태 필터로 목록을 좁힐 수 있습니다.
+2. 테스트할 빌드를 찾습니다. **Search version or label…** 검색창과 상태 필터로 목록을 좁힐 수 있습니다.
 3. 빌드 행의 **Start QA**를 누릅니다. 리뷰 상태가 **Done**인 빌드는 이 버튼이 꺼져 있습니다.
 4. **Select Mac** 화면에서 Mac을 고르고 **Select device** 화면에서 기기를 클릭합니다. 다른 팀원이 쓰고 있는 기기는 **In use**로 표시되어 고를 수 없습니다.
 5. 기기가 켜지고 빌드 설치가 끝나면 툴바의 **Launch app**을 눌러 앱을 실행합니다.
@@ -72,6 +72,7 @@ Viewer가 **Upload build**나 **Add App**을 누르면 QA나 Developer 권한이
 사이드바 아래쪽의 내 이름을 누르고 **Settings**를 고르면 설정 화면이 열립니다.
 
 - **Profile**: **Nickname**과 **Avatar**를 바꾸고 **Save changes**를 누릅니다.
+- **Flow Capture**: **Capture my steps**를 켜거나 끕니다. 켜 두면 QA 세션에서 한 동작을 [플로우로 저장](/ko/testing/flow-capture)할 수 있습니다. 바꾸면 바로 적용됩니다.
 - **Password**: **Current password**, **New password**, **Confirm new password**를 입력해 비밀번호를 바꿉니다.
 
 비밀번호를 잊었다면 Admin에게 요청하세요. Admin이 **Settings → Team**에서 **Reset pwd**를 누르면 재설정 링크가 표시되고 Admin이 그 링크를 전달해 줍니다. tapflow가 메일을 보낼 수 있으면(SMTP 설정) 링크가 메일로도 갑니다. 링크는 2시간 동안 한 번만 쓸 수 있습니다. 재설정하면 모든 브라우저에서 로그아웃되니 새 비밀번호로 다시 로그인하세요. 로그아웃은 같은 메뉴의 **Log out**으로 합니다.

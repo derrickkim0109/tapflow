@@ -16,7 +16,7 @@ Only the endpoints below accept a personal access token (PAT), and they accept t
 | PAT scope | Endpoints |
 |-----------|-----------|
 | `builds:write` | `POST /builds`, `GET /builds`, `GET /builds/:id`, `POST /comments`, every webhook endpoint, writing run records (`POST` under `/runs`) |
-| `view` | `GET /apps`, `GET` under `/runs`, `GET /sessions/:sessionId/screenshot`, `GET /sessions/:sessionId/ui-tree`, files under `/uploads/` (at the relay root, not under `/api/v1/`), device-session WebSockets opened from a remote machine |
+| `view` | `GET /apps`, `GET` under `/runs`, `GET /sessions/:sessionId/screenshot`, `GET /sessions/:sessionId/ui-tree`, `POST /sessions/:sessionId/reach`, files under `/uploads/` (at the relay root, not under `/api/v1/`), device-session WebSockets opened from a remote machine |
 | `agent` | A remote agent's WebSocket connection, accepted only while the member who issued the token is an Admin |
 
 **Roles.** A call made with a PAT is held to its owner's current role. Viewer is read-only: uploading, updating or scheduling deletion of a build, creating, renaming or deleting an app, every webhook endpoint and writing run records return `403` for a Viewer. Reading builds and posting comments work for a Viewer too. The endpoints that check roles read the role on every request, so a role change applies there without signing in again or issuing a new token.
@@ -117,11 +117,12 @@ Return the currently signed-in user's info.
   "email": "admin@example.com",
   "displayName": "Admin",
   "avatarUrl": "/uploads/avatars/user-1.png",
-  "role": "Admin"
+  "role": "Admin",
+  "flowCapture": true
 }
 ```
 
-`avatarUrl` is `null` when there is no profile image.
+`avatarUrl` is `null` when there is no profile image. `flowCapture` says whether the relay remembers this user's QA steps ([`PATCH /api/v1/me/preferences`](#patch-api-v1-me-preferences)).
 
 
 ### `POST /api/v1/auth/change-password`
@@ -252,7 +253,9 @@ Return all apps. Each app includes a summary of its latest build.
       "id": 7,
       "name": "My App",
       "bundle_id_key": "com.example.app",
-      "platform": "ios",
+      "bundle_ids": { "ios": "com.example.app", "android": "com.example.android" },
+      "build_platforms": ["android", "ios"],
+      "platform": "both",
       "created_at": "2025-05-01T00:00:00.000Z",
       "latest_build_id": 42,
       "version_name": "1.2.3",
@@ -264,10 +267,12 @@ Return all apps. Each app includes a summary of its latest build.
 }
 ```
 
+`bundle_ids` is the app's bundle ID per platform, `null` where it has none. `bundle_id_key` stays for older clients; when the two IDs differ, it holds the iOS one. `build_platforms` lists the platforms the app has builds on.
+
 
 ### `POST /api/v1/apps`
 
-Create an app manually. Requires the **Admin, Developer or QA** role. A Viewer gets `403`. If an app with the same `bundle_id_key` already exists, on any platform, you get `409`. Create an app for iOS and Android once, with `both`.
+Create an app manually. Requires the **Admin, Developer or QA** role. A Viewer gets `403`. If an app with the same `bundle_id_key` already exists, on any platform, you get `409`. Create an app that uses the same bundle ID on iOS and Android once, with `both`. If the IDs differ, create it for one platform and upload the other platform's build with `app_id`; that build's bundle ID is added to the app. `__unknown__` is reserved and gets `400`.
 
 ```
 Body (JSON):
@@ -310,6 +315,45 @@ Delete an app and all its builds, with their comments, recordings, run records a
 ```
 
 
+### `POST /api/v1/apps/:id/merge`
+
+Move one platform of another app into this one. That platform's bundle ID and builds move together, and the builds' comments, recordings and run records go with them. If the other app has nothing left, it is deleted. The app keeps this app's name. To undo it, split the platform out again with [`POST /api/v1/apps/:id/split`](#post-api-v1-apps-id-split); the deleted app's name does not come back. Requires the **Admin, Developer or QA** role.
+
+```
+Body (JSON):
+  fromAppId  number        required  the app to move from
+  platform   ios|android   required  the platform to move
+```
+
+**Response `200`**
+
+```json
+{ "ok": true, "appId": 7, "removedAppId": 9 }
+```
+
+`removedAppId` is there only when the other app was deleted. You get `409` if the platform you move has a bundle ID and this app already has one there, or if the other app has builds carrying the bundle ID of its other platform, or uses one ID on both, so one platform cannot be moved on its own. You get `404` if either app is missing. You get `400` for an app merged into itself, a platform the other app has nothing on, or when either app is the one that collects builds whose bundle ID could not be read (`__unknown__`).
+
+### `POST /api/v1/apps/:id/split`
+
+Move one platform of this app into a new app: the other way round from a merge. That platform's bundle ID and builds move together, and the builds' comments, recordings and run records go with them. The new app is listed first. Requires the **Admin, Developer or QA** role.
+
+```
+Body (JSON):
+  platform   ios|android   required  the platform to move
+  name       string        required  the new app's name
+```
+
+**Response `200`**
+
+```json
+{ "ok": true, "appId": 12 }
+```
+
+`appId` is the new app. This app must keep its other platform, so an app with only one gets `400`. You get `409` if this app uses one bundle ID on both platforms, or has builds carrying the bundle ID of its other platform. You get `404` if the app is missing, and `400` for an empty name, a platform this app has nothing on, or the app that collects builds whose bundle ID could not be read (`__unknown__`).
+
+Uploads that name this app's `app_id` and carry the moved bundle ID go to the new app. Builds whose bundle ID could not be read follow `app_id`, so if the platform you moved had no bundle ID, point CI at the new app's `app_id`.
+
+
 ## Builds
 
 ### `POST /api/v1/builds`
@@ -327,13 +371,17 @@ Only `file` is required; every other field is optional.
 |-------|----------|-------------|
 | `file` | Yes | The build artifact. iOS: `.app.zip` or `.tar.gz` / `.tgz` (a simulator build); Android: `.apk`. Max 500 MB by default (`TAPFLOW_MAX_BUILD_BYTES` changes it). `.ipa` and `.aab` are rejected. |
 | `status` | No | Initial review status — one of `Backlog`, `In Progress`, `Done`, `Rejected`. Omit to leave it unset. |
-| `label` | No | Free-text label to identify the build in App Center (e.g. a branch name or `rc-1`). |
-| `platform` | No | `ios` or `android`. Derived from the file type when omitted. |
-| `app_id` | No | Attach to an existing app explicitly. Normally the app is resolved automatically from the bundle ID. |
+| `label` | No | Free-text label to identify the build in App Center (e.g. a branch name or `rc-1`). Returned as `version_label`. Not used as the app's name when the build file has none (the file name is). |
+| `version_name` | No | A version to use instead of the build file's. It is used to show and group the build; the file is not changed. Empty uses the file's value. |
+| `build_number` | No | A build number to use instead of the build file's, as for `version_name`. |
+| `platform` | No | Ignored. The platform comes from the file type. |
+| `app_id` | No | Attach to an existing app. If that app has no bundle ID on the build's platform and no other app holds the build's ID, the ID is added to the app. Otherwise the build goes to the app for its bundle ID. An upload naming an app a merge removed is routed by its bundle ID instead. When omitted, the bundle ID decides the app. |
 
 ::: warning iOS builds
 `.ipa` files are not supported. Upload `.app.zip`, or the `.tar.gz` / `.tgz` a cloud simulator build produces. Build `.app.zip` with `xcodebuild -sdk iphonesimulator` and zip the `.app` folder.
 :::
+
+`label`, `version_name` and `build_number` are trimmed. A `label` longer than 100 characters is cut to 100; a longer `version_name` or `build_number` gets `400`.
 
 **Response `201`**
 
@@ -344,12 +392,16 @@ Only `file` is required; every other field is optional.
   "name": "My App",
   "version_name": "1.2.3",
   "build_number": "89",
+  "binary": { "version_name": "1.2.3", "build_number": "89" },
+  "version_label": "rc-1",
   "bundle_id": "com.example.app",
   "status_label": "In Progress",
   "platform": "ios",
   "uploaded_at": "2025-05-15T12:00:00.000Z"
 }
 ```
+
+`version_name` and `build_number` are the values in use, which are the overrides when there are any. `binary` holds what was read from the build file; where the two differ, the build was overridden. The list and single-build responses are the same.
 
 
 ### `GET /api/v1/builds`
@@ -360,7 +412,7 @@ Return a paginated list of builds.
 Query:
   page      number                                   page number (default: 0)
   limit     number                                   page size (default: 20, max: 100)
-  q         string                                   search by version name
+  q         string                                   search by version name or label (version_label)
   platform  ios|android                              platform filter
   status    Backlog|In Progress|Done|Rejected        status filter
   app_id    number                                   filter by app
@@ -391,6 +443,7 @@ Return a single build.
   "name": "My App",
   "version_name": "1.2.3",
   "build_number": "89",
+  "binary": { "version_name": "1.2.3", "build_number": "89" },
   "version_label": "rc-1",
   "status_label": "In Progress",
   "platform": "ios",
@@ -406,13 +459,17 @@ Return a single build.
 
 ### `PATCH /api/v1/builds/:id`
 
-Update the status or label of a build. A Viewer gets `403`.
+Update the status, label, version or build number of a build. A Viewer gets `403`.
 
 ```
 Body (JSON):
   status_label  Backlog|In Progress|Done|Rejected|null  optional
   version_label string|null                              optional
+  version_name  string|null                              optional  empty or null goes back to the build file's
+  build_number  string|null                              optional  empty or null goes back to the build file's
 ```
+
+Text fields are trimmed and at most 100 characters; a longer one, or one that is not text, gets `400`. An empty `version_label` removes the label. A version or build number equal to the build file's is stored as not overridden.
 
 **Response `200`**
 
@@ -694,6 +751,26 @@ File:
 ```json
 { "ok": true }
 ```
+
+
+### `PATCH /api/v1/me/preferences`
+
+Change the signed-in user's own settings. Call it with the session cookie only; every role can, Viewer included.
+
+```
+Body (JSON):
+  flowCapture  boolean  required
+```
+
+When `flowCapture` is `true`, the relay remembers the taps, swipes and typing this user does in the dashboard, in memory, for the length of the session. It also reads the text field being typed into, its whole contents, so the steps say what was typed, and where the on-screen keyboard is, so a tap on a key is not taken for a tap on the app. On iOS both are read from inside the app under test. A field the app marks as a password is never read. The keys typed and the text pasted into it are kept in memory for the session like any other input. Capture flow uses them only to type into the device again in Match and Verify, and writes just the secret's name to the file. A password shown as plain text, as after tapping a show-password button, is an ordinary field: its value is read and exported as text. Keep it hidden while you record, or remove the step in Edit. Typing into any other field it could not read is recorded as the keys pressed on a US keyboard, which may differ from what the device typed, and Capture flow marks the step **fragile**. It is `true` by default. Setting it to `false` also discards what was already remembered.
+
+**Response `200`**
+
+```json
+{ "flowCapture": false }
+```
+
+Returns `400` when the value is not a boolean.
 
 
 ## Settings {#settings}
@@ -1045,6 +1122,51 @@ Query:
 Data is sampled once per minute and retained for 30 days.
 
 
+## Device settings {#device-settings}
+
+Settings for the QA session device list. They are stored on the relay; the devices on the Mac don't change. A device is named by `agent` and `deviceId`: `agent` is the `agentKey` from the device list (`agents:listed`), and `deviceId` is the device's `id` (the UDID on iOS, `avd:<AVD name>` on Android). See [Organize the device list](/testing/qa-session#organize-devices).
+
+### `PUT /api/v1/device-prefs`
+
+Hides a device or gives it a name, for every teammate's list. Requires the **Admin** role; other roles get `403`.
+
+```
+Body (JSON):
+  agent        string          required
+  deviceId     string          required
+  hidden       boolean         optional  keeps the current value when left out
+  displayName  string | null   optional  keeps the current value when left out. An empty string or null goes back to the device's own name (at most 100 characters)
+```
+
+**Response `200`**
+
+```json
+{ "ok": true, "hidden": true, "displayName": "Release phone" }
+```
+
+When a device ends up neither hidden nor renamed, its stored settings are deleted. The device list doesn't leave hidden devices out; it marks them `hidden: true`, so MCP clients and automated runs can keep using them.
+
+### `PUT /api/v1/device-favourites`
+
+Adds a device to your favourites. Each person has their own. Call it with a session cookie or a PAT with the `view` scope; any role can. Calling it again for a device that is already a favourite returns `200`.
+
+```
+Body (JSON):
+  agent     string  required
+  deviceId  string  required
+```
+
+**Response `200`**
+
+```json
+{ "ok": true }
+```
+
+### `DELETE /api/v1/device-favourites`
+
+Removes a device from your favourites. The body and the response are the same as for `PUT`.
+
+
 ## Sessions
 
 Find a `sessionId` in the MCP server's `list_devices` result. Both endpoints take the session cookie or a PAT with the `view` scope.
@@ -1079,11 +1201,87 @@ Return the UI elements on the session device's current screen.
       "frame": { "x": 0.1, "y": 0.8, "width": 0.8, "height": 0.06 },
       "enabled": true
     }
-  ]
+  ],
+  "interfaceTurn": 90
 }
 ```
 
-`frame` is a 0–1 fraction of the screen size. The error status codes match the screenshot endpoint, with a 15-second timeout.
+`frame` is a 0–1 fraction of the screen size, measured on the screen as the app draws it. The error status codes match the screenshot endpoint, with a 15-second timeout.
+
+`interfaceTurn` is how many degrees clockwise the device's portrait screen has to turn for the app's interface to stand upright: `0`, `90`, `180` or `270`. It is present only when the agent can read the app's orientation, which today is iOS only. When it is absent, there is no information about the turn.
+
+Text fields (`role: "input"`) carry `secure`: `true` for a field that hides what is typed, such as a password, and `false` otherwise. Any other element that reports hiding its text has `secure: true` too. A text field without `secure` means the agent could not tell, so treat it as a password field. The field that is taking typing now has `focused: true`.
+
+A switch or checkbox that is on has `checked: true`, and a selected tab, segment or row has `selected: true`. Both are absent otherwise, and from an agent that does not read them.
+
+### `POST /api/v1/sessions/:sessionId/reach`
+
+Ask where a touch meant for each element lands, for elements read from `ui-tree`. Flows tap the point it returns instead of the element's center, which a tab bar, a floating button or a scrim can cover.
+
+**Request**
+
+```json
+{ "targets": [{ "role": "cell", "label": "Row 13", "frame": { "x": 0, "y": 0.86, "width": 1, "height": 0.06 } }] }
+```
+
+Each target is an element as `ui-tree` returned it: `role`, `label`, `frame`, and `identifier` when it has one. At most 64 targets and 64 KB.
+
+**Response `200`**
+
+```json
+{ "results": [{ "state": "reachable", "point": [0.1, 0.9], "atCentre": false, "frame": { "x": 0, "y": 0.86, "width": 1, "height": 0.03 } }] }
+```
+
+One result per target, in order:
+
+| `state` | Meaning |
+|---|---|
+| `reachable` | A touch at `point` reaches the element. `point` is 0–1 in the space a touch is sent in: on iOS the device's portrait screen, not the app's turned one, and on Android the screen as Android draws it, as `ui-tree` frames are. `atCentre` says whether that is the element's center. |
+| `occluded` | Something that takes touches covers all of it. `by` names it when known. |
+| `offscreen` | The element is not on the screen. |
+| `missing` | The element was not where it was read. `candidates` counts the elements near it. Read the tree again. |
+| `unknown` | The device cannot judge. `reason` says why. An agent from before this endpoint answers every target this way. |
+
+Returns `400` for a malformed body, `413` for one over 64 KB, `404` when the session does not exist, `409` when its device is shut down, `502` when the agent is offline and `504` after 15 seconds plus 0.3 seconds per target.
+
+
+## Flow Capture
+
+The dashboard uses these endpoints to save what you tested as a flow. They are for the dashboard and may change between releases. Call them with the session cookie only; a PAT gets `401`. The remembered steps include what was typed, so only the user whose steps they are gets an answer. Anyone else gets `404`.
+
+### `POST /api/v1/sessions/:sessionId/capture/snapshot`
+
+Make a fixed copy of the steps remembered so far, and return it. Calling it again makes a new copy. Returns `404` when no steps are remembered.
+
+### `GET /api/v1/sessions/:sessionId/capture/snapshot`
+
+Return the last copy made. Returns `404` when there is none.
+
+### `DELETE /api/v1/sessions/:sessionId/capture/snapshot`
+
+Discard the copy. Returns `404` when there is none.
+
+### `PUT /api/v1/sessions/:sessionId/capture/thumbnails/:requestId`
+
+Keep a picture of the screen as an input began: a JPEG of at most 16 KB, for an input already remembered, sent once. The dashboard sends it after the input. Returns `201` when kept, `200` with `{ "kept": false, "reason": … }` when it was not (`exists`, `keyboard` for a touch the keyboard reads do not place off the on-screen keyboard, or a key inside a typed run, `typed` for an input begun within 2 seconds of a typed character when the field typed into is not read as non-secure, `full`), `404` when no steps are remembered for you on this session, `409` when no remembered input has that `requestId` yet or a keyboard or field read it waits on is still out (send it again shortly), `413` for a larger body and `415` for one that is not a JPEG.
+
+### `GET /api/v1/sessions/:sessionId/capture/snapshot/thumbnails/:requestId`
+
+Return the picture of a step in the copy, as `image/jpeg`. The copy's `thumbnails` lists the steps that have one. Returns `404` when there is none.
+
+### `PUT /api/v1/sessions/:sessionId/capture/pause`
+
+Stop remembering for a while. The dashboard uses it while it replays the remembered steps on the device, so the replay is not remembered as the person's input. The pause lifts on its own after the `ttlMs` in the response (30 seconds), and calling it again extends it. Returns `404` when no steps are remembered. A `404` during a replay means remembering has already ended, so stop the replay.
+
+**Response `200`**
+
+```json
+{ "ok": true, "ttlMs": 30000 }
+```
+
+### `DELETE /api/v1/sessions/:sessionId/capture/pause`
+
+Lift the pause now. Returns `404` when nothing is paused.
 
 
 ## Relay
@@ -1096,14 +1294,17 @@ Return the relay address details the dashboard uses to build addresses for teamm
 
 ```json
 {
-  "lanHost": "192.168.0.10",
+  "lanHost": null,
   "port": 4000,
-  "publicBaseUrl": "https://tap.example.com",
-  "agentRelayUrl": "wss://tap.example.com"
+  "publicBaseUrl": null,
+  "agentRelayUrl": null,
+  "publicUrlWarning": "container-without-public-url",
+  "agentUrlWarning": "container-without-relay-url"
 }
 ```
 
 A value that cannot be determined is `null`. `lanHost` is always `null` when the relay runs in a container.
+`publicUrlWarning` is included only when the relay runs in a container without a public URL for teammate links. `agentUrlWarning` is included only when it runs in a container without `TAPFLOW_RELAY_URL` for agents. Each field is omitted when its condition does not apply.
 
 
 ## Logs

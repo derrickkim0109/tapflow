@@ -92,8 +92,8 @@ describe('app:install with keepIfInstalled', () => {
     port = (server.address() as { port: number }).port
 
     const db = getDb()
-    db.prepare(`INSERT INTO apps (name, bundle_id_key, platform) VALUES ('Keep', 'com.example.keep', 'ios')`).run()
-    const app = db.prepare(`SELECT id FROM apps WHERE bundle_id_key = 'com.example.keep'`).get() as { id: number }
+    db.prepare(`INSERT INTO apps (name, platform) VALUES ('Keep', 'ios')`).run()
+    const app = db.prepare('SELECT id FROM apps ORDER BY id DESC LIMIT 1').get() as { id: number }
     const addBuild = (name: string): [number, string] => {
       const file = path.join(uploadsDir, 'builds', name)
       fs.writeFileSync(file, name)

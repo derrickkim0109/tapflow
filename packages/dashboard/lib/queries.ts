@@ -21,6 +21,10 @@ export const queryKeys = {
   comments: (buildId: number) => ['comments', buildId] as const,
   allRecordings: ['recordings'] as const,
   recordings: (buildId: number) => ['recordings', buildId] as const,
+  /** One build, for what Flow Capture needs of it: the bundle id a captured flow clears and runs (#1125). */
+  build: (id: number) => ['builds', 'detail', id] as const,
+  /** Flow Capture's frozen copy of the steps, one per opening of the dialog: each opening takes a new one. */
+  captureSnapshot: (sessionId: string, openedAt: number) => ['capture', 'snapshot', sessionId, openedAt] as const,
   agents: ['agents'] as const,
   resourceHistory: (agent: string, range: string) => ['agents', agent, 'resources', range] as const,
   /** Every filter is in the key, so changing one never shows another filter's rows as this one's. */
@@ -53,6 +57,14 @@ export async function getMe(): Promise<AuthUser | null> {
   if (status === 401) return null
   if (!data) throw new Error(`GET /api/v1/auth/me failed with ${status}`)
   return data
+}
+
+/** Flow Capture (#1125): whether the relay keeps the signed-in person's QA steps. Turning it off also discards what
+ *  it already kept. */
+export async function setFlowCapture(on: boolean): Promise<boolean> {
+  const { data, error } = await api.patch<{ flowCapture: boolean }>('/api/v1/me/preferences', { flowCapture: on })
+  if (!data) throw new Error(error ?? 'Could not save the setting')
+  return data.flowCapture
 }
 
 /** The role an invitation grants. Throws for a token the relay refuses. */
@@ -154,6 +166,29 @@ async function throwIfRefused(res: Response): Promise<void> {
   // `null` is valid JSON, so the body can parse and still have no fields.
   const body = await res.json().catch(() => null) as { error?: string } | null
   throw new ForbiddenError(body?.error ?? 'You do not have permission to do this')
+}
+
+/** What a person sets in Edit build (#1084). `null` for a version or build number goes back to the build file's. */
+export interface BuildEdit {
+  version_label: string | null
+  version_name: string | null
+  build_number: string | null
+}
+
+/** Saves Edit build. Throws `ForbiddenError` with the relay's words for a refusal, and an `Error` carrying the relay's
+ *  message for anything else it refuses, so the dialog can say it. */
+export async function updateBuildDetails(id: number, edit: BuildEdit): Promise<void> {
+  const res = await fetch(`/api/v1/builds/${id}`, {
+    method: 'PATCH',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(edit),
+  })
+  await throwIfRefused(res)
+  if (!res.ok) {
+    const body = await res.json().catch(() => null) as { error?: string } | null
+    throw new Error(body?.error ?? `Could not save the build (${res.status})`)
+  }
 }
 
 export async function updateBuildStatus(

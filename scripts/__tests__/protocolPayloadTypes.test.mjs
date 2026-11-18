@@ -157,6 +157,10 @@ const ALLOWED = new Set([
   // shape instead of by name — and the cost is worth paying, since name matching missed two of five
   // copies of one shape when this work was planned.
   'agent-core:UIElementFrame',
+  // Same two field names as `SessionHolder`, different values and purpose: the relay's own record of who drives a
+  // session for Flow Capture — any client kind or none, and a user *id* to compare — where `SessionHolder` is an
+  // AI kind and an email shown to people. Never on the wire.
+  'relay:Holder',
   // `AgentSession` in mcp-server and flow-runner is `SessionInfo` minus `resources` and
   // `capabilities` — a narrower view for a client that reads neither, not a copy. Its field set
   // differs so it never matches; listed so the next reader knows it was considered rather than
@@ -175,9 +179,10 @@ describe('wire payload types are declared once, in @tapflowio/protocol', () => {
     expect(count('ChromeData')).toBe(14) // 14 with `streamRotation`, `screenCornerRadii` and `scaleBasis` (iPhone Duo)
     expect(count('ChromeButton')).toBe(13)
     // 9 with `holder`, the AI client driving a device; 10 with `serviceTier` (L2); 15 with the five that say whose
-    // dropped session the device is waiting for (#1087)
-    expect(count('DeviceSummary')).toBe(15)
-    expect(count('SessionInfo')).toBe(6) // 6 with `admission`, the relay's reading of the Mac (L2)
+    // dropped session the device is waiting for (#1087); 18 with `displayName`, `hidden` and `favourite` (#1085)
+    expect(count('DeviceSummary')).toBe(18)
+    // 6 with `admission`, the relay's reading of the Mac (L2); 7 with `agentKey`, the key for its devices' settings (#1085)
+    expect(count('SessionInfo')).toBe(7)
   })
 
   it('guards the payload shapes by name, so a shape cannot silently leave', () => {

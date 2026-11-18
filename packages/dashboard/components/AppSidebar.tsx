@@ -159,7 +159,7 @@ export function AppSidebar() {
                 </div>
               </button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent side="top" align="start" className="w-56">
+            <DropdownMenuContent side="top" align="start" className="w-72">
               <DropdownMenuItem asChild>
                 <Link to="/settings/default" onClick={closeSheet}>
                   <Settings className="mr-2 h-4 w-4" />
@@ -167,7 +167,7 @@ export function AppSidebar() {
                 </Link>
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={handleLogout} className="text-destructive focus:text-destructive">
+              <DropdownMenuItem onClick={handleLogout} className="text-destructive focus:bg-destructive/10 focus:text-destructive">
                 <LogOut className="mr-2 h-4 w-4" />
                 Log out
               </DropdownMenuItem>

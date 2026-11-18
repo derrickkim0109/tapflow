@@ -351,6 +351,10 @@ const FLOW_STATUSES = new Set(['passed', 'failed', 'skipped'])
 /** Why the runner did not replay a flow — flow-runner's `SkipReason`. */
 const SKIP_REASONS = new Set(['app-mismatch', 'tag-filter'])
 const STEP_STATUSES = new Set(['passed', 'failed', 'skipped'])
+/** Whether a touch was checked to land on its element (#1125) — flow-runner's `StepResult.reach`. */
+const STEP_REACHES = new Set(['verified', 'delivered', 'unchecked'])
+/** Whether a touch did what the flow says it brings (#1125) — flow-runner's `StepResult.effect`. */
+const STEP_EFFECTS = new Set(['confirmed', 'failed'])
 
 export async function handleReportFlow(
   req: http.IncomingMessage,
@@ -381,19 +385,29 @@ export async function handleReportFlow(
     return json(res, 400, { error: `steps must be an array of at most ${MAX_STEPS}` })
   }
   // Rebuilt field by field, so what is stored is only what the page renders.
-  const steps: { index: number; name: string; status: string; durationMs: number; message?: string; suggestions?: ReturnType<typeof suggestions> }[] = []
+  const steps: {
+    index: number; name: string; status: string; durationMs: number; message?: string; reach?: string; reachNote?: string; effect?: string
+    suggestions?: ReturnType<typeof suggestions>
+  }[] = []
   for (const s of body.steps as unknown[]) {
     if (!isObj(s) || typeof s.status !== 'string' || !STEP_STATUSES.has(s.status)) {
       return json(res, 400, { error: 'every step needs a status of passed, failed or skipped' })
     }
     const message = str(s.message, MAX_STEP_MESSAGE)
     const suggested = s.status === 'failed' ? suggestions(s.suggestions) : []
+    // Dropped rather than refused when unknown: a newer runner's value must not cost the whole flow's record.
+    const reach = typeof s.reach === 'string' && STEP_REACHES.has(s.reach) ? s.reach : null
+    const reachNote = reach === 'unchecked' ? str(s.reachNote, MAX_STEP_MESSAGE) : null
+    const effect = typeof s.effect === 'string' && STEP_EFFECTS.has(s.effect) ? s.effect : null
     steps.push({
       index: nonNegInt(s.index) ?? steps.length,
       name: str(s.name, MAX_NAME) ?? '',
       status: s.status,
       durationMs: nonNegInt(s.durationMs) ?? 0,
       ...(message !== null ? { message } : {}),
+      ...(reach !== null ? { reach } : {}),
+      ...(reachNote !== null ? { reachNote } : {}),
+      ...(effect !== null ? { effect } : {}),
       ...(suggested.length > 0 ? { suggestions: suggested } : {}),
     })
   }
@@ -628,7 +642,7 @@ function buildSummary(buildId: number | null): BuildSummary | null {
   if (buildId === null) return null
   const b = getDb().prepare(`
     SELECT b.id, ap.name AS app_name, b.version_name, b.build_number, ap.platform
-      FROM builds b LEFT JOIN apps ap ON ap.id = b.app_id WHERE b.id = ?
+      FROM builds_effective b LEFT JOIN apps ap ON ap.id = b.app_id WHERE b.id = ?
   `).get(buildId) as { id: number; app_name: string | null; version_name: string | null; build_number: string | null; platform: string | null } | undefined
   if (!b) return null
   return { id: b.id, appName: b.app_name, versionName: b.version_name, buildNumber: b.build_number, platform: b.platform }

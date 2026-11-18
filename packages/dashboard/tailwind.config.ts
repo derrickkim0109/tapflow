@@ -41,6 +41,12 @@ const config: Config = {
           DEFAULT: 'hsl(var(--destructive))',
           foreground: 'hsl(var(--destructive-foreground))',
         },
+        warning: {
+          DEFAULT: 'hsl(var(--warning))',
+          foreground: 'hsl(var(--warning-foreground))',
+          border: 'hsl(var(--warning-border))',
+          solid: 'hsl(var(--warning-solid))',
+        },
         card: {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
@@ -89,10 +95,26 @@ const config: Config = {
         'screen-shimmer': 'linear-gradient(100deg, transparent 30%, rgba(255,255,255,0.08) 50%, transparent 70%)',
       },
       keyframes: {
+        // shadcn's Accordion: the panel grows from and shrinks to nothing, by the height Radix measures for it.
+        'accordion-down': { from: { height: '0' }, to: { height: 'var(--radix-accordion-content-height)' } },
+        'accordion-up': { from: { height: 'var(--radix-accordion-content-height)' }, to: { height: '0' } },
+        'collapsible-down': { from: { height: '0' }, to: { height: 'var(--radix-collapsible-content-height)' } },
+        'collapsible-up': { from: { height: 'var(--radix-collapsible-content-height)' }, to: { height: '0' } },
         'screen-shimmer': { from: { backgroundPosition: '150% 0' }, to: { backgroundPosition: '-50% 0' } },
+        // Merge mode's bundle ID rows, like icons held on a phone's home screen. A fraction of a degree: a row is wide, and
+        // the ID on it is text to read.
+        'row-wiggle': {
+          '0%, 100%': { transform: 'translate3d(0, 0, 2px) rotate(0.2deg)' },
+          '50%': { transform: 'translate3d(0, 0, -2px) rotate(-0.2deg)' },
+        },
       },
       animation: {
+        'accordion-down': 'accordion-down 0.2s ease-out',
+        'accordion-up': 'accordion-up 0.2s ease-out',
+        'collapsible-down': 'collapsible-down 0.2s ease-out',
+        'collapsible-up': 'collapsible-up 0.2s ease-out',
         'screen-shimmer': 'screen-shimmer 1.6s linear infinite',
+        'row-wiggle': 'row-wiggle 0.3s ease-in-out infinite',
       },
       zIndex: {
         /* Layer tokens — use these instead of raw z-{n} for semantic stacking.

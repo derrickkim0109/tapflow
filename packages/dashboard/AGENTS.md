@@ -28,9 +28,10 @@ The audience is the whole team (PO, PM, designers, backend, QA) — not just QA.
 
 - **App sidebar**: `GET /api/v1/apps` → selecting an app manages state via `?appId=N` URL parameter.
 - **Release Accordion**: `GET /api/v1/builds?app_id=N` → grouped by `version_name` (`groupByRelease()`). No dedicated `releases` table — UI grouping uses `version_name` metadata.
-- **Build card**: shows `build_number`, `platform`, `status_label`, uploader, `uploaded_at`. Inline status dropdown. **"Start QA" CTA** → `/app-center/build?id={build_id}`.
-- **Viewer is read-only**: `AppCenter` reads the role once (`useAuth`) and passes `canWrite` down. For a Viewer the build card draws no status dropdown or deletion button, and **Add App** / **Upload build** stay as plain buttons whose click raises a toast instead of opening a dialog. The relay enforces the same rule (`assertCanWrite`), so this only decides what is offered.
-- **Upload**: `UploadBuildDialog` — iOS `.app.zip` or `.tar.gz`/`.tgz` (EAS simulator build) / Android `.apk`. `version_name` / `build_number` are auto-extracted from plist, so no manual input fields.
+- **Build card**: shows `build_number`, the label (`version_label`), an **Edited** badge when the version or build number differs from `binary` (what the file says), `platform`, `status_label`, uploader, `uploaded_at`. Inline status dropdown, and a ⋯ menu with **Edit build** and scheduling or cancelling deletion. **"Start QA" CTA** → `/app-center/build?id={build_id}`.
+- **Edit build** (#1084) is one dialog in `AppCenter`, not one per row: a version edit moves the row into another release, which React draws as a new row, and a dialog inside the old one would vanish and drop focus. The save writes the cache and opens the target release before the dialog closes; the refetch waits for the dialog's focus hand-back (`onClosed`), or it can take the row away while the dialog still holds focus.
+- **Viewer is read-only**: `AppCenter` reads the role once (`useAuth`) and passes `canWrite` down. For a Viewer the build card draws no status dropdown or ⋯ menu, and **Add App** / **Upload build** stay as plain buttons whose click raises a toast instead of opening a dialog. The relay enforces the same rule (`assertCanWrite`), so this only decides what is offered.
+- **Upload**: `UploadBuildDialog` — iOS `.app.zip` or `.tar.gz`/`.tgz` (EAS simulator build) / Android `.apk`. `version_name` / `build_number` are read from the file; an optional **Label** and a folded **Override version** (Version, Build number) are sent when filled in. The dialog closes on submit and the answer is a toast, so each field carries the relay's 100-character bound.
 
 ## HOW
 
@@ -317,6 +318,40 @@ Two limits, both written beside the rule:
   A helper such as `getBuild()`, `window.fetch`, or a renamed `api` import also passes. A reviewer has
   to look for these.
 
+### Flow Capture's dialog is its own chunk, and the viewer goes quiet while it is open
+
+The **Capture flow** button (Capture group, offered only while the session records steps and has a build) opens
+`components/flow-capture/FlowCaptureDialog.tsx` by state. The dialog replays the person's steps through
+flow-runner's own `SessionChannel` (`lib/flowCapture/channel.ts`), so a flow verified here behaves as it does under
+`tapflow flow run`.
+
+- **The viewer hands over a `CaptureTap` (`lib/flowCapture/tap.ts`), which imports nothing from flow-runner.** That
+  is what keeps the engine and `yaml` out of the QA page's first load: the dialog is `lazy()`, and only its chunk
+  brings them. `scripts/__tests__/dashboardFirstLoadBudget.test.mjs` walks the static imports of the `QASession`
+  chunk and fails if a flow-runner marker is reachable. A static import of `channel.ts` from viewer code is what it
+  catches, measured.
+- **While the dialog is open the viewer sends nothing of its own.** Its shortcuts and keys, the clipboard bridge,
+  and the `input:error` toast all stop, because a key pressed mid-replay (⌘⇧O turns the device) would break the
+  match, and a toast behind a modal is not heard (below). Each viewer carries the guard separately, and each has its
+  own test (`viewerFlowCapture.test.tsx`, `AndroidViewer.flowCapture.test.tsx`).
+- **The dialog holds the relay's pause on recording while it replays or verifies** (`PauseLease`, a 30 s lease
+  renewed every 10 s and before each step). Otherwise its own inputs would be recorded into the capture they come
+  from. A tab that dies lets the lease lapse, so the person is not left unrecorded.
+- **What the dialog opens (channel, lease, run) is made by an effect and ended by its cleanup, and the copy of the
+  steps is dropped by the viewer.** Made during render and ended in a cleanup, StrictMode's mount-time cleanup closed
+  a channel the dialog went on using; a deferred cleanup was tried and dropped, since it guessed which unmount was
+  real. The copy outlives the dialog's double mount, so it belongs to the opening — `DeviceViewer` drops it when
+  `captureTap` goes, however the dialog went. The lease gives the pause back only if it asked for it: another tab of
+  the same person may hold it.
+- **The replay is of the flow that will be exported, not of everything the person did.** An install in the range is
+  matched (as skipped) but not sent: the flow has none, and replaying one uninstalled the app the replay had just
+  launched, leaving every later step to be matched on the home screen.
+- **`vite build` reads flow-runner's `dist`; `pnpm dev` and the tests read its source.** The dev server prepends the
+  `source` export condition (`vite.config.ts`, serve only), so a fresh checkout opens the dialog with no flow-runner
+  build and an edit there shows without one. A dashboard build still needs flow-runner built first
+  (`pnpm --filter @tapflowio/flow-runner build`), which is why CI, both Dockerfiles and the playground's
+  `pre-release` build it before the dashboard.
+
 ## Testing
 
 - `pnpm test` is always run foreground (terminal). **Never run vitest as a background process** — worker forks accumulate as zombies and exhaust CPU/RAM.
@@ -428,7 +463,8 @@ diagnostic detail (`unknown key code: KeyFoo`) belongs. Absent or unrecognised r
 Suppressed entirely while the agent is away. An absent agent cannot send this, so in that state the
 *relay* answers every terminal input itself (`agent offline`, `channel-unavailable` since #492); a
 tapping tester would refresh the toast indefinitely, with advice contradicting the status card, which
-already says the relay is holding the session open and waiting.
+already says the relay is holding the session open and waiting. Also suppressed while Flow Capture's dialog is
+open, which reports a step that did not land itself (see that section above).
 
 A persistent indicator needs a protocol-level input-health signal, or acks that identify their channel
 and arrive in order. Two tests guard the decision (`DeviceViewer.inputError.test.tsx`): `input:done`
@@ -666,7 +702,9 @@ lives in a portal under `body` and still goes with its owner.
 
 **A dialog opened by state rather than by a trigger returns focus itself.** Radix returns focus to an
 `AlertDialogTrigger`; without one it drops it on `body`. `BuildRow`'s deletion dialog is opened from
-its trash button's `onClick`, so it passes `onCloseAutoFocus` to put focus back on that button.
+an item of the row's ⋯ menu, so it passes `onCloseAutoFocus` to put focus back on the ⋯. Edit build is the case
+where the trigger moves: a version edit redraws the row under another release, so its dialog looks the ⋯ up by
+`[data-row-menu]` when it closes rather than holding a ref.
 
 ### A toast fired while a dialog is open is not heard
 

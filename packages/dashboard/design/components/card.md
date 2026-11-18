@@ -62,7 +62,7 @@ component — propose it as a code change first.
 
 ## Variations at the call site
 
-These are `className` overrides, not props. They change layout, not the look of the card.
+These are `className` overrides, not props. All but one change layout, not the look of the card.
 
 | Where | Override | Why |
 |-------|----------|-----|
@@ -83,5 +83,5 @@ These are `className` overrides, not props. They change layout, not the look of 
 
 ## Figma
 
-Component set **Card** (`57:74`) in the `Design System` page — one variant per `level`, with `level=2` as the
-default (top left of the set) to match `defaultVariants`.
+Component set **Card** (`1:1893`) on the `Data display` page of tapflow-design-system — one variant per `level`,
+with `level=2` as the default (top left of the set) to match `defaultVariants`.

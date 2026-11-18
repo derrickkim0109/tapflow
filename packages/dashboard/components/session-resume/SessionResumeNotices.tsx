@@ -63,7 +63,8 @@ export function InterruptedSessionsBanner({ sessions, onResume, onEnd, canResume
                 ? `Your session on ${device.name} was interrupted. An AI client is using the device; you can continue when it is done.`
                 : `Your session on ${device.name} was interrupted.${minutes !== null ? ` The device shuts down in about ${minutes} min.` : ''}`}
             </p>
-            <div className="flex shrink-0 gap-2">
+            {/* Equal columns, as wide as the wider label: the pair reads as one choice. */}
+            <div className="grid shrink-0 grid-flow-col auto-cols-fr gap-2">
               {!borrowed && canResume(s) && (
                 <Button size="sm" onClick={() => onResume(s)} aria-label={`Resume your session on ${device.name}`}>Resume</Button>
               )}

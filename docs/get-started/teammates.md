@@ -42,7 +42,7 @@ An address with `localhost` in it only opens on the operator's own Mac. If that 
 ## 3. Test a build {#test-a-build}
 
 1. In App Center, pick the app in the **Apps** list on the left. The first app in the list is selected when the page opens, so check it when there are several.
-2. Find the build to test. The **Search version…** box and the status filter narrow the list.
+2. Find the build to test. The **Search version or label…** box and the status filter narrow the list.
 3. Click **Start QA** on the build's row. The button is off for a build whose review status is **Done**.
 4. Pick a Mac on the **Select Mac** page, then click a device on the **Select device** page. A device a teammate is using shows **In use** and cannot be picked.
 5. Once the device is up and the build has installed, click **Launch app** in the toolbar to open the app.
@@ -72,6 +72,7 @@ When a Viewer clicks **Upload build** or **Add App**, a notice says QA or Develo
 Click your name at the bottom of the sidebar and choose **Settings**.
 
 - **Profile**: change **Nickname** and **Avatar**, then click **Save changes**.
+- **Flow Capture**: turn **Capture my steps** on or off. While it is on, you can [save what you did in a QA Session as a flow](/testing/flow-capture). The change applies at once.
 - **Password**: enter **Current password**, **New password** and **Confirm new password**.
 
 If you forget your password, ask an Admin. The Admin clicks **Reset pwd** in **Settings → Team** and sends you the reset link it shows. When tapflow can send email (SMTP is set up), the link also arrives by email. The link works once, for 2 hours. After the reset you are signed out everywhere, so sign in again with the new password. **Log out** is in the same menu.
