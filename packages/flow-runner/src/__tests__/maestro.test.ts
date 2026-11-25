@@ -94,6 +94,16 @@ tags:
     ])
   })
 
+  it('refuses a timeout or swipe duration a JavaScript timer cannot hold, after rounding', () => {
+    for (const text of [
+      '- extendedWaitUntil:\n    notVisible: Loading\n    timeout: 0.4\n',
+      '- extendedWaitUntil:\n    visible: Home\n    timeout: 2147483648\n',
+      '- swipe:\n    direction: UP\n    duration: 2147483648\n',
+    ]) {
+      expect(convert({ 'flow.yaml': text }).status).toBe('not-converted')
+    }
+  })
+
   it('erases text one Backspace per character, 50 by default as Maestro does', () => {
     const steps = converted(convert({ 'flow.yaml': '- eraseText: 3\n- eraseText\n' })).steps
     expect(steps).toHaveLength(53)
@@ -152,14 +162,15 @@ tags:
     ])
   })
 
-  it('does not convert an env default it would type literally, unless --env sets it', () => {
+  it("reads Maestro's ${NAME || 'x'} env default, and refuses any other expression it would type literally", () => {
     const files = { 'flow.yaml': "env:\n  USER: ${USER || 'guest'}\n---\n- inputText: ${USER}\n" }
-    const r = convert(files)
-    expect(r.status).toBe('not-converted')
-    expect(r.issues).toEqual([expect.objectContaining({ command: 'inputText', line: 4, reason: expect.stringContaining('--env USER=') })])
+    expect(converted(convert(files)).steps).toEqual([{ type: 'inputText', text: 'guest' }])
     expect(converted(convert(files, 'flow.yaml', { USER: 'kim' })).steps).toEqual([{ type: 'inputText', text: 'kim' }])
+    const r = convert({ 'flow.yaml': "env:\n  USER: ${USER.toUpperCase()}\n---\n- inputText: ${USER}\n" })
+    expect(r.status).toBe('not-converted')
+    expect(r.issues).toEqual([expect.objectContaining({ command: 'inputText', line: 4, reason: expect.stringContaining('cannot evaluate') })])
     // Only a variable the commands use is checked.
-    expect(convert({ 'flow.yaml': "env:\n  A: kim\n  B: ${B || 'x'}\n---\n- inputText: ${A}\n" }).status).toBe('converted')
+    expect(convert({ 'flow.yaml': "env:\n  A: kim\n  B: ${B.trim()}\n---\n- inputText: ${A}\n" }).status).toBe('converted')
   })
 
   it('keeps launch arguments numbers, as Maestro passes them', () => {
@@ -198,12 +209,11 @@ tags:
   })
 
   describe('env', () => {
-    it('substitutes ${NAME} from the flow env, with --env winning', () => {
-      const files = { 'flow.yaml': 'appId: ${APP}\nenv:\n  APP: com.a\n  USER: kim\n---\n- inputText: ${USER}@example.com\n' }
-      const a = converted(convert(files))
+    it('substitutes ${NAME} from --env and the flow env, the flow env winning as it does in Maestro', () => {
+      const files = { 'flow.yaml': 'appId: ${APP}\nenv:\n  APP: com.a\n  USER: kim\n---\n- inputText: ${USER}@${HOST}\n' }
+      const a = converted(convert(files, 'flow.yaml', { USER: 'lee', HOST: 'example.com' }))
       expect(a.appId).toBe('com.a')
       expect(a.steps).toEqual([{ type: 'inputText', text: 'kim@example.com' }])
-      expect(converted(convert(files, 'flow.yaml', { USER: 'lee' })).steps).toEqual([{ type: 'inputText', text: 'lee@example.com' }])
     })
 
     it('does not convert an unset variable or a JavaScript expression', () => {
@@ -220,7 +230,7 @@ tags:
     it('inlines a subflow, relative to the file that runs it, with the env it passes', () => {
       const flow = converted(convert({
         'flow.yaml': 'appId: a\n---\n- launchApp\n- runFlow:\n    file: common/login.yaml\n    env:\n      USER: kim\n- assertVisible: Home\n',
-        'common/login.yaml': 'appId: a\nenv:\n  USER: nobody\n---\n- tapOn: Email\n- inputText: ${USER}\n- runFlow: submit.yaml\n',
+        'common/login.yaml': "appId: a\nenv:\n  USER: ${USER || 'nobody'}\n---\n- tapOn: Email\n- inputText: ${USER}\n- runFlow: submit.yaml\n",
         'common/submit.yaml': '- tapOn: Sign in\n',
       }))
       expect(flow.steps).toEqual([
@@ -229,6 +239,18 @@ tags:
         { type: 'inputText', text: 'kim' },
         { type: 'tapOn', selector: { text: 'Sign in' } },
         { type: 'assertVisible', selector: { text: 'Home' } },
+      ])
+    })
+
+    it("lets a subflow's own constants win over the parent's and over what runFlow passes, as Maestro defines them last", () => {
+      const flow = converted(convert({
+        'flow.yaml': 'env:\n  G: parent\n---\n- runFlow: sub.yaml\n- runFlow:\n    file: sub.yaml\n    env:\n      G: passed\n- inputText: ${G}\n',
+        'sub.yaml': 'env:\n  G: sub\n---\n- inputText: ${G}\n',
+      }))
+      expect(flow.steps).toEqual([
+        { type: 'inputText', text: 'sub' },
+        { type: 'inputText', text: 'sub' },
+        { type: 'inputText', text: 'parent' },
       ])
     })
 

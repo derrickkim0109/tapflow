@@ -102,6 +102,33 @@ describe('cmdFlowImport', () => {
     expect(fs.readFileSync(path.join(dir, 'm/a.yaml'), 'utf-8')).toBe('- launchApp\n')
   })
 
+  it('refuses to replace a flow or subflow it reads through another path to it, even with --overwrite', async () => {
+    write('m/a.yaml', '- runFlow: sub/s.yaml\n')
+    write('m/sub/s.yaml', '- launchApp\n')
+    fs.symlinkSync(path.join(dir, 'm'), path.join(dir, 'alias'))
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'alias', overwrite: true })).toBe(2)
+    expect(fs.readFileSync(path.join(dir, 'm/a.yaml'), 'utf-8')).toBe('- runFlow: sub/s.yaml\n')
+    // The subflow is only read, never an input of its own; an output landing on it is refused all the same.
+    write('n/a.yaml', '- runFlow: ../lib/a.yaml\n')
+    write('lib/a.yaml', '- launchApp\n')
+    expect(await cmdFlowImport(['n'], { from: 'maestro', out: 'lib', overwrite: true })).toBe(2)
+    expect(fs.readFileSync(path.join(dir, 'lib/a.yaml'), 'utf-8')).toBe('- launchApp\n')
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'out', report: 'm/sub/s.yaml' })).toBe(2)
+    expect(fs.readFileSync(path.join(dir, 'm/sub/s.yaml'), 'utf-8')).toBe('- launchApp\n')
+  })
+
+  it('refuses a --report that is where a converted flow goes', async () => {
+    write('m/a.yaml', '- launchApp\n')
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'out', report: 'out/a.yaml' })).toBe(2)
+    expect(fs.existsSync(path.join(dir, 'out'))).toBe(false)
+  })
+
+  it('takes an --out cac read as a number', async () => {
+    write('m/a.yaml', '- launchApp\n')
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 2024 as unknown as string })).toBe(0)
+    expect(fs.existsSync(path.join(dir, '2024/a.yaml'))).toBe(true)
+  })
+
   it.each([
     ['no --from', ['m'], {}],
     ['an unknown format', ['m'], { from: 'appium' }],

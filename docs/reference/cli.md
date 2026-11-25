@@ -427,11 +427,11 @@ tapflow flow import --from maestro .maestro/
 |--------|---------|-------------|
 | `--from <format>` | — | Format of the flows to convert. Required. Only `maestro` for now. |
 | `--out <dir>` | `.tapflow/flows` | Where converted flows are written. Each keeps its path relative to the inputs. |
-| `--env <KEY=VALUE>` | — | Value for `${KEY}` in the source flows. Repeat for more than one. Wins over the flow's own `env`. |
+| `--env <KEY=VALUE>` | — | Value for `${KEY}` in the source flows. Repeat for more than one. A flow's own `env` wins over it, as in Maestro. |
 | `--report <path>` | — | Write what was and was not converted as JSON |
 | `--overwrite` | — | Replace converted flows that already exist. Without it, the import stops before writing anything. |
 
-A directory contributes the flows directly in it, as Maestro runs a directory, and never `config.yaml`. `runFlow` subflows are inlined into the flow that runs them, and `${NAME}` values are filled in, so the written flow does not depend on the Maestro files afterwards.
+A directory contributes every flow directly in it. `config.yaml` is not read, so its `flows` patterns and tag filters do not narrow the import: a subflow kept beside the flows is converted as a flow of its own unless you name the flows to import. `runFlow` subflows are inlined into the flow that runs them, and `${NAME}` values are filled in, so the written flow does not depend on the Maestro files afterwards.
 
 A flow converts whole or not at all. When one of its commands has no tapflow step, no file is written for that flow, and every such command is listed with its file and line. A flow with a command left out could pass without the assertion that command made. See [Importing Maestro flows](/automation/flows#importing-maestro-flows) for what converts.
 

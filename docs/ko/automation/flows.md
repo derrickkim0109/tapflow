@@ -425,7 +425,7 @@ tapflow flow import --from maestro .maestro/ --report import-report.json
 
 - `repeat`, `evalScript`, `runScript`, `takeScreenshot`, `back`, `hideKeyboard`, `longPressOn`, `scrollUntilVisible`, `copyTextFrom` 같은 명령, `when`이 있는 `runFlow`, `onFlowStart`·`onFlowComplete`.
 - 셀렉터 옵션: 상대 위치(`below`, `above`, `leftOf`, `rightOf`, `childOf`, `containsChild`, `containsDescendants`), 상태(`enabled`, `checked`, `focused`, `selected`), `traits`, 크기(`width`, `height`, `tolerance`), `point`, `optional: true`.
-- 변수 이름이 아닌 JavaScript 식인 `${...}`, 또는 값이 없는 변수.
+- 변수 이름이 아닌 JavaScript 식인 `${...}`, 또는 값이 없는 변수. 예외로 `env` 값에 쓴 Maestro 기본값 표기 `${NAME || 'value'}`는 읽습니다.
 - 픽셀 단위나 요소에서 시작하는 스와이프, 위 세 개 외의 키, 다른 앱 실행.
 
 `id`는 적힌 그대로 옮깁니다. Android에서 tapflow는 `com.example.app:id/login` 같은 전체 리소스 ID로 찾으므로, Maestro의 `id: login`은 변환된 플로우에 패키지 접두사를 붙여야 할 수 있습니다.
@@ -435,6 +435,9 @@ tapflow flow import --from maestro .maestro/ --report import-report.json
 - 정확히 맞는 요소가 없으면 일부만 맞는 텍스트도 찾습니다. Maestro는 전체 텍스트가 맞아야 합니다. 변환된 `assertVisible: Welcome`은 `Welcome back`만 보이는 화면에서도 통과합니다.
 - 대소문자를 구분합니다. Maestro는 구분하지 않습니다. 변환된 `assertNotVisible: error`는 화면에 `Error`가 있어도 통과합니다.
 - Android에서 패키지 접두사가 없는 `id`는 아무 요소에도 맞지 않으므로 그런 `id`를 쓴 `assertNotVisible`은 접두사를 붙이기 전까지 항상 통과합니다.
+- 텍스트를 라벨보다 요소의 식별자와 먼저 비교합니다. Maestro는 텍스트만 봅니다. 변환된 `assertVisible: login`은 식별자가 `login`인 버튼이 있으면 라벨과 상관없이 통과합니다.
+
+여러 요소가 매칭되면 Maestro는 그중 하나를 탭하지만 tapflow는 후보를 나열하고 스텝을 실패시킵니다. 그래서 Maestro에서 통과하던 `tapOn`이 변환 뒤 실패할 수 있습니다. iOS 탭 바 항목이 버튼과 이미지로 동시에 매칭되는 경우가 그렇습니다. 실패 출력의 `try:` 줄처럼 `role`이나 `index`를 붙이세요.
 
 예전 가져오기로 쓴 플로우가 이제 변환되지 않으면 옛 파일은 그대로 두고 `stale`로 표시합니다. `flow run`이 그 파일을 계속 실행하기 때문입니다.
 

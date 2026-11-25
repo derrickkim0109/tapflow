@@ -61,15 +61,30 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
     return EXIT_USAGE
   }
 
-  const outDir = path.resolve(opts.out ?? DEFAULT_IMPORT_OUT)
+  // cac hands a value that looks like a number over as one.
+  const outDir = path.resolve(String(opts.out ?? DEFAULT_IMPORT_OUT))
+  const reportPath = opts.report === undefined ? undefined : String(opts.report)
   const outputOf = (file: string): string => path.join(outDir, path.relative(base, file))
-  // `--overwrite` exists for re-importing, which an output landing on its own source would turn into deleting it.
-  const onSource = files.filter((f) => outputOf(f) === f)
+  // Every file the import reads, subflows included, by identity rather than by path: on a case-insensitive disk or
+  // through a symlink, two different paths name one file.
+  const sources = new Set<string>()
+  const readFile = (file: string): string => {
+    const id = identity(file)
+    if (id !== undefined) sources.add(id)
+    return fs.readFileSync(file, 'utf-8')
+  }
+  const results = files.map((file) => ({ result: convertMaestroFlow(file, { env, readFile }), output: outputOf(file) }))
+  // `--overwrite` exists for re-importing, which an output landing on a source would turn into deleting it.
+  const isSource = (p: string): boolean => { const id = identity(p); return id !== undefined && sources.has(id) }
+  const onSource = [...results.map((r) => r.output), ...(reportPath !== undefined ? [path.resolve(reportPath)] : [])].filter(isSource)
   if (onSource.length > 0) {
-    console.error(`✗ --out ${display(outDir)} would replace the Maestro flows themselves (${onSource.map(display).join(', ')}) — write to another directory`)
+    console.error(`✗ this import would replace the Maestro flows it reads (${onSource.map(display).join(', ')}) — pass another --out or --report`)
     return EXIT_USAGE
   }
-  const results = files.map((file) => ({ result: convertMaestroFlow(file, { env }), output: outputOf(file) }))
+  if (reportPath !== undefined && results.some((r) => r.output.toLowerCase() === path.resolve(reportPath).toLowerCase())) {
+    console.error(`✗ --report ${reportPath} is where a converted flow is written — pass another path`)
+    return EXIT_USAGE
+  }
 
   // Every flow is serialized and read back before the first file is written. A flow that does not read back is
   // reported like any other that did not convert, rather than costing the others their output.
@@ -115,7 +130,7 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
 
   printResults(written)
 
-  if (opts.report !== undefined) {
+  if (reportPath !== undefined) {
     const report: ImportReport = {
       format: 'tapflow-import-report',
       version: 1,
@@ -129,9 +144,9 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
       })),
     }
     try {
-      fs.mkdirSync(path.dirname(path.resolve(opts.report)), { recursive: true })
-      fs.writeFileSync(opts.report, JSON.stringify(report, null, 2) + '\n')
-      console.log(`${DIM}report: ${opts.report}${R}`)
+      fs.mkdirSync(path.dirname(path.resolve(reportPath)), { recursive: true })
+      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
+      console.log(`${DIM}report: ${reportPath}${R}`)
     } catch (e) {
       console.error(`✗ cannot write the report: ${(e as Error).message}`)
       return EXIT_USAGE
@@ -169,6 +184,15 @@ function printResults(written: Written[]): void {
   console.log(`${converted} converted, ${notConverted} not converted`)
 }
 
+function identity(file: string): string | undefined {
+  try {
+    const st = fs.statSync(file)
+    return `${st.dev}:${st.ino}`
+  } catch {
+    return undefined
+  }
+}
+
 function display(p: string): string {
   const rel = path.relative(process.cwd(), p)
   return rel === '' || rel.startsWith('..') ? p : rel
@@ -188,8 +212,8 @@ function parseEnvPairs(env: string | string[] | undefined): Record<string, strin
 
 /**
  * The files a list of inputs names, and the directory their output paths are kept relative to. A directory
- * contributes the flows directly in it, as Maestro runs a directory: subfolders are where subflows live, and
- * `runFlow` inlines those.
+ * contributes the flows directly in it: subfolders are where subflows usually live, and `runFlow` inlines those.
+ * `config.yaml` is not read, so its `flows` patterns do not narrow the set.
  */
 function collectFlowFiles(inputs: string[]): { files: string[]; base: string } {
   const files: string[] = []

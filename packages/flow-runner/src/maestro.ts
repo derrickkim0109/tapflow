@@ -19,7 +19,10 @@ import type { ImportedFlow, ImportIssue } from './importReport.js'
  */
 
 export interface MaestroImportOptions {
-  /** `${NAME}` values. They win over a flow's own `env`, as Maestro's `-e` does. */
+  /**
+   * `${NAME}` values, as Maestro's `-e`. A flow's own `env` wins over them, as it does in Maestro, where a default
+   * that yields to `-e` is written `${NAME || 'x'}`.
+   */
   env?: Record<string, string>
   /** Injected for tests; defaults to reading from disk. */
   readFile?: (file: string) => string
@@ -46,6 +49,8 @@ interface ParsedFile {
 const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 // Maestro's own default is 50; past this the expansion into one key press per character stops being a flow step.
 const MAX_ERASE_CHARACTERS = 1000
+/** The longest wait a JavaScript timer holds; `parseFlow` refuses a longer one. */
+const MAX_TIMER_MS = 2_147_483_647
 
 /** Whether `name` can be referenced as `${name}` in a Maestro flow, and so set with `--env`. */
 export function isEnvName(name: string): boolean {
@@ -88,7 +93,7 @@ export function convertMaestroFlow(file: string, options: MaestroImportOptions =
   } catch (e) {
     return fail((e as Error).message, undefined, 'env')
   }
-  const env = { ...flowEnv, ...(options.env ?? {}) }
+  const env = layerEnv(options.env ?? {}, flowEnv)
 
   const { appId, name, tags } = readHeader(header, file, lines, env, ctx, false)
   ctx.appId = appId
@@ -273,9 +278,10 @@ function inlineSubflow(rawArg: unknown, file: string, line: number | undefined, 
     throw new Problem(`subflow ${target}: ${e instanceof Problem ? e.message : `cannot read it (${(e as Error).message})`}`)
   }
   if (parsed.commands === undefined) throw new Problem(`subflow ${target} has no commands`)
-  // The subflow's own env is its default; what the caller passes wins, then whatever was set for the whole import.
+  // Maestro defines variables in the order it runs: the caller's, then what runFlow passes, then the subflow's own
+  // env — so a subflow's constants win over the parent's of the same name, as its docs say.
   const subHeader = (parsed.header?.toJSON() ?? {}) as Record<string, unknown>
-  const subEnv = { ...stringEnv(subHeader.env), ...env, ...passedEnv }
+  const subEnv = layerEnv({ ...env, ...passedEnv }, stringEnv(subHeader.env))
   readHeader(parsed.header, subPath, parsed.lines, subEnv, ctx, true)
   ctx.stack.push(subPath)
   try {
@@ -399,7 +405,7 @@ function convertSwipe(arg: unknown): Step {
   if (from !== undefined) throw new Problem('"swipe" from an element has no tapflow equivalent — tapflow swipes between points')
   rejectKeys(rest, 'swipe')
   const durationMs = duration === undefined ? DEFAULT_SWIPE_DURATION_MS : Number(duration)
-  if (!Number.isFinite(durationMs) || durationMs <= 0) throw new Problem('"swipe" duration must be a positive number of milliseconds')
+  if (!(durationMs > 0 && durationMs <= MAX_TIMER_MS)) throw new Problem(`"swipe" duration must be a positive number of milliseconds, at most ${MAX_TIMER_MS}`)
   if (direction !== undefined) {
     const g = typeof direction === 'string' ? SWIPE_DIRECTIONS[direction.toUpperCase()] : undefined
     if (!g) throw new Problem(`"swipe" direction must be UP, DOWN, LEFT or RIGHT (got ${String(direction)})`)
@@ -449,11 +455,11 @@ function convertSelector(arg: unknown, command: string, ctx: Context, droppable:
 
 function withTimeout(sel: Selector, timeout: unknown): Selector {
   if (timeout === undefined) return sel
-  const ms = Number(timeout)
-  if (!Number.isFinite(ms) || ms <= 0) throw new Problem('"timeout" must be a positive number of milliseconds')
+  const ms = Math.round(Number(timeout))
+  if (!(ms >= 1 && ms <= MAX_TIMER_MS)) throw new Problem(`"timeout" must be 1 to ${MAX_TIMER_MS} milliseconds`)
   // A timeout needs the object form, which reads `text` as a label.
   const { text, ...rest } = sel
-  return { ...rest, ...(text !== undefined ? { label: text } : {}), timeoutMs: Math.round(ms) }
+  return { ...rest, ...(text !== undefined ? { label: text } : {}), timeoutMs: ms }
 }
 
 /**
@@ -486,14 +492,30 @@ function substitute(value: unknown, env: Record<string, string>): unknown {
       const key = expr.trim()
       if (!NAME_PATTERN.test(key)) throw new Problem(`"\${${expr}}" is a JavaScript expression — tapflow substitutes only \${NAME} from env`)
       if (!Object.hasOwn(env, key)) throw new Problem(`\${${key}} is not set — define it in the flow's env or pass --env ${key}=…`)
-      // A value that still holds `\${…}` — Maestro's `\${USER || 'guest'}` default — would be typed literally.
-      if (env[key].includes('${')) throw new Problem(`\${${key}} is "${env[key]}", which tapflow cannot evaluate — pass --env ${key}=… to set it`)
+      // A value that still holds `\${…}` would be typed literally; only the `\${NAME || 'x'}` default is evaluated.
+      if (env[key].includes('${')) throw new Problem(`\${${key}} is "${env[key]}", which tapflow cannot evaluate — set it to a plain value in the flow's env`)
       return env[key]
     })
   }
   if (Array.isArray(value)) return value.map((v) => substitute(v, env))
   if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substitute(v, env)]))
   return value
+}
+
+const DEFAULT_PATTERN = /^\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\|\|\s*(['"])([^'"]*)\2\s*\}$/
+
+/**
+ * A flow's own env laid over the values set before it. Maestro evaluates each value as JavaScript; the one form read
+ * here is its documented default, `${NAME || 'x'}`, which keeps a value set before and otherwise falls back to `x`.
+ * Any other `${…}` value is kept as written, and `substitute` refuses it where a command uses it.
+ */
+function layerEnv(before: Record<string, string>, own: Record<string, string>): Record<string, string> {
+  const out = { ...before }
+  for (const [key, value] of Object.entries(own)) {
+    const m = DEFAULT_PATTERN.exec(value)
+    out[key] = m === null ? value : Object.hasOwn(before, m[1]) ? before[m[1]] : m[3]
+  }
+  return out
 }
 
 function stringEnv(v: unknown): Record<string, string> {

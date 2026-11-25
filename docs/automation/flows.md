@@ -425,7 +425,7 @@ These have no tapflow step, and a flow that uses one is not converted:
 
 - Commands such as `repeat`, `evalScript`, `runScript`, `takeScreenshot`, `back`, `hideKeyboard`, `longPressOn`, `scrollUntilVisible` and `copyTextFrom`, a `runFlow` with `when`, and `onFlowStart` / `onFlowComplete`.
 - Selector options: relative position (`below`, `above`, `leftOf`, `rightOf`, `childOf`, `containsChild`, `containsDescendants`), state (`enabled`, `checked`, `focused`, `selected`), `traits`, size (`width`, `height`, `tolerance`), `point`, and `optional: true`.
-- `${...}` that is a JavaScript expression rather than a variable name, or a variable that is not set.
+- `${...}` that is a JavaScript expression rather than a variable name, or a variable that is not set. The one expression read is Maestro's default, `${NAME || 'value'}` in an `env` value.
 - Swipes in pixels or from an element, keys other than the three above, and launching a different app.
 
 An `id` is copied as written. On Android, tapflow matches an element's full resource ID, such as `com.example.app:id/login`, so a Maestro `id: login` may need the package prefix added to the converted flow.
@@ -435,6 +435,9 @@ Converted selectors match the way tapflow selectors do, not the way Maestro's do
 - Text falls back to a partial match when no element matches exactly, where Maestro needs the whole text. A converted `assertVisible: Welcome` passes on a screen that shows only `Welcome back`.
 - Case counts, where Maestro ignores it. A converted `assertNotVisible: error` passes while `Error` is on screen.
 - On Android, an `id` without its package prefix matches nothing, so a converted `assertNotVisible` with one always passes until the prefix is added.
+- Text is checked against each element's identifier before its label, where Maestro reads text only. A converted `assertVisible: login` passes when a button's identifier is `login`, whatever its label says.
+
+When several elements match, Maestro taps one of them and tapflow fails the step, listing the candidates. A converted `tapOn` can therefore fail where the Maestro flow passed, as when an iOS tab bar item matches both as a button and as an image. Add `role` or `index` to it, as the failure's `try:` lines suggest.
 
 When a flow no longer converts but an earlier import wrote it, the old file is left in place and listed as `stale`, because `flow run` would keep replaying it.
 
