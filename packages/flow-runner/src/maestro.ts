@@ -1,7 +1,8 @@
 import { readFileSync } from 'fs'
 import path from 'path'
-import { LineCounter, isMap, isScalar, isSeq, parseAllDocuments, type Node, type YAMLMap } from 'yaml'
+import { LineCounter, isMap, isScalar, isSeq, parseAllDocuments, visit, type Node, type YAMLMap } from 'yaml'
 import type { Flow, Selector, Step } from './schema.js'
+import { launchOptionsProblem } from '@tapflowio/protocol/launch'
 import type { ImportedFlow, ImportIssue } from './importReport.js'
 
 /**
@@ -72,46 +73,16 @@ export function convertMaestroFlow(file: string, options: MaestroImportOptions =
   }
   const { header, lines } = parsed
 
-  const headerValue = (header?.toJSON() ?? {}) as Record<string, unknown>
   let flowEnv: Record<string, string>
   try {
-    flowEnv = stringEnv(headerValue.env)
+    flowEnv = stringEnv((header?.toJSON() as Record<string, unknown> | undefined)?.env)
   } catch (e) {
     return fail((e as Error).message, undefined, 'env')
   }
   const env = { ...flowEnv, ...(options.env ?? {}) }
+  checkEnvValues(env, file, ctx)
 
-  let appId: string | undefined
-  let name: string | undefined
-  let tags: string[] | undefined
-  for (const pair of header?.items ?? []) {
-    const key = isScalar(pair.key) ? String(pair.key.value) : String(pair.key)
-    const line = lineOf(pair.key as Node, lines)
-    const value: unknown = (pair.value as Node | null)?.toJSON() ?? null
-    try {
-      switch (key) {
-        case 'appId': appId = requireString(substitute(value, env), 'appId'); break
-        case 'name': name = requireString(substitute(value, env), 'name'); break
-        case 'tags':
-          if (!Array.isArray(value) || value.some((t) => typeof t !== 'string' || t.trim() === '' || t.includes(','))) {
-            throw new Problem('"tags" must be a list of non-empty strings without commas')
-          }
-          tags = value as string[]
-          break
-        case 'env': break
-        // Settings for Maestro's JavaScript, and free-form metadata; neither changes what the commands do.
-        case 'jsEngine': case 'properties': break
-        case 'onFlowStart': case 'onFlowComplete':
-          if (Array.isArray(value) && value.length === 0) break
-          throw new Problem(`"${key}" hooks have no tapflow equivalent — move their commands into the flow`)
-        default:
-          throw new Problem(`config key "${key}" has no tapflow equivalent`)
-      }
-    } catch (e) {
-      if (!(e instanceof Problem)) throw e
-      ctx.issues.push({ file, line, command: key, kind: 'unconverted', reason: e.message })
-    }
-  }
+  const { appId, name, tags } = readHeader(header, file, lines, env, ctx, false)
   ctx.appId = appId
 
   if (parsed.commands === undefined) return fail('no commands — a Maestro flow lists its commands after the "---" line')
@@ -129,6 +100,68 @@ export function convertMaestroFlow(file: string, options: MaestroImportOptions =
   return { source: file, status: 'converted', flow, issues: ctx.issues }
 }
 
+/**
+ * The config section, for a flow or a subflow alike. A subflow's section is read with the same rules, because its
+ * hooks run with it in Maestro: skipping them would drop the commands they hold, assertions included.
+ */
+function readHeader(
+  header: YAMLMap | undefined, file: string, lines: LineCounter, env: Record<string, string>, ctx: Context, subflow: boolean,
+): { appId?: string; name?: string; tags?: string[] } {
+  const out: { appId?: string; name?: string; tags?: string[] } = {}
+  for (const pair of header?.items ?? []) {
+    const key = isScalar(pair.key) ? String(pair.key.value) : String(pair.key)
+    const line = lineOf(pair.key as Node, lines)
+    const value: unknown = (pair.value as Node | null)?.toJSON() ?? null
+    try {
+      switch (key) {
+        case 'appId': {
+          const appId = requireString(substitute(value, env), 'appId')
+          // A subflow for another app (Settings, say) would have its bare clearState and launchApp act on the app under test.
+          if (subflow && ctx.appId !== undefined && appId !== ctx.appId) {
+            throw new Problem(`subflow is for ${appId}, not ${ctx.appId} — tapflow drives only the app under test`)
+          }
+          out.appId = appId
+          break
+        }
+        case 'name': out.name = requireString(substitute(value, env), 'name'); break
+        case 'tags':
+          if (!Array.isArray(value) || value.some((t) => typeof t !== 'string' || t.trim() === '' || t.includes(','))) {
+            throw new Problem('"tags" must be a list of non-empty strings without commas')
+          }
+          out.tags = value as string[]
+          break
+        case 'env': break
+        // Settings for Maestro's JavaScript, and free-form metadata; neither changes what the commands do.
+        case 'jsEngine': case 'properties': break
+        case 'onFlowStart': case 'onFlowComplete':
+          if (Array.isArray(value) && value.length === 0) break
+          throw new Problem(`"${key}" hooks have no tapflow equivalent — move their commands into the flow`)
+        default:
+          throw new Problem(`config key "${key}" has no tapflow equivalent`)
+      }
+    } catch (e) {
+      if (!(e instanceof Problem)) throw e
+      ctx.issues.push({ file, line, command: key, kind: 'unconverted', reason: e.message })
+    }
+  }
+  return out
+}
+
+/**
+ * An env value is used as written, so one that still holds `${…}` — Maestro's `${USER || 'guest'}` default — would be
+ * typed literally. Only the values that survive `--env` are checked: passing the variable is the way out.
+ */
+function checkEnvValues(env: Record<string, string>, file: string, ctx: Context): void {
+  for (const [key, value] of Object.entries(env)) {
+    if (value.includes('${')) {
+      ctx.issues.push({
+        file, command: 'env', kind: 'unconverted',
+        reason: `env ${key} is "${value}", which tapflow cannot evaluate — pass --env ${key}=… to set it`,
+      })
+    }
+  }
+}
+
 /** The files Maestro runs for a directory: the flows directly in it, not its subflows' folders, never its config. */
 export function isMaestroFlowFile(name: string): boolean {
   return /\.ya?ml$/i.test(name) && !/^config\.ya?ml$/i.test(name)
@@ -141,6 +174,13 @@ function parseMaestroFile(text: string): ParsedFile {
   for (const doc of docs) {
     const err = doc.errors[0]
     if (err) throw new Problem(`invalid YAML — ${err.message}`)
+    // Maestro reads its fields as strings, so `inputText: 01012345678` types the leading zero and `PIN: 0000` is
+    // four zeros. YAML would read both as numbers and lose that, so a number whose text says more keeps its text.
+    visit(doc, {
+      Scalar(_, node) {
+        if (typeof node.value === 'number' && node.source !== undefined && node.source !== String(node.value)) node.value = node.source
+      },
+    })
   }
   const contents = docs.map((d) => d.contents).filter((c): c is NonNullable<typeof c> => c !== null)
   // `appId: x` / `---` / commands is the usual shape; a subflow may be the command list alone.
@@ -238,6 +278,8 @@ function inlineSubflow(rawArg: unknown, file: string, line: number | undefined, 
   // The subflow's own env is its default; what the caller passes wins, then whatever was set for the whole import.
   const subHeader = (parsed.header?.toJSON() ?? {}) as Record<string, unknown>
   const subEnv = { ...stringEnv(subHeader.env), ...env, ...passedEnv }
+  checkEnvValues(subEnv, subPath, ctx)
+  readHeader(parsed.header, subPath, parsed.lines, subEnv, ctx, true)
   ctx.stack.push(subPath)
   try {
     return convertCommands(parsed.commands, subPath, parsed.lines, subEnv, ctx)
@@ -342,6 +384,8 @@ function convertLaunch(arg: unknown, ctx: Context): Step[] {
   }
   if (args !== undefined) {
     if (!isRecord(args)) throw new Problem('"launchApp" arguments must be a mapping')
+    const problem = launchOptionsProblem({ arguments: args })
+    if (problem) throw new Problem(`"launchApp" ${problem}`)
     steps.push({ type: 'launchApp', options: { arguments: args as Record<string, string | number | boolean | string[]> } })
   } else {
     steps.push({ type: 'launchApp' })

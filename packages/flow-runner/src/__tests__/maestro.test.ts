@@ -140,6 +140,32 @@ tags:
     expect(flow.steps).toEqual([{ type: 'launchApp', options: { arguments: { onboarding: false } } }])
   })
 
+  it('keeps the text of a number YAML would shorten, as Maestro reads it', () => {
+    const flow = converted(convert({
+      'flow.yaml': 'env:\n  PIN: 0000\n---\n- inputText: 01012345678\n- inputText: ${PIN}\n- assertVisible: 10.50\n- inputText: 1234\n',
+    }))
+    expect(flow.steps).toEqual([
+      { type: 'inputText', text: '01012345678' },
+      { type: 'inputText', text: '0000' },
+      { type: 'assertVisible', selector: { text: '10.50' } },
+      { type: 'inputText', text: '1234' },
+    ])
+  })
+
+  it('does not convert an env default it would type literally, unless --env sets it', () => {
+    const files = { 'flow.yaml': "env:\n  USER: ${USER || 'guest'}\n---\n- inputText: ${USER}\n" }
+    const r = convert(files)
+    expect(r.status).toBe('not-converted')
+    expect(r.issues[0]).toMatchObject({ command: 'env', reason: expect.stringContaining('--env USER=') })
+    expect(converted(convert(files, 'flow.yaml', { USER: 'kim' })).steps).toEqual([{ type: 'inputText', text: 'kim' }])
+  })
+
+  it('refuses launch arguments the relay would refuse', () => {
+    const r = convert({ 'flow.yaml': '- launchApp:\n    arguments:\n      config:\n        a: 1\n' })
+    expect(r.status).toBe('not-converted')
+    expect(r.issues[0].command).toBe('launchApp')
+  })
+
   describe('env', () => {
     it('substitutes ${NAME} from the flow env, with --env winning', () => {
       const files = { 'flow.yaml': 'appId: ${APP}\nenv:\n  APP: com.a\n  USER: kim\n---\n- inputText: ${USER}@example.com\n' }
@@ -187,6 +213,19 @@ tags:
       })
       expect(r.status).toBe('not-converted')
       expect(r.issues).toEqual([{ file: path.join(ROOT, 'sub.yaml'), line: 2, command: 'repeat', kind: 'unconverted', reason: 'Maestro command "repeat" has no tapflow step' }])
+    })
+
+    it('reads a subflow\'s config with the same rules: hooks and another app are refused', () => {
+      const hooks = convert({
+        'flow.yaml': 'appId: a\n---\n- runFlow: sub.yaml\n',
+        'sub.yaml': 'appId: a\nonFlowComplete:\n  - assertVisible: Saved\n---\n- tapOn: Save\n',
+      })
+      expect(hooks.issues).toEqual([expect.objectContaining({ file: path.join(ROOT, 'sub.yaml'), line: 2, command: 'onFlowComplete' })])
+      const settings = convert({
+        'flow.yaml': 'appId: a\n---\n- runFlow: settings.yaml\n',
+        'settings.yaml': 'appId: com.apple.Preferences\n---\n- launchApp\n',
+      })
+      expect(settings.issues[0]).toMatchObject({ command: 'appId', reason: expect.stringContaining('not a') })
     })
 
     it('refuses a conditional runFlow, a missing subflow and a cycle', () => {

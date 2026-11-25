@@ -37,6 +37,8 @@ export interface ImportReport {
     status: ImportedFlow['status']
     /** Where the converted flow was written. Absent for a flow that was not converted. */
     output?: string
+    /** A file an earlier import wrote for this flow, left in place although this import did not convert it. */
+    staleOutput?: string
     issues: ImportIssue[]
   }>
 }

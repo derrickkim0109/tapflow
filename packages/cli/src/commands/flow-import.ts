@@ -73,19 +73,26 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
     }
   }
 
-  // Everything is serialized and read back before the first file is written, so a failure writes nothing.
-  const written: Array<{ result: ImportedFlow; output?: string; yaml?: string }> = []
-  try {
-    for (const { result, output } of results) {
-      if (result.status !== 'converted') {
-        written.push({ result })
-        continue
-      }
-      const yaml = flowToYaml(result.flow, `Converted from ${display(result.source)} by \`tapflow flow import --from ${opts.from}\`.`)
+  // Every flow is serialized and read back before the first file is written. A flow that does not read back is
+  // reported like any other that did not convert, rather than costing the others their output.
+  const written: Written[] = []
+  for (const { result, output } of results) {
+    if (result.status !== 'converted') {
+      written.push({ result, ...(fs.existsSync(output) ? { stale: output } : {}) })
+      continue
+    }
+    const yaml = flowToYaml(result.flow, `Converted from ${display(result.source)} by \`tapflow flow import --from ${opts.from}\`.`)
+    try {
       // What is written is what `flow run` will read, so it is read back the way `flow run` reads it.
       parseFlow(yaml, output)
       written.push({ result, output, yaml })
+    } catch (e) {
+      const issue = { file: result.source, command: '(output)', kind: 'unconverted' as const, reason: `the converted flow does not read back: ${(e as Error).message}` }
+      written.push({ result: { source: result.source, status: 'not-converted', issues: [...result.issues, issue] }, ...(fs.existsSync(output) ? { stale: output } : {}) })
     }
+  }
+  // A write that fails part way leaves the files before it; the error names the one that failed.
+  try {
     for (const { output, yaml } of written) {
       if (output === undefined || yaml === undefined) continue
       fs.mkdirSync(path.dirname(output), { recursive: true })
@@ -103,10 +110,11 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
       format: 'tapflow-import-report',
       version: 1,
       from: opts.from,
-      flows: written.map(({ result, output }) => ({
+      flows: written.map(({ result, output, stale }) => ({
         source: display(result.source),
         status: result.status,
         ...(output !== undefined ? { output: display(output) } : {}),
+        ...(stale !== undefined ? { staleOutput: display(stale) } : {}),
         issues: result.issues.map((i) => ({ ...i, file: display(i.file) })),
       })),
     }
@@ -123,12 +131,21 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
   return written.some((w) => w.result.status !== 'converted') ? EXIT_NOT_CONVERTED : 0
 }
 
-function printResults(written: Array<{ result: ImportedFlow; output?: string }>): void {
-  for (const { result, output } of written) {
+/**
+ * `stale` is a file an earlier import wrote for a flow that no longer converts. It is left in place — no tapflow
+ * command deletes what a person may have edited — but named, because `flow run` would keep replaying it.
+ */
+interface Written { result: ImportedFlow; output?: string; yaml?: string; stale?: string }
+
+function printResults(written: Written[]): void {
+  for (const { result, output, stale } of written) {
     if (output !== undefined) {
       console.log(`${GREEN}✓${R} ${display(result.source)} ${DIM}→${R} ${display(output)}`)
     } else {
       console.log(`${RED}✗${R} ${display(result.source)} ${DIM}— not converted, nothing written${R}`)
+      if (stale !== undefined) {
+        console.log(`    ${YELLOW}stale${R} ${display(stale)} is from an earlier import and does not reflect this source — \`flow run\` still replays it`)
+      }
     }
     for (const issue of result.issues) {
       const where = `${display(issue.file)}${issue.line !== undefined ? `:${issue.line}` : ''}`

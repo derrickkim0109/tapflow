@@ -430,6 +430,10 @@ tapflow flow import --from maestro .maestro/ --report import-report.json
 
 `id`는 적힌 그대로 옮깁니다. Android에서 tapflow는 `com.example.app:id/login` 같은 전체 리소스 ID로 찾으므로, Maestro의 `id: login`은 변환된 플로우에 패키지 접두사를 붙여야 할 수 있습니다.
 
+변환된 셀렉터는 tapflow 셀렉터 방식으로 찾으므로 Maestro보다 두 가지가 느슨합니다. 정확히 맞는 요소가 없으면 일부만 맞는 텍스트도 찾고, 대소문자를 구분합니다. 변환된 `assertNotVisible`은 직접 확인하세요. Maestro에서는 `Error` 때문에 실패할 `error`가 tapflow에서는 통과할 수 있습니다.
+
+예전 가져오기로 쓴 플로우가 이제 변환되지 않으면, 옛 파일은 그대로 두고 `stale`로 표시합니다. `flow run`이 그 파일을 계속 실행하기 때문입니다.
+
 `--report`로 쓰는 리포트에는 원본 플로우마다 상태, 쓴 파일, 옮기지 못한 명령이 파일·줄 번호와 함께 들어갑니다.
 
 ```json

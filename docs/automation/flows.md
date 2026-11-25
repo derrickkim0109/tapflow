@@ -430,6 +430,10 @@ These have no tapflow step, and a flow that uses one is not converted:
 
 An `id` is copied as written. On Android, tapflow matches an element's full resource ID, such as `com.example.app:id/login`, so a Maestro `id: login` may need the package prefix added to the converted flow.
 
+Converted selectors match the way tapflow selectors do, which is looser than Maestro in two ways: text falls back to a partial match when nothing matches exactly, and case counts. Check each converted `assertNotVisible` by hand: one that Maestro would fail on `Error` can pass in tapflow when it was written as `error`.
+
+When a flow no longer converts but an earlier import wrote it, the old file is left in place and listed as `stale`, because `flow run` would keep replaying it.
+
 The report, written with `--report`, lists each source flow with its status, the file it was written to, and every command it could not keep, by file and line:
 
 ```json

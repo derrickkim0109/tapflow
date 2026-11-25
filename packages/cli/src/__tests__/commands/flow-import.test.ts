@@ -87,6 +87,15 @@ describe('cmdFlowImport', () => {
     expect(fs.readFileSync(path.join(dir, 'out/a.yaml'), 'utf-8')).toMatch(/^# Converted from/)
   })
 
+  it('names a file an earlier import left for a flow that no longer converts, and leaves it in place', async () => {
+    write('m/a.yaml', '- launchApp\n- takeScreenshot: x\n')
+    write('out/a.yaml', 'from last week\n')
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'out', report: 'r.json' })).toBe(1)
+    expect(fs.readFileSync(path.join(dir, 'out/a.yaml'), 'utf-8')).toBe('from last week\n')
+    const report = JSON.parse(fs.readFileSync(path.join(dir, 'r.json'), 'utf-8')) as ImportReport
+    expect(report.flows[0]).toMatchObject({ status: 'not-converted', staleOutput: 'out/a.yaml' })
+  })
+
   it.each([
     ['no --from', ['m'], {}],
     ['an unknown format', ['m'], { from: 'appium' }],
