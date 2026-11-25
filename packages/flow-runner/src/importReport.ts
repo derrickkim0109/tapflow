@@ -16,7 +16,8 @@ export interface ImportIssue {
   command: string
   /**
    * `unconverted` blocks the whole flow: no flow is written for it.
-   * `dropped` is a command with no effect on a tapflow replay (a wait tapflow already does), so the flow still converts.
+   * `dropped` is a command, or an option of one, left out because tapflow already does it or fails louder without it
+   * (a wait, a tap retry), so the flow still converts.
    */
   kind: 'unconverted' | 'dropped'
   reason: string

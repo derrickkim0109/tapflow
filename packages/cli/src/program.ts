@@ -24,18 +24,18 @@ import { cmdMigrate, cmdMigrateDataDir, cmdMigrateNetFilter } from './commands/m
 
 // Options a `flow` subcommand does not take, by the key cac parses them into. A `--no-*` option is set to `false` when
 // given and `true` otherwise, so only `false` means it was typed.
-const RUN_ONLY_OPTIONS: Record<string, string> = {
+export const RUN_ONLY_OPTIONS: Record<string, string> = {
   relay: '--relay', token: '--token', session: '--session', device: '--device', build: '--build', install: '--no-install',
   junit: '--junit', artifacts: '--artifacts', timeout: '--timeout', serviceTier: '--service-tier', keep: '--keep',
   admissionTimeout: '--admission-timeout', record: '--no-record', reset: '--no-reset', includeTags: '--include-tags',
   excludeTags: '--exclude-tags', parallel: '--parallel', platform: '--platform', secret: '--secret',
 }
-const IMPORT_ONLY_OPTIONS: Record<string, string> = {
+export const IMPORT_ONLY_OPTIONS: Record<string, string> = {
   from: '--from', out: '--out', env: '--env', report: '--report', overwrite: '--overwrite',
 }
 const NEGATED = new Set(['install', 'record', 'reset'])
 
-function misplaced(opts: object, options: Record<string, string>): string[] {
+export function misplaced(opts: object, options: Record<string, string>): string[] {
   const given = opts as Record<string, unknown>
   return Object.entries(options)
     .filter(([key]) => (NEGATED.has(key) ? given[key] === false : given[key] !== undefined))

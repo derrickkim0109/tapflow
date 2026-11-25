@@ -173,6 +173,30 @@ tags:
     expect(r.issues[0].command).toBe('launchApp')
   })
 
+  it('reports the tapOn retry options it drops', () => {
+    const r = convert({ 'flow.yaml': '- tapOn:\n    text: Next\n    retryTapIfNoChange: true\n' })
+    expect(converted(r).steps).toEqual([{ type: 'tapOn', selector: { text: 'Next' } }])
+    expect(r.issues).toEqual([expect.objectContaining({ command: 'tapOn', kind: 'dropped', line: 1, reason: expect.stringContaining('retryTapIfNoChange') })])
+  })
+
+  it('types any scalar inputText as Maestro does, the empty string included', () => {
+    expect(converted(convert({ 'flow.yaml': '- inputText: true\n- inputText: ""\n' })).steps).toEqual([
+      { type: 'inputText', text: 'true' },
+      { type: 'inputText', text: '' },
+    ])
+  })
+
+  it('refuses an eraseText too long to be one key press per character', () => {
+    expect(converted(convert({ 'flow.yaml': '- eraseText: 1000\n' })).steps).toHaveLength(1000)
+    expect(convert({ 'flow.yaml': '- eraseText: 1001\n' }).issues[0].reason).toMatch(/over 1000/)
+  })
+
+  it('accepts launchApp with an appId in a flow that names none, in either form', () => {
+    for (const text of ['- launchApp: com.a\n', '- launchApp:\n    appId: com.a\n']) {
+      expect(converted(convert({ 'flow.yaml': text })).steps).toEqual([{ type: 'launchApp' }])
+    }
+  })
+
   describe('env', () => {
     it('substitutes ${NAME} from the flow env, with --env winning', () => {
       const files = { 'flow.yaml': 'appId: ${APP}\nenv:\n  APP: com.a\n  USER: kim\n---\n- inputText: ${USER}@example.com\n' }
@@ -206,6 +230,14 @@ tags:
         { type: 'tapOn', selector: { text: 'Sign in' } },
         { type: 'assertVisible', selector: { text: 'Home' } },
       ])
+    })
+
+    it('substitutes ${NAME} in the short runFlow form too', () => {
+      const flow = converted(convert({
+        'flow.yaml': 'env:\n  DIR: common\n---\n- runFlow: ${DIR}/a.yaml\n',
+        'common/a.yaml': '- tapOn: A\n',
+      }))
+      expect(flow.steps).toEqual([{ type: 'tapOn', selector: { text: 'A' } }])
     })
 
     it('inlines commands given in place', () => {

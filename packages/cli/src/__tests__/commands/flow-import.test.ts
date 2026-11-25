@@ -96,6 +96,12 @@ describe('cmdFlowImport', () => {
     expect(report.flows[0]).toMatchObject({ status: 'not-converted', staleOutput: 'out/a.yaml' })
   })
 
+  it('refuses an --out that would replace the Maestro flows themselves, even with --overwrite', async () => {
+    write('m/a.yaml', '- launchApp\n')
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'm', overwrite: true })).toBe(2)
+    expect(fs.readFileSync(path.join(dir, 'm/a.yaml'), 'utf-8')).toBe('- launchApp\n')
+  })
+
   it.each([
     ['no --from', ['m'], {}],
     ['an unknown format', ['m'], { from: 'appium' }],

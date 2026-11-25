@@ -3,6 +3,7 @@ import path from 'path'
 import {
   convertMaestroFlow,
   isMaestroFlowFile,
+  isEnvName,
   flowToYaml,
   parseFlow,
   type ImportedFlow,
@@ -61,7 +62,14 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
   }
 
   const outDir = path.resolve(opts.out ?? DEFAULT_IMPORT_OUT)
-  const results = files.map((file) => ({ result: convertMaestroFlow(file, { env }), output: path.join(outDir, path.relative(base, file)) }))
+  const outputOf = (file: string): string => path.join(outDir, path.relative(base, file))
+  // `--overwrite` exists for re-importing, which an output landing on its own source would turn into deleting it.
+  const onSource = files.filter((f) => outputOf(f) === f)
+  if (onSource.length > 0) {
+    console.error(`✗ --out ${display(outDir)} would replace the Maestro flows themselves (${onSource.map(display).join(', ')}) — write to another directory`)
+    return EXIT_USAGE
+  }
+  const results = files.map((file) => ({ result: convertMaestroFlow(file, { env }), output: outputOf(file) }))
 
   // Every flow is serialized and read back before the first file is written. A flow that does not read back is
   // reported like any other that did not convert, rather than costing the others their output.
@@ -172,7 +180,7 @@ function parseEnvPairs(env: string | string[] | undefined): Record<string, strin
   for (const pair of pairs) {
     const eq = String(pair).indexOf('=')
     const key = eq > 0 ? String(pair).slice(0, eq) : ''
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`--env takes KEY=VALUE (got "${String(pair)}")`)
+    if (!isEnvName(key)) throw new Error(`--env takes KEY=VALUE (got "${String(pair)}")`)
     out[key] = String(pair).slice(eq + 1)
   }
   return out
@@ -210,7 +218,12 @@ function collectFlowFiles(inputs: string[]): { files: string[]; base: string } {
 function commonDir(dirs: string[]): string {
   return dirs.reduce((acc, d) => {
     let cur = acc
-    while (cur !== d && !d.startsWith(cur.endsWith(path.sep) ? cur : cur + path.sep)) cur = path.dirname(cur)
+    while (cur !== d && !d.startsWith(cur.endsWith(path.sep) ? cur : cur + path.sep)) {
+      const parent = path.dirname(cur)
+      // A root is its own parent: inputs on two Windows drives share no directory to keep paths relative to.
+      if (parent === cur) throw new Error(`the inputs share no directory (${acc} and ${d}) — import them separately`)
+      cur = parent
+    }
     return cur
   })
 }

@@ -33,6 +33,8 @@ interface Context {
   /** Files being inlined, outermost first, to refuse a `runFlow` cycle. */
   stack: string[]
   appId?: string
+  /** Options the command being converted dropped; turned into `dropped` issues at its line. */
+  dropped: string[]
 }
 
 interface ParsedFile {
@@ -42,6 +44,13 @@ interface ParsedFile {
 }
 
 const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+// Maestro's own default is 50; past this the expansion into one key press per character stops being a flow step.
+const MAX_ERASE_CHARACTERS = 1000
+
+/** Whether `name` can be referenced as `${name}` in a Maestro flow, and so set with `--env`. */
+export function isEnvName(name: string): boolean {
+  return NAME_PATTERN.test(name)
+}
 const DEFAULT_ERASE_CHARACTERS = 50
 // Maestro's own default, so a converted swipe moves as fast as the one it came from.
 const DEFAULT_SWIPE_DURATION_MS = 400
@@ -59,7 +68,7 @@ const SWIPE_DIRECTIONS: Record<string, { from: [number, number]; to: [number, nu
 const KEYS: Record<string, string> = { enter: 'Enter', backspace: 'Backspace', tab: 'Tab' }
 
 export function convertMaestroFlow(file: string, options: MaestroImportOptions = {}): ImportedFlow {
-  const ctx: Context = { issues: [], readFile: options.readFile ?? ((f) => readFileSync(f, 'utf-8')), stack: [path.resolve(file)] }
+  const ctx: Context = { issues: [], readFile: options.readFile ?? ((f) => readFileSync(f, 'utf-8')), stack: [path.resolve(file)], dropped: [] }
   const fail = (reason: string, line?: number, command = '(file)'): ImportedFlow => {
     ctx.issues.push({ file, ...(line !== undefined ? { line } : {}), command, kind: 'unconverted', reason })
     return { source: file, status: 'not-converted', issues: ctx.issues }
@@ -208,11 +217,13 @@ function convertCommands(commands: Node, file: string, lines: LineCounter, env: 
         steps.push(...inlineSubflow(arg, file, line, env, ctx))
         continue
       }
+      ctx.dropped = []
       const converted = convertCommand(name, substitute(arg, env), ctx)
       if (converted === 'dropped') {
         ctx.issues.push({ file, line, command: name, kind: 'dropped', reason: 'tapflow already waits for the screen before every selector' })
       } else {
         steps.push(...converted)
+        for (const reason of ctx.dropped) ctx.issues.push({ file, line, command: name, kind: 'dropped', reason })
       }
     } catch (e) {
       if (!(e instanceof Problem)) throw e
@@ -227,7 +238,7 @@ function inlineSubflow(rawArg: unknown, file: string, line: number | undefined, 
   let passedEnv: Record<string, string> = {}
   let inline: unknown
   if (typeof rawArg === 'string') {
-    target = rawArg
+    target = requireString(substitute(rawArg, env), 'runFlow file')
   } else if (isRecord(rawArg)) {
     const { file: subfile, env: subEnv, commands, when, label: _label, ...rest } = rawArg
     if (when !== undefined) throw new Problem('a conditional "runFlow" (when) has no tapflow step — tapflow flows have no branches')
@@ -289,15 +300,15 @@ function convertCommand(name: string, arg: unknown, ctx: Context): Step[] | 'dro
       if (appId === undefined && ctx.appId === undefined) throw new Problem('"clearState" needs an app id — set "appId" in the config section')
       return [appId === undefined || appId === ctx.appId ? { type: 'clearState' } : { type: 'clearState', appId }]
     }
-    case 'tapOn': return [{ type: 'tapOn', selector: convertSelector(arg, 'tapOn', TAP_OPTIONS) }]
-    case 'assertVisible': return [{ type: 'assertVisible', selector: convertSelector(arg, 'assertVisible', {}) }]
-    case 'assertNotVisible': return [{ type: 'assertNotVisible', selector: convertSelector(arg, 'assertNotVisible', {}) }]
+    case 'tapOn': return [{ type: 'tapOn', selector: convertSelector(arg, 'tapOn', ctx, TAP_RETRY_OPTIONS) }]
+    case 'assertVisible': return [{ type: 'assertVisible', selector: convertSelector(arg, 'assertVisible', ctx) }]
+    case 'assertNotVisible': return [{ type: 'assertNotVisible', selector: convertSelector(arg, 'assertNotVisible', ctx) }]
     case 'extendedWaitUntil': {
       if (!isRecord(arg)) throw new Problem('"extendedWaitUntil" takes { visible | notVisible, timeout }')
       const { visible, notVisible, timeout, label: _label, ...rest } = arg
       rejectKeys(rest, 'extendedWaitUntil')
       if ((visible === undefined) === (notVisible === undefined)) throw new Problem('"extendedWaitUntil" needs exactly one of "visible" or "notVisible"')
-      const selector = withTimeout(convertSelector(visible ?? notVisible, 'extendedWaitUntil', {}), timeout)
+      const selector = withTimeout(convertSelector(visible ?? notVisible, 'extendedWaitUntil', ctx), timeout)
       return [{ type: visible !== undefined ? 'assertVisible' : 'assertNotVisible', selector }]
     }
     case 'waitForAnimationToEnd': return 'dropped'
@@ -308,8 +319,10 @@ function convertCommand(name: string, arg: unknown, ctx: Context): Step[] | 'dro
         rejectKeys(rest, 'inputText')
         text = t
       }
-      if (typeof text === 'number') text = String(text)
-      return [{ type: 'inputText', text: requireString(text, 'inputText') }]
+      // Maestro types whatever scalar it is given, `true` and the empty string included.
+      if (typeof text === 'number' || typeof text === 'boolean') text = String(text)
+      if (typeof text !== 'string') throw new Problem('"inputText" takes text')
+      return [{ type: 'inputText', text }]
     }
     case 'eraseText': {
       let count: unknown = arg
@@ -320,6 +333,7 @@ function convertCommand(name: string, arg: unknown, ctx: Context): Step[] | 'dro
       }
       const n = count === undefined || count === null ? DEFAULT_ERASE_CHARACTERS : Number(count)
       if (!Number.isInteger(n) || n < 1) throw new Problem('"eraseText" takes a positive number of characters')
+      if (n > MAX_ERASE_CHARACTERS) throw new Problem(`"eraseText" ${n} is over ${MAX_ERASE_CHARACTERS} characters, each of which would be its own key press`)
       return Array.from({ length: n }, (): Step => ({ type: 'pressKey', code: 'Backspace' }))
     }
     case 'pressKey': {
@@ -359,7 +373,7 @@ function convertLaunch(arg: unknown, ctx: Context): Step[] {
   if (!isRecord(arg)) throw new Problem('"launchApp" takes an app id, options, or nothing')
   const { appId, clearState, clearKeychain, stopApp, permissions, arguments: args, label: _label, ...rest } = arg
   rejectKeys(rest, 'launchApp')
-  if (appId !== undefined && appId !== ctx.appId) throw new Problem(`"launchApp" ${String(appId)} is another app — tapflow launches the build under test`)
+  if (appId !== undefined && ctx.appId !== undefined && appId !== ctx.appId) throw new Problem(`"launchApp" ${String(appId)} is another app — tapflow launches the build under test`)
   if (clearKeychain === true) throw new Problem('"launchApp" clearKeychain has no tapflow equivalent')
   if (stopApp === false) throw new Problem('"launchApp" stopApp: false has no tapflow equivalent — tapflow always relaunches')
   if (permissions !== undefined) throw new Problem('"launchApp" permissions have no tapflow equivalent')
@@ -404,10 +418,10 @@ function percentPoint(v: unknown, key: string): [number, number] {
 }
 
 // tapOn options that only tune how Maestro retries a tap. Without them a tap that missed fails the next step,
-// so the flow fails louder rather than passing.
-const TAP_OPTIONS: Record<string, 'drop'> = { retryTapIfNoChange: 'drop', waitToSettleTimeoutMs: 'drop' }
+// so the flow fails louder rather than passing; each is still reported as dropped.
+const TAP_RETRY_OPTIONS: ReadonlySet<string> = new Set(['retryTapIfNoChange', 'waitToSettleTimeoutMs'])
 
-function convertSelector(arg: unknown, command: string, droppable: Record<string, 'drop'>): Selector {
+function convertSelector(arg: unknown, command: string, ctx: Context, droppable: ReadonlySet<string> = new Set()): Selector {
   if (typeof arg === 'number') arg = String(arg)
   if (typeof arg === 'string') return { text: literalText(arg) }
   if (!isRecord(arg)) throw new Problem(`"${command}" takes text or a selector`)
@@ -416,8 +430,8 @@ function convertSelector(arg: unknown, command: string, droppable: Record<string
     throw new Problem(`"optional: true" has no tapflow equivalent — a tapflow step either runs or fails the flow`)
   }
   for (const key of Object.keys(rest)) {
-    if (droppable[key] === 'drop') continue
-    throw new Problem(`selector option "${key}" has no tapflow equivalent`)
+    if (!droppable.has(key)) throw new Problem(`selector option "${key}" has no tapflow equivalent`)
+    ctx.dropped.push(`"${key}" tunes how Maestro retries a tap; tapflow taps once and the next step fails if it missed`)
   }
   if (text === undefined && id === undefined) throw new Problem(`"${command}" selector needs "text" or "id"`)
   const selector: Selector = {}
