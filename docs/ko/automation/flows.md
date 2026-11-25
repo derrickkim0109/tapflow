@@ -430,7 +430,11 @@ tapflow flow import --from maestro .maestro/ --report import-report.json
 
 `id`는 적힌 그대로 옮깁니다. Android에서 tapflow는 `com.example.app:id/login` 같은 전체 리소스 ID로 찾으므로, Maestro의 `id: login`은 변환된 플로우에 패키지 접두사를 붙여야 할 수 있습니다.
 
-변환된 셀렉터는 tapflow 셀렉터 방식으로 찾으므로 Maestro보다 두 가지가 느슨합니다. 정확히 맞는 요소가 없으면 일부만 맞는 텍스트도 찾고, 대소문자를 구분합니다. 변환된 `assertNotVisible`은 직접 확인하세요. Maestro에서는 `Error` 때문에 실패할 `error`가 tapflow에서는 통과할 수 있습니다.
+변환된 셀렉터는 Maestro가 아니라 tapflow 셀렉터 방식으로 찾으므로, 변환된 검증 스텝은 직접 확인하세요.
+
+- 정확히 맞는 요소가 없으면 일부만 맞는 텍스트도 찾습니다. Maestro는 전체 텍스트가 맞아야 합니다. 변환된 `assertVisible: Welcome`은 `Welcome back`만 보이는 화면에서도 통과합니다.
+- 대소문자를 구분합니다. Maestro는 구분하지 않습니다. 변환된 `assertNotVisible: error`는 화면에 `Error`가 있어도 통과합니다.
+- Android에서 패키지 접두사가 없는 `id`는 아무 요소에도 맞지 않으므로, 그런 `id`를 쓴 `assertNotVisible`은 접두사를 붙이기 전까지 항상 통과합니다.
 
 예전 가져오기로 쓴 플로우가 이제 변환되지 않으면, 옛 파일은 그대로 두고 `stale`로 표시합니다. `flow run`이 그 파일을 계속 실행하기 때문입니다.
 

@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs'
 import path from 'path'
-import { LineCounter, isMap, isScalar, isSeq, parseAllDocuments, visit, type Node, type YAMLMap } from 'yaml'
+import { LineCounter, isMap, isPair, isScalar, isSeq, parseAllDocuments, visit, type Node, type YAMLMap } from 'yaml'
 import type { Flow, Selector, Step } from './schema.js'
 import { launchOptionsProblem } from '@tapflowio/protocol/launch'
 import type { ImportedFlow, ImportIssue } from './importReport.js'
@@ -80,7 +80,6 @@ export function convertMaestroFlow(file: string, options: MaestroImportOptions =
     return fail((e as Error).message, undefined, 'env')
   }
   const env = { ...flowEnv, ...(options.env ?? {}) }
-  checkEnvValues(env, file, ctx)
 
   const { appId, name, tags } = readHeader(header, file, lines, env, ctx, false)
   ctx.appId = appId
@@ -147,21 +146,6 @@ function readHeader(
   return out
 }
 
-/**
- * An env value is used as written, so one that still holds `${…}` — Maestro's `${USER || 'guest'}` default — would be
- * typed literally. Only the values that survive `--env` are checked: passing the variable is the way out.
- */
-function checkEnvValues(env: Record<string, string>, file: string, ctx: Context): void {
-  for (const [key, value] of Object.entries(env)) {
-    if (value.includes('${')) {
-      ctx.issues.push({
-        file, command: 'env', kind: 'unconverted',
-        reason: `env ${key} is "${value}", which tapflow cannot evaluate — pass --env ${key}=… to set it`,
-      })
-    }
-  }
-}
-
 /** The files Maestro runs for a directory: the flows directly in it, not its subflows' folders, never its config. */
 export function isMaestroFlowFile(name: string): boolean {
   return /\.ya?ml$/i.test(name) && !/^config\.ya?ml$/i.test(name)
@@ -176,9 +160,12 @@ function parseMaestroFile(text: string): ParsedFile {
     if (err) throw new Problem(`invalid YAML — ${err.message}`)
     // Maestro reads its fields as strings, so `inputText: 01012345678` types the leading zero and `PIN: 0000` is
     // four zeros. YAML would read both as numbers and lose that, so a number whose text says more keeps its text.
+    // Launch arguments are the exception: Maestro hands them over as numbers, and an Android app reads them that way.
     visit(doc, {
-      Scalar(_, node) {
-        if (typeof node.value === 'number' && node.source !== undefined && node.source !== String(node.value)) node.value = node.source
+      Scalar(_, node, ancestors) {
+        if (typeof node.value !== 'number' || node.source === undefined || node.source === String(node.value)) return
+        if (ancestors.some((a) => isPair(a) && isScalar(a.key) && a.key.value === 'arguments')) return
+        node.value = node.source
       },
     })
   }
@@ -278,7 +265,6 @@ function inlineSubflow(rawArg: unknown, file: string, line: number | undefined, 
   // The subflow's own env is its default; what the caller passes wins, then whatever was set for the whole import.
   const subHeader = (parsed.header?.toJSON() ?? {}) as Record<string, unknown>
   const subEnv = { ...stringEnv(subHeader.env), ...env, ...passedEnv }
-  checkEnvValues(subEnv, subPath, ctx)
   readHeader(parsed.header, subPath, parsed.lines, subEnv, ctx, true)
   ctx.stack.push(subPath)
   try {
@@ -486,6 +472,8 @@ function substitute(value: unknown, env: Record<string, string>): unknown {
       const key = expr.trim()
       if (!NAME_PATTERN.test(key)) throw new Problem(`"\${${expr}}" is a JavaScript expression — tapflow substitutes only \${NAME} from env`)
       if (!Object.hasOwn(env, key)) throw new Problem(`\${${key}} is not set — define it in the flow's env or pass --env ${key}=…`)
+      // A value that still holds `\${…}` — Maestro's `\${USER || 'guest'}` default — would be typed literally.
+      if (env[key].includes('${')) throw new Problem(`\${${key}} is "${env[key]}", which tapflow cannot evaluate — pass --env ${key}=… to set it`)
       return env[key]
     })
   }

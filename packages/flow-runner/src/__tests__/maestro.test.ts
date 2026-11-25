@@ -156,8 +156,15 @@ tags:
     const files = { 'flow.yaml': "env:\n  USER: ${USER || 'guest'}\n---\n- inputText: ${USER}\n" }
     const r = convert(files)
     expect(r.status).toBe('not-converted')
-    expect(r.issues[0]).toMatchObject({ command: 'env', reason: expect.stringContaining('--env USER=') })
+    expect(r.issues).toEqual([expect.objectContaining({ command: 'inputText', line: 4, reason: expect.stringContaining('--env USER=') })])
     expect(converted(convert(files, 'flow.yaml', { USER: 'kim' })).steps).toEqual([{ type: 'inputText', text: 'kim' }])
+    // Only a variable the commands use is checked.
+    expect(convert({ 'flow.yaml': "env:\n  A: kim\n  B: ${B || 'x'}\n---\n- inputText: ${A}\n" }).status).toBe('converted')
+  })
+
+  it('keeps launch arguments numbers, as Maestro passes them', () => {
+    const flow = converted(convert({ 'flow.yaml': 'appId: a\n---\n- launchApp:\n    arguments:\n      ratio: 1.0\n' }))
+    expect(flow.steps).toEqual([{ type: 'launchApp', options: { arguments: { ratio: 1 } } }])
   })
 
   it('refuses launch arguments the relay would refuse', () => {

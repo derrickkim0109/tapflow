@@ -63,16 +63,6 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
   const outDir = path.resolve(opts.out ?? DEFAULT_IMPORT_OUT)
   const results = files.map((file) => ({ result: convertMaestroFlow(file, { env }), output: path.join(outDir, path.relative(base, file)) }))
 
-  // Every collision is named before anything is written: a converted flow is likely to have been edited since.
-  if (!opts.overwrite) {
-    const taken = results.filter((r) => r.result.status === 'converted' && fs.existsSync(r.output)).map((r) => display(r.output))
-    if (taken.length > 0) {
-      console.error(`✗ ${taken.length === 1 ? 'this file exists' : 'these files exist'} — pass --overwrite to replace, or --out to write elsewhere:`)
-      for (const t of taken) console.error(`    ${t}`)
-      return EXIT_USAGE
-    }
-  }
-
   // Every flow is serialized and read back before the first file is written. A flow that does not read back is
   // reported like any other that did not convert, rather than costing the others their output.
   const written: Written[] = []
@@ -91,15 +81,27 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
       written.push({ result: { source: result.source, status: 'not-converted', issues: [...result.issues, issue] }, ...(fs.existsSync(output) ? { stale: output } : {}) })
     }
   }
+  // Every collision is named before anything is written: a converted flow is likely to have been edited since.
+  // Checked after the read-back, so a flow that did not read back is reported, not counted as a collision.
+  if (!opts.overwrite) {
+    const taken = written.filter((w) => w.output !== undefined && fs.existsSync(w.output)).map((w) => display(w.output!))
+    if (taken.length > 0) {
+      console.error(`✗ ${taken.length === 1 ? 'this file exists' : 'these files exist'} — pass --overwrite to replace, or --out to write elsewhere:`)
+      for (const t of taken) console.error(`    ${t}`)
+      return EXIT_USAGE
+    }
+  }
   // A write that fails part way leaves the files before it; the error names the one that failed.
+  const done: string[] = []
   try {
     for (const { output, yaml } of written) {
       if (output === undefined || yaml === undefined) continue
       fs.mkdirSync(path.dirname(output), { recursive: true })
       fs.writeFileSync(output, yaml)
+      done.push(display(output))
     }
   } catch (e) {
-    console.error(`✗ ${(e as Error).message}`)
+    console.error(`✗ ${(e as Error).message}${done.length > 0 ? ` (already written: ${done.join(', ')})` : ''}`)
     return EXIT_USAGE
   }
 
