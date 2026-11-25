@@ -415,6 +415,32 @@ With `--build`, a flow whose `appId` differs from that build's bundle ID is skip
 
 With a token, the run is recorded on the relay. Recording never changes the exit code. See [Run records](/automation/flows#run-records).
 
+## `tapflow flow import`
+
+Convert Maestro flows into tapflow flows. Nothing is run and no relay is needed.
+
+```sh
+tapflow flow import --from maestro .maestro/
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--from <format>` | — | Format of the flows to convert. Required. Only `maestro` for now. |
+| `--out <dir>` | `.tapflow/flows` | Where converted flows are written. Each keeps its path relative to the inputs. |
+| `--env <KEY=VALUE>` | — | Value for `${KEY}` in the source flows. Repeat for more than one. Wins over the flow's own `env`. |
+| `--report <path>` | — | Write what was and was not converted as JSON |
+| `--overwrite` | — | Replace converted flows that already exist. Without it, the import stops before writing anything. |
+
+A directory contributes the flows directly in it, as Maestro runs a directory, and never `config.yaml`. `runFlow` subflows are inlined into the flow that runs them, and `${NAME}` values are filled in, so the written flow does not depend on the Maestro files afterwards.
+
+A flow converts whole or not at all. When one of its commands has no tapflow step, no file is written for that flow, and every such command is listed with its file and line. A flow with a command left out could pass without the assertion that command made. See [Importing Maestro flows](/automation/flows#importing-maestro-flows) for what converts.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Every flow converted |
+| `1` | At least one flow was not converted. The output and the report say why. |
+| `2` | Usage error, a missing input, or a file that already exists without `--overwrite` |
+
 ## `tapflow token set`
 
 Store a token in the [token file](/automation/mcp-server#token-file) the MCP server and `tapflow flow run` read. The relay is asked first, and a token it does not accept is not stored.

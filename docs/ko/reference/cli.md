@@ -394,6 +394,32 @@ tapflow flow run .tapflow/flows/login-smoke.yaml
 
 토큰을 주면 실행 결과를 릴레이에 기록합니다. 기록은 종료 코드를 바꾸지 않습니다. 자세한 내용은 [실행 기록](/ko/automation/flows#run-records)을 참고하세요.
 
+## `tapflow flow import`
+
+Maestro 플로우를 tapflow 플로우로 변환합니다. 아무것도 실행하지 않으며 릴레이가 필요 없습니다.
+
+```sh
+tapflow flow import --from maestro .maestro/
+```
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--from <format>` | — | 변환할 플로우의 형식. 필수. 지금은 `maestro`만 지원합니다. |
+| `--out <dir>` | `.tapflow/flows` | 변환한 플로우를 쓸 디렉터리. 입력 기준 상대 경로를 그대로 유지합니다. |
+| `--env <KEY=VALUE>` | — | 원본 플로우의 `${KEY}`에 넣을 값. 여러 개면 반복합니다. 플로우 자체의 `env`보다 우선합니다. |
+| `--report <path>` | — | 변환한 것과 변환하지 못한 것을 JSON으로 기록 |
+| `--overwrite` | — | 이미 있는 변환 결과를 덮어씀. 없으면 아무것도 쓰기 전에 멈춥니다. |
+
+디렉터리를 주면 Maestro가 디렉터리를 실행할 때처럼 그 안에 바로 있는 플로우만 읽고, `config.yaml`은 읽지 않습니다. `runFlow` 하위 플로우는 호출한 플로우 안에 펼쳐 넣고 `${NAME}` 값도 채우므로, 쓰인 플로우는 이후 Maestro 파일에 의존하지 않습니다.
+
+플로우는 통째로 변환되거나 아예 변환되지 않습니다. 명령 하나라도 대응하는 tapflow 스텝이 없으면 그 플로우는 파일을 쓰지 않고, 그런 명령을 모두 파일·줄 번호와 함께 보여 줍니다. 명령을 뺀 플로우는 그 명령이 하던 검증 없이 통과할 수 있기 때문입니다. 무엇이 변환되는지는 [Maestro 플로우 가져오기](/ko/automation/flows#importing-maestro-flows)를 보세요.
+
+| 종료 코드 | 의미 |
+|-----------|------|
+| `0` | 모든 플로우를 변환함 |
+| `1` | 변환하지 못한 플로우가 하나 이상 있음. 출력과 리포트에 이유가 있습니다. |
+| `2` | 사용법 오류, 없는 입력, 또는 `--overwrite` 없이 이미 있는 파일 |
+
 ## `tapflow token set`
 
 MCP 서버와 `tapflow flow run`이 읽는 [토큰 파일](/ko/automation/mcp-server#token-file)에 토큰을 저장합니다. 저장하기 전에 릴레이에 한 번 물어보고 릴레이가 받지 않는 토큰은 저장하지 않습니다.

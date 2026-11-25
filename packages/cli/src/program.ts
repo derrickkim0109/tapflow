@@ -19,7 +19,29 @@ import { cmdReset } from './commands/reset.js'
 import { cmdStatus } from './commands/status.js'
 import { cmdLogs } from './commands/logs.js'
 import { cmdFlowRun, secretArg, tagsArg, type FlowRunOptions, type TagsArg } from './commands/flow-run.js'
+import { cmdFlowImport, type FlowImportOptions } from './commands/flow-import.js'
 import { cmdMigrate, cmdMigrateDataDir, cmdMigrateNetFilter } from './commands/migrate.js'
+
+// Options a `flow` subcommand does not take, by the key cac parses them into. A `--no-*` option is set to `false` when
+// given and `true` otherwise, so only `false` means it was typed.
+const RUN_ONLY_OPTIONS: Record<string, string> = {
+  relay: '--relay', token: '--token', session: '--session', device: '--device', build: '--build', install: '--no-install',
+  junit: '--junit', artifacts: '--artifacts', timeout: '--timeout', serviceTier: '--service-tier', keep: '--keep',
+  admissionTimeout: '--admission-timeout', record: '--no-record', reset: '--no-reset', includeTags: '--include-tags',
+  excludeTags: '--exclude-tags', parallel: '--parallel', platform: '--platform', secret: '--secret',
+}
+const IMPORT_ONLY_OPTIONS: Record<string, string> = {
+  from: '--from', out: '--out', env: '--env', report: '--report', overwrite: '--overwrite',
+}
+const NEGATED = new Set(['install', 'record', 'reset'])
+
+function misplaced(opts: object, options: Record<string, string>): string[] {
+  const given = opts as Record<string, unknown>
+  return Object.entries(options)
+    .filter(([key]) => (NEGATED.has(key) ? given[key] === false : given[key] !== undefined))
+    .map(([, flag]) => flag)
+}
+
 
 /**
  * The whole command surface, built without parsing anything.
@@ -123,7 +145,7 @@ export function createCli(): CAC {
     .action((opts: { relay?: string; lines?: number }) => cmdLogs(opts))
 
   cli
-    .command('flow <subcommand> [...files]', 'Deterministic flow commands (subcommand: run)')
+    .command('flow <subcommand> [...files]', 'Deterministic flow commands (subcommand: run | import)')
     .option('--relay <url>', 'Relay URL (default: ws://localhost:4000)')
     .option('--token <token>', 'PAT for a remote relay (or TAPFLOW_TOKEN env, or ~/.config/tapflow/credentials.json)')
     .option('--session <id>', "Target session id, for when --device matches more than one device (the MCP server's list_devices shows it)")
@@ -143,12 +165,33 @@ export function createCli(): CAC {
     .option('--parallel <n>', 'Share the flows across up to n devices the relay chooses and boots (1-16)')
     .option('--platform <platform>', 'ios or android: the platform of a --parallel run without --build')
     .option('--secret <name>', 'An environment variable an inputText { secret: NAME } step may type; repeat for each')
-    .action((subcommand: string, files: string[], opts: Omit<FlowRunOptions, 'includeTags' | 'excludeTags' | 'secret'> & {
+    .option('--from <format>', 'import only: the format of the flows to convert (maestro)')
+    .option('--out <dir>', 'import only: where converted flows are written (default: .tapflow/flows)')
+    .option('--env <KEY=VALUE>', 'import only: a value for ${KEY} in the source flows (repeatable)')
+    .option('--report <path>', 'import only: write what was and was not converted as JSON')
+    .option('--overwrite', 'import only: replace converted flows that already exist')
+    .action(async (subcommand: string, files: string[], opts: Omit<FlowRunOptions, 'includeTags' | 'excludeTags' | 'secret'> & FlowImportOptions & {
       build?: string | number; timeout?: string | number; admissionTimeout?: string | number; includeTags?: TagsArg; excludeTags?: TagsArg
       parallel?: string | number; secret?: TagsArg
     }) => {
+      // cac offers every option to every subcommand, so one that belongs to the other is refused rather than
+      // ignored: an option that silently does nothing reads as one that worked.
+      const runOnly = misplaced(opts, RUN_ONLY_OPTIONS)
+      const importOnly = misplaced(opts, IMPORT_ONLY_OPTIONS)
+      if (subcommand === 'import') {
+        if (runOnly.length > 0) {
+          console.error(`${runOnly.join(', ')} ${runOnly.length === 1 ? 'applies' : 'apply'} to \`flow run\` only`)
+          process.exit(2)
+        }
+        process.exitCode = await cmdFlowImport(files, opts)
+        return
+      }
       if (subcommand !== 'run') {
-        console.error(`unknown flow subcommand: ${subcommand} (expected: run)`)
+        console.error(`unknown flow subcommand: ${subcommand} (expected: run | import)`)
+        process.exit(2)
+      }
+      if (importOnly.length > 0) {
+        console.error(`${importOnly.join(', ')} ${importOnly.length === 1 ? 'applies' : 'apply'} to \`flow import\` only`)
         process.exit(2)
       }
       return cmdFlowRun(files, {

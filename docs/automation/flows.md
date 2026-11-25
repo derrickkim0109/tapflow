@@ -399,6 +399,56 @@ your-app/
 
 A JSON Schema for editor autocomplete ships with the `@tapflowio/flow-runner` package at `schema/tapflow-flow.schema.json`.
 
+## Importing Maestro flows {#importing-maestro-flows}
+
+A suite written for Maestro can be converted once with [`tapflow flow import`](/reference/cli#tapflow-flow-import), then kept as tapflow flows.
+
+```sh
+tapflow flow import --from maestro .maestro/ --report import-report.json
+```
+
+| Maestro | Becomes |
+|---------|---------|
+| `launchApp` (with `clearState: true`, `arguments`) | `launchApp`, after `clearState` when it cleared state |
+| `clearState`, `tapOn`, `inputText`, `assertVisible`, `assertNotVisible`, `scroll` | The step of the same name |
+| `openLink` | `openUrl` |
+| `extendedWaitUntil` | `assertVisible` or `assertNotVisible` with the same `timeout` |
+| `eraseText` | `pressKey: Backspace`, once per character (50 when no count is given, as in Maestro) |
+| `pressKey` | `Enter`, `Backspace` and `Tab` only |
+| `swipe` with `direction`, or with `start` and `end` in percentages | `swipe` between the same points |
+| `runFlow` with `file`, `env` or `commands` | The subflow's steps, inlined |
+| `waitForAnimationToEnd` | Nothing. tapflow selectors already wait. Listed as `dropped`. |
+
+A selector converts when it uses `text`, `id` and `index`. Text alone stays a bare-string selector, so it also matches a field's placeholder, as Maestro's text does. Maestro reads `text` and `id` as regular expressions, so a pattern converts only when it is literal text: escaped punctuation such as `\(` is read as the character, and `.` as a dot.
+
+These have no tapflow step, and a flow that uses one is not converted:
+
+- Commands such as `repeat`, `evalScript`, `runScript`, `takeScreenshot`, `back`, `hideKeyboard`, `longPressOn`, `scrollUntilVisible` and `copyTextFrom`, a `runFlow` with `when`, and `onFlowStart` / `onFlowComplete`.
+- Selector options: relative position (`below`, `above`, `leftOf`, `rightOf`, `childOf`, `containsChild`, `containsDescendants`), state (`enabled`, `checked`, `focused`, `selected`), `traits`, size (`width`, `height`, `tolerance`), `point`, and `optional: true`.
+- `${...}` that is a JavaScript expression rather than a variable name, or a variable that is not set.
+- Swipes in pixels or from an element, keys other than the three above, and launching a different app.
+
+An `id` is copied as written. On Android, tapflow matches an element's full resource ID, such as `com.example.app:id/login`, so a Maestro `id: login` may need the package prefix added to the converted flow.
+
+The report, written with `--report`, lists each source flow with its status, the file it was written to, and every command it could not keep, by file and line:
+
+```json
+{
+  "format": "tapflow-import-report",
+  "version": 1,
+  "from": "maestro",
+  "flows": [
+    {
+      "source": ".maestro/checkout.yaml",
+      "status": "not-converted",
+      "issues": [
+        { "file": ".maestro/checkout.yaml", "line": 12, "command": "repeat", "kind": "unconverted", "reason": "Maestro command \"repeat\" has no tapflow step" }
+      ]
+    }
+  ]
+}
+```
+
 ## Running in CI
 
 With a relay and agent always on a self-hosted Mac runner, a CI job only has to replay the flows. No LLM is involved on the replay path, so there is no API cost.

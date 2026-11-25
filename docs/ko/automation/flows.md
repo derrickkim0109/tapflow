@@ -399,6 +399,56 @@ your-app/
 
 에디터 자동완성을 위한 JSON Schema는 `@tapflowio/flow-runner` 패키지의 `schema/tapflow-flow.schema.json`에 함께 배포됩니다.
 
+## Maestro 플로우 가져오기 {#importing-maestro-flows}
+
+Maestro로 쓴 스위트는 [`tapflow flow import`](/ko/reference/cli#tapflow-flow-import)로 한 번 변환한 뒤 tapflow 플로우로 관리할 수 있습니다.
+
+```sh
+tapflow flow import --from maestro .maestro/ --report import-report.json
+```
+
+| Maestro | 변환 결과 |
+|---------|-----------|
+| `launchApp` (`clearState: true`, `arguments` 포함) | `launchApp`. 상태를 지웠다면 그 앞에 `clearState` |
+| `clearState`, `tapOn`, `inputText`, `assertVisible`, `assertNotVisible`, `scroll` | 같은 이름의 스텝 |
+| `openLink` | `openUrl` |
+| `extendedWaitUntil` | 같은 `timeout`을 둔 `assertVisible` 또는 `assertNotVisible` |
+| `eraseText` | 글자 수만큼 `pressKey: Backspace` (개수가 없으면 Maestro처럼 50번) |
+| `pressKey` | `Enter`, `Backspace`, `Tab`만 |
+| `direction`, 또는 퍼센트 `start`·`end`를 쓴 `swipe` | 같은 지점 사이의 `swipe` |
+| `file`, `env`, `commands`를 쓴 `runFlow` | 하위 플로우의 스텝을 펼쳐 넣음 |
+| `waitForAnimationToEnd` | 없음. tapflow 셀렉터가 이미 기다립니다. `dropped`로 표시합니다. |
+
+셀렉터는 `text`, `id`, `index`를 쓸 때 변환됩니다. `text`만 있으면 문자열 셀렉터로 남겨서, Maestro의 text처럼 입력 칸의 placeholder에도 맞습니다. Maestro는 `text`와 `id`를 정규식으로 읽으므로, 패턴이 리터럴 문자열일 때만 변환합니다. `\(`처럼 이스케이프한 기호는 그 문자로, `.`은 점으로 읽습니다.
+
+다음은 대응하는 tapflow 스텝이 없어서, 하나라도 쓰면 그 플로우는 변환되지 않습니다.
+
+- `repeat`, `evalScript`, `runScript`, `takeScreenshot`, `back`, `hideKeyboard`, `longPressOn`, `scrollUntilVisible`, `copyTextFrom` 같은 명령, `when`이 있는 `runFlow`, `onFlowStart`·`onFlowComplete`.
+- 셀렉터 옵션: 상대 위치(`below`, `above`, `leftOf`, `rightOf`, `childOf`, `containsChild`, `containsDescendants`), 상태(`enabled`, `checked`, `focused`, `selected`), `traits`, 크기(`width`, `height`, `tolerance`), `point`, `optional: true`.
+- 변수 이름이 아닌 JavaScript 식인 `${...}`, 또는 값이 없는 변수.
+- 픽셀 단위나 요소에서 시작하는 스와이프, 위 세 개 외의 키, 다른 앱 실행.
+
+`id`는 적힌 그대로 옮깁니다. Android에서 tapflow는 `com.example.app:id/login` 같은 전체 리소스 ID로 찾으므로, Maestro의 `id: login`은 변환된 플로우에 패키지 접두사를 붙여야 할 수 있습니다.
+
+`--report`로 쓰는 리포트에는 원본 플로우마다 상태, 쓴 파일, 옮기지 못한 명령이 파일·줄 번호와 함께 들어갑니다.
+
+```json
+{
+  "format": "tapflow-import-report",
+  "version": 1,
+  "from": "maestro",
+  "flows": [
+    {
+      "source": ".maestro/checkout.yaml",
+      "status": "not-converted",
+      "issues": [
+        { "file": ".maestro/checkout.yaml", "line": 12, "command": "repeat", "kind": "unconverted", "reason": "Maestro command \"repeat\" has no tapflow step" }
+      ]
+    }
+  ]
+}
+```
+
 ## CI에서 실행
 
 self-hosted Mac 러너에서 릴레이와 에이전트가 항상 켜져 있다면, CI 잡은 플로우를 재생하기만 하면 됩니다. 재생 경로에는 LLM이 개입하지 않으므로 API 비용이 들지 않습니다.
