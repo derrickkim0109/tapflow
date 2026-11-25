@@ -117,10 +117,22 @@ describe('cmdFlowImport', () => {
     expect(fs.readFileSync(path.join(dir, 'm/sub/s.yaml'), 'utf-8')).toBe('- launchApp\n')
   })
 
-  it('refuses a --report that is where a converted flow goes', async () => {
+  it('refuses a --report that is a converted flow, by any path to it, and keeps the flow', async () => {
     write('m/a.yaml', '- launchApp\n')
-    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'out', report: 'out/a.yaml' })).toBe(2)
-    expect(fs.existsSync(path.join(dir, 'out'))).toBe(false)
+    fs.mkdirSync(path.join(dir, 'out'))
+    fs.symlinkSync(path.join(dir, 'out'), path.join(dir, 'alias'))
+    for (const report of ['out/a.yaml', 'alias/a.yaml']) {
+      expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'out', report, overwrite: true })).toBe(2)
+      expect(fs.readFileSync(path.join(dir, 'out/a.yaml'), 'utf-8')).toMatch(/^# Converted from/)
+    }
+  })
+
+  it('protects a subflow a refused runFlow never opened', async () => {
+    write('m/x.yaml', '- runFlow:\n    file: sub/s.yaml\n    when:\n      visible: X\n')
+    write('m/s.yaml', '- launchApp\n')
+    write('m/sub/s.yaml', '- tapOn: A\n')
+    expect(await cmdFlowImport(['m'], { from: 'maestro', out: 'm/sub', overwrite: true })).toBe(2)
+    expect(fs.readFileSync(path.join(dir, 'm/sub/s.yaml'), 'utf-8')).toBe('- tapOn: A\n')
   })
 
   it('takes an --out cac read as a number', async () => {

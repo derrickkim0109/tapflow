@@ -166,6 +166,13 @@ tags:
     const files = { 'flow.yaml': "env:\n  USER: ${USER || 'guest'}\n---\n- inputText: ${USER}\n" }
     expect(converted(convert(files)).steps).toEqual([{ type: 'inputText', text: 'guest' }])
     expect(converted(convert(files, 'flow.yaml', { USER: 'kim' })).steps).toEqual([{ type: 'inputText', text: 'kim' }])
+    // An empty value falls back, as `||` does.
+    expect(converted(convert(files, 'flow.yaml', { USER: '' })).steps).toEqual([{ type: 'inputText', text: 'guest' }])
+    // The same form in what runFlow passes.
+    expect(converted(convert({
+      'flow.yaml': "- runFlow:\n    file: sub.yaml\n    env:\n      U: ${U || 'p'}\n",
+      'sub.yaml': '- inputText: ${U}\n',
+    })).steps).toEqual([{ type: 'inputText', text: 'p' }])
     const r = convert({ 'flow.yaml': "env:\n  USER: ${USER.toUpperCase()}\n---\n- inputText: ${USER}\n" })
     expect(r.status).toBe('not-converted')
     expect(r.issues).toEqual([expect.objectContaining({ command: 'inputText', line: 4, reason: expect.stringContaining('cannot evaluate') })])

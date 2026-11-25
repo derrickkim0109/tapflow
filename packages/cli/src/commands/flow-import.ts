@@ -65,9 +65,11 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
   const outDir = path.resolve(String(opts.out ?? DEFAULT_IMPORT_OUT))
   const reportPath = opts.report === undefined ? undefined : String(opts.report)
   const outputOf = (file: string): string => path.join(outDir, path.relative(base, file))
-  // Every file the import reads, subflows included, by identity rather than by path: on a case-insensitive disk or
-  // through a symlink, two different paths name one file.
+  // Every Maestro file the import reads, subflows included, and every one under an input directory — a subflow a
+  // refused `runFlow` never opened is still a source. By identity rather than by path: on a case-insensitive disk
+  // or through a symlink, two different paths name one file.
   const sources = new Set<string>()
+  for (const input of inputs) addTree(path.resolve(input), sources)
   const readFile = (file: string): string => {
     const id = identity(file)
     if (id !== undefined) sources.add(id)
@@ -79,10 +81,6 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
   const onSource = [...results.map((r) => r.output), ...(reportPath !== undefined ? [path.resolve(reportPath)] : [])].filter(isSource)
   if (onSource.length > 0) {
     console.error(`✗ this import would replace the Maestro flows it reads (${onSource.map(display).join(', ')}) — pass another --out or --report`)
-    return EXIT_USAGE
-  }
-  if (reportPath !== undefined && results.some((r) => r.output.toLowerCase() === path.resolve(reportPath).toLowerCase())) {
-    console.error(`✗ --report ${reportPath} is where a converted flow is written — pass another path`)
     return EXIT_USAGE
   }
 
@@ -125,6 +123,13 @@ export async function cmdFlowImport(inputs: string[], opts: FlowImportOptions): 
     }
   } catch (e) {
     console.error(`✗ ${(e as Error).message}${done.length > 0 ? ` (already written: ${done.join(', ')})` : ''}`)
+    return EXIT_USAGE
+  }
+
+  // Only now do the outputs exist to compare by identity; a report written over one would lose that flow.
+  const outputIds = new Set(written.map((w) => (w.yaml !== undefined && w.output !== undefined ? identity(w.output) : undefined)))
+  if (reportPath !== undefined && identity(reportPath) !== undefined && outputIds.has(identity(reportPath))) {
+    console.error(`✗ --report ${reportPath} is a converted flow this import just wrote — the report was not written; pass another path`)
     return EXIT_USAGE
   }
 
@@ -186,10 +191,25 @@ function printResults(written: Written[]): void {
 
 function identity(file: string): string | undefined {
   try {
-    const st = fs.statSync(file)
-    return `${st.dev}:${st.ino}`
+    // bigint keeps a 64-bit NTFS file id whole; a filesystem that reports no inode (0) cannot tell files apart.
+    const st = fs.statSync(file, { bigint: true })
+    return st.ino === 0n ? undefined : `${st.dev}:${st.ino}`
   } catch {
     return undefined
+  }
+}
+
+function addTree(abs: string, ids: Set<string>): void {
+  let entries: fs.Dirent[]
+  try {
+    entries = fs.readdirSync(abs, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    const p = path.join(abs, e.name)
+    if (e.isDirectory() && e.name !== 'node_modules' && e.name !== '.git') addTree(p, ids)
+    else if (/\.ya?ml$/i.test(e.name)) { const id = identity(p); if (id !== undefined) ids.add(id) }
   }
 }
 

@@ -251,7 +251,7 @@ function inlineSubflow(rawArg: unknown, file: string, line: number | undefined, 
     if (subfile !== undefined && commands !== undefined) throw new Problem('"runFlow" takes "file" or "commands", not both')
     if (subfile !== undefined) target = requireString(substitute(subfile, env), 'runFlow file')
     inline = commands
-    passedEnv = stringEnv(substitute(subEnv, env))
+    passedEnv = Object.fromEntries(Object.entries(stringEnv(subEnv)).map(([k, v]) => [k, readDefault(v, env) ?? (substitute(v, env) as string)]))
   } else {
     throw new Problem('"runFlow" takes a file path or { file, env } or { commands }')
   }
@@ -511,11 +511,15 @@ const DEFAULT_PATTERN = /^\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\|\|\s*(['"])([^'"]*
  */
 function layerEnv(before: Record<string, string>, own: Record<string, string>): Record<string, string> {
   const out = { ...before }
-  for (const [key, value] of Object.entries(own)) {
-    const m = DEFAULT_PATTERN.exec(value)
-    out[key] = m === null ? value : Object.hasOwn(before, m[1]) ? before[m[1]] : m[3]
-  }
+  for (const [key, value] of Object.entries(own)) out[key] = readDefault(value, before) ?? value
   return out
+}
+
+/** `${NAME || 'x'}` read against `env`, or undefined when `value` is not that form. An empty value falls back, as `||` does. */
+function readDefault(value: string, env: Record<string, string>): string | undefined {
+  const m = DEFAULT_PATTERN.exec(value)
+  if (m === null) return undefined
+  return Object.hasOwn(env, m[1]) && env[m[1]] !== '' ? env[m[1]] : m[3]
 }
 
 function stringEnv(v: unknown): Record<string, string> {
